@@ -1,0 +1,71 @@
+# version: "3.9"
+
+services:
+  agent:
+    build: ./agent
+    environment:
+      - SERVICE_PORT=${AGENT_PORT}
+      - VECTOR_PORT=${VECTOR_PORT}
+      - LLM_PORT=${LLM_PORT}
+    ports:
+      - "${AGENT_PORT}:${AGENT_PORT}"
+    volumes:
+      - ./agent/src:/app/src:rw
+      - ./storage:/storage
+
+  llm:
+    build: ./llm
+    runtime: nvidia
+    environment:
+      - SERVICE_PORT=${LLM_PORT}
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      - "${LLM_PORT}:${LLM_PORT}"
+    volumes:
+      - ./llm/src:/app/src:rw
+      - ./storage/models_cache:/models
+      - ./storage/logs:/storage/logs
+
+  vectorstore:
+    build: ./vectorstore
+    runtime: nvidia
+    environment:
+      - SERVICE_PORT=${VECTOR_PORT}
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      - "${VECTOR_PORT}:${VECTOR_PORT}"
+    volumes:
+      - ./vectorstore/src:/app/src:rw
+      - ./storage:/storage
+  
+  browser:
+    build: ./browser
+    environment:
+      - SERVICE_PORT=${BROWSER_PORT}
+      - BROWSER_HEADLESS=false
+    ports:
+      - "${BROWSER_PORT}:${BROWSER_PORT}"
+    volumes:
+      - ./browser/src:/app/src:rw
+      - ./storage:/storage
+      - ./storage/scraped_data:/scraped_data
+    
+
+
+  notebook:
+    build: ./notebook
+    environment:
+      - SERVICE_PORT=${NOTEBOOK_PORT}
+      # expose peer URLs so notebooks can call them
+      - AGENT_ENDPOINT=http://agent:${AGENT_PORT}
+      - VECTOR_ENDPOINT=http://vectorstore:${VECTOR_PORT}
+      - LLM_ENDPOINT=http://llm:${LLM_PORT}
+      - BROWSER_ENDPOINT=http://browser:${BROWSER_PORT}  
+    ports:
+      - "${NOTEBOOK_PORT}:${NOTEBOOK_PORT}"
+    volumes:
+      - ./notebook:/home/jovyan/notebooks:rw   # editable even in dev
+      - ./storage/models_cache:/models:ro 
+      
+
+  # Removed local WireGuard server; it does not help bypass WAF for outbound requests.

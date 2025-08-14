@@ -1,0 +1,8 @@
+# Notebook dependencies
+notebook==7.4.4
+ipykernel==6.30.0
+requests==2.32.4
+pandas==2.3.1
+matplotlib==3.10.3
+numpy==2.3.2
+# playwright==1.54.0
