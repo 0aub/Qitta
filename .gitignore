@@ -89,4 +89,5 @@ backend/vectorstore/data/
 **/index/
 
 storage/
+
 scripts/
