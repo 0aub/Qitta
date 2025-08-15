@@ -768,46 +768,755 @@ async def saudi_open_data(*, browser: Browser, params: Dict[str, Any], job_outpu
     return await task.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
 
 
-# ═══════════════ Generic website crawler (class wrapper, logic unchanged) ════════════════
+# ═══════════════ Enhanced Website Scraper for Vector Stores ════════════════
 class ScrapeSiteTask:
+    """
+    Professional two-phase website scraper optimized for vector store preparation.
+    
+    Phase 1: Intelligent HTML collection with JS rendering support
+    Phase 2: Offline content extraction and chunking (separate task: extract-content)
+    """
+    
+    # ───── URL management utilities ─────
+    @staticmethod
+    def _should_skip_url(url: str, base_domain: str) -> bool:
+        """Filter out non-content URLs before fetching."""
+        from .utils import extract_domain, is_same_domain
+        
+        # Domain check
+        if not is_same_domain(url, f"https://{base_domain}"):
+            return True
+            
+        url_lower = url.lower()
+        
+        # Skip obvious non-content URLs
+        skip_patterns = [
+            '/search', '/login', '/register', '/cart', '/checkout', '/admin',
+            '/api/', '/ajax/', '/.well-known/', '/wp-admin/', '/wp-json/',
+            '.xml', '.json', '.rss', '.atom', '.pdf', '.doc', '.docx',
+            '.xls', '.xlsx', '.ppt', '.pptx', '.zip', '.tar', '.gz',
+            '/contact', '/privacy', '/terms', '/sitemap', '/robots.txt',
+            '/favicon.ico', '/apple-touch-icon', '/.css', '/.js', '/.map'
+        ]
+        
+        return any(pattern in url_lower for pattern in skip_patterns)
+    
+    @staticmethod
+    def _extract_urls_from_page(html: str, current_url: str, base_domain: str) -> List[str]:
+        """Extract valid URLs from a page's HTML."""
+        from .utils import extract_links_from_html, normalize_url
+        
+        all_links = extract_links_from_html(html, current_url)
+        valid_links = []
+        
+        for link in all_links:
+            try:
+                normalized = normalize_url(link)
+                if not ScrapeSiteTask._should_skip_url(normalized, base_domain):
+                    valid_links.append(normalized)
+            except Exception:
+                continue
+                
+        return valid_links
+    
+    # ───── Content fetching with retry logic ─────
+    @staticmethod
+    async def _fetch_page_html(
+        client: httpx.AsyncClient,
+        url: str,
+        headers: Dict[str, str],
+        logger: logging.Logger
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """
+        Fetch a single page's HTML with proper error handling.
+        Returns: (success, html_content, metadata)
+        """
+        from .utils import fetch_with_retry
+        
+        success, response, error = await fetch_with_retry(
+            client, url, headers, max_retries=2, timeout=20.0
+        )
+        
+        if not success:
+            return False, None, {"error": error, "url": url}
+        
+        try:
+            html = response.text
+            content_type = response.headers.get("content-type", "")
+            
+            # Basic content validation
+            if not html or len(html.strip()) < 100:
+                return False, None, {"error": "insufficient_content", "url": url}
+                
+            # Check if it's actually HTML
+            if "text/html" not in content_type and not any(
+                tag in html.lower()[:1000] for tag in ["<html", "<head", "<body", "<!doctype"]
+            ):
+                return False, None, {"error": "not_html", "url": url, "content_type": content_type}
+            
+            metadata = {
+                "url": url,
+                "status_code": response.status_code,
+                "content_type": content_type,
+                "content_length": len(html),
+                "final_url": str(response.url)
+            }
+            
+            return True, html, metadata
+            
+        except Exception as e:
+            return False, None, {"error": f"processing_failed_{type(e).__name__}", "url": url}
+    
+    @staticmethod
+    async def _fetch_with_browser(
+        browser: Browser,
+        url: str,
+        headers: Dict[str, str],
+        logger: logging.Logger
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """
+        Fetch page using Playwright for JavaScript-heavy sites.
+        Fallback method when HTTP client fails or for dynamic content.
+        """
+        context = None
+        page = None
+        
+        try:
+            # Create browser context with custom headers
+            context = await browser.new_context(
+                user_agent=headers.get("user-agent", ""),
+                extra_http_headers=headers
+            )
+            
+            page = await context.new_page()
+            
+            # Navigate and wait for content
+            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)  # Allow dynamic content to load
+            
+            html = await page.content()
+            final_url = page.url
+            
+            metadata = {
+                "url": url,
+                "final_url": final_url,
+                "content_length": len(html),
+                "method": "playwright"
+            }
+            
+            return True, html, metadata
+            
+        except Exception as e:
+            return False, None, {"error": f"browser_failed_{type(e).__name__}", "url": url}
+        finally:
+            if page:
+                await page.close()
+            if context:
+                await context.close()
+    
+    # ───── Main scraping logic ─────
+    @staticmethod
+    async def _scrape_website(
+        browser: Browser,
+        start_url: str,
+        max_pages: Optional[int],
+        use_browser: bool,
+        headers: Dict[str, str],
+        out_dir: pathlib.Path,
+        logger: logging.Logger
+    ) -> Dict[str, Any]:
+        """Execute the main scraping logic."""
+        from .utils import extract_domain, normalize_url, save_content_atomic, save_json_atomic, is_content_page, score_content_quality
+        
+        # Setup
+        start_url = normalize_url(start_url)
+        base_domain = extract_domain(start_url)
+        
+        if not base_domain:
+            raise ValueError(f"Invalid start URL: {start_url}")
+        
+        # Create output directories
+        html_dir = out_dir / "raw_html"
+        html_dir.mkdir(parents=True, exist_ok=True)
+        
+        # State tracking
+        url_queue = [start_url]
+        processed_urls = set()
+        successful_pages = []
+        failed_pages = []
+        total_content_size = 0
+        
+        # HTTP client for standard requests
+        timeout = httpx.Timeout(20.0, connect=10.0)
+        
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+            while url_queue and (max_pages is None or len(successful_pages) < max_pages):
+                current_url = url_queue.pop(0)
+                
+                if current_url in processed_urls:
+                    continue
+                    
+                processed_urls.add(current_url)
+                logger.info(f"Processing [{len(successful_pages)+1}]: {current_url[:100]}")
+                
+                # Try HTTP client first, fallback to browser if needed
+                success = False
+                html = None
+                metadata = {}
+                
+                if not use_browser:
+                    success, html, metadata = await ScrapeSiteTask._fetch_page_html(
+                        client, current_url, headers, logger
+                    )
+                
+                # Fallback to browser for failed requests or when explicitly requested
+                if not success and browser:
+                    success, html, metadata = await ScrapeSiteTask._fetch_with_browser(
+                        browser, current_url, headers, logger
+                    )
+                
+                if not success:
+                    failed_pages.append(metadata)
+                    logger.warning(f"Failed to fetch {current_url}: {metadata.get('error', 'unknown')}")
+                    continue
+                
+                # Content quality check
+                if not is_content_page(current_url, html):
+                    logger.debug(f"Skipping low-content page: {current_url}")
+                    continue
+                
+                # Save HTML atomically
+                safe_filename = urllib.parse.quote(current_url, safe='') + ".html"
+                html_file = html_dir / safe_filename
+                
+                save_success, save_error, file_meta = await save_content_atomic(
+                    html_file, html.encode('utf-8')
+                )
+                
+                if not save_success:
+                    logger.error(f"Failed to save {current_url}: {save_error}")
+                    failed_pages.append({"url": current_url, "error": f"save_failed_{save_error}"})
+                    continue
+                
+                # Calculate content quality score
+                quality_score = score_content_quality(html)
+                
+                # Track success
+                page_info = {
+                    "url": current_url,
+                    "file": safe_filename,
+                    "quality_score": quality_score,
+                    "timestamp": json.dumps(asyncio.get_event_loop().time()),  # For sorting
+                    **metadata,
+                    **file_meta
+                }
+                successful_pages.append(page_info)
+                total_content_size += file_meta.get("size", 0)
+                
+                # Extract new URLs for crawling
+                if len(successful_pages) < (max_pages or float('inf')):
+                    new_urls = ScrapeSiteTask._extract_urls_from_page(html, current_url, base_domain)
+                    
+                    for new_url in new_urls:
+                        if new_url not in processed_urls and new_url not in url_queue:
+                            url_queue.append(new_url)
+                
+                # Rate limiting
+                await asyncio.sleep(random.uniform(1.0, 2.5))
+        
+        # Save metadata
+        crawl_metadata = {
+            "start_url": start_url,
+            "base_domain": base_domain,
+            "total_pages_found": len(processed_urls),
+            "successful_pages": len(successful_pages),
+            "failed_pages": len(failed_pages),
+            "total_content_size": total_content_size,
+            "average_quality_score": sum(p["quality_score"] for p in successful_pages) / len(successful_pages) if successful_pages else 0,
+            "pages": successful_pages,
+            "failures": failed_pages[:50]  # Limit failure details
+        }
+        
+        save_json_atomic(out_dir / "crawl_metadata.json", crawl_metadata)
+        save_json_atomic(out_dir / "page_urls.json", [p["url"] for p in successful_pages])
+        
+        return {
+            "start_url": start_url,
+            "base_domain": base_domain,
+            "pages_scraped": len(successful_pages),
+            "pages_failed": len(failed_pages),
+            "total_content_size": total_content_size,
+            "html_directory": "raw_html",
+            "metadata_file": "crawl_metadata.json",
+            "urls_file": "page_urls.json",
+            "quality_score_avg": round(crawl_metadata["average_quality_score"], 3)
+        }
+    
+    # ───── Main entry point ─────
     async def run(self, *, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-        import re
-        start = params["url"]
-        dom = urllib.parse.urlparse(start).netloc
-        lim = None if str(params.get("max_pages", "")).strip() in {"", "0", "-1"} else int(params["max_pages"])
-        q, seen, saved = [start], set(), []
-        out = pathlib.Path(job_output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as cl:
-            while q and (lim is None or len(seen) < lim):
-                url = q.pop(0)
-                seen.add(url)
-                try:
-                    r = await cl.get(url, headers={"User-Agent": params.get("user_agent", "Mozilla/5.0")})
-                except Exception as e:
-                    logger.error(f"{url}: {e}")
-                    continue
-                if r.status_code != 200:
-                    continue
-                html = r.text
-                saved.append(url)
-                (out / f"{urllib.parse.quote(url, safe='')}.html").write_text(html, "utf-8")
-                for h in re.findall(r'href=["\\\'](.*?)["\\\']', html, re.I):
-                    if not h:
-                        continue
-                    full = h if h.startswith("http") else urllib.parse.urljoin(url, h)
-                    p = urllib.parse.urlparse(full)
-                    if p.netloc != dom:
-                        continue
-                    full = urllib.parse.urlunparse(p._replace(fragment=""))
-                    if full not in seen and full not in q:
-                        q.append(full)
-                await asyncio.sleep(random.uniform(1, 2))
-        (out / "urls.json").write_text(json.dumps(saved, indent=2, ensure_ascii=False), "utf-8")
-        return {"url": start, "pages_scraped": len(saved), "unbounded": lim is None, "urls_file": "urls.json"}
+        """
+        Main entry point for the enhanced website scraper.
+        
+        Phase 1: Collect HTML pages with intelligent filtering and quality scoring.
+        Use 'extract-content' task later for Phase 2 content extraction.
+        """
+        
+        # Validate required parameters
+        start_url = params.get("url", "").strip()
+        if not start_url:
+            raise ValueError("Parameter 'url' is required")
+        
+        # Optional parameters with defaults
+        max_pages_str = str(params.get("max_pages", "")).strip()
+        max_pages = None if max_pages_str in {"", "0", "-1"} else int(max_pages_str)
+        
+        use_browser = params.get("use_browser", False)  # Force browser rendering
+        user_agent = params.get("user_agent", 
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        
+        # Build request headers
+        headers = {
+            "user-agent": user_agent,
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "accept-language": "en-US,en;q=0.9",
+            "accept-encoding": "gzip, deflate, br",
+            "cache-control": "no-cache",
+            "upgrade-insecure-requests": "1"
+        }
+        
+        # Setup output directory
+        out_dir = pathlib.Path(job_output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Starting website scrape: {start_url}")
+        logger.info(f"Max pages: {max_pages or 'unlimited'}, Browser mode: {use_browser}")
+        
+        try:
+            result = await ScrapeSiteTask._scrape_website(
+                browser=browser,
+                start_url=start_url,
+                max_pages=max_pages,
+                use_browser=use_browser,
+                headers=headers,
+                out_dir=out_dir,
+                logger=logger
+            )
+            
+            logger.info(f"Scrape completed: {result['pages_scraped']} pages, avg quality: {result['quality_score_avg']}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Scrape failed: {e}")
+            raise
 
 
 @_registry.register("scrape-site")
 async def scrape_site(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
     task = ScrapeSiteTask()
+    return await task.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+
+
+# ═══════════════ Content Extraction for Vector Stores (Phase 2) ════════════════
+class ExtractContentTask:
+    """
+    Phase 2: Extract clean text content from scraped HTML files.
+    Optimized for vector store preparation with intelligent chunking.
+    """
+    
+    # ───── Content extraction strategies ─────
+    @staticmethod
+    def _extract_with_readability(html: str, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Extract main content using readability algorithm."""
+        try:
+            # Simple readability-like algorithm without external dependencies
+            import re
+            
+            # Remove script and style elements
+            html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            
+            # Extract title
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+            title = title_match.group(1).strip() if title_match else ""
+            
+            # Look for main content areas
+            content_patterns = [
+                r'<article[^>]*>(.*?)</article>',
+                r'<main[^>]*>(.*?)</main>',
+                r'<div[^>]*class=["\'][^"\']*content[^"\']*["\'][^>]*>(.*?)</div>',
+                r'<div[^>]*class=["\'][^"\']*article[^"\']*["\'][^>]*>(.*?)</div>',
+                r'<div[^>]*id=["\'][^"\']*content[^"\']*["\'][^>]*>(.*?)</div>',
+            ]
+            
+            best_content = ""
+            max_text_length = 0
+            
+            for pattern in content_patterns:
+                matches = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
+                for match in matches:
+                    # Convert to text and measure
+                    text = re.sub(r'<[^>]+>', ' ', match)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if len(text) > max_text_length:
+                        max_text_length = len(text)
+                        best_content = text
+            
+            # Fallback: extract all paragraph text
+            if not best_content or len(best_content) < 200:
+                paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL | re.IGNORECASE)
+                paragraph_text = ' '.join(re.sub(r'<[^>]+>', ' ', p) for p in paragraphs)
+                paragraph_text = re.sub(r'\s+', ' ', paragraph_text).strip()
+                if len(paragraph_text) > len(best_content):
+                    best_content = paragraph_text
+            
+            if best_content:
+                metadata = {
+                    "extraction_method": "readability",
+                    "title": title,
+                    "content_length": len(best_content),
+                    "word_count": len(best_content.split())
+                }
+                return best_content, metadata
+            
+            return None, {"error": "no_content_found"}
+            
+        except Exception as e:
+            return None, {"error": f"readability_failed_{type(e).__name__}"}
+    
+    @staticmethod
+    def _extract_with_selectors(html: str, selectors: List[str]) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Extract content using custom CSS selectors (simplified)."""
+        try:
+            import re
+            
+            content_parts = []
+            
+            for selector in selectors:
+                # Simple selector matching (basic implementation)
+                if selector.startswith('.'):
+                    # Class selector
+                    class_name = selector[1:]
+                    pattern = f'<[^>]*class=["\'][^"\']*{re.escape(class_name)}[^"\']*["\'][^>]*>(.*?)</[^>]+>'
+                elif selector.startswith('#'):
+                    # ID selector
+                    id_name = selector[1:]
+                    pattern = f'<[^>]*id=["\'][^"\']*{re.escape(id_name)}[^"\']*["\'][^>]*>(.*?)</[^>]+>'
+                else:
+                    # Tag selector
+                    pattern = f'<{re.escape(selector)}[^>]*>(.*?)</{re.escape(selector)}>'
+                
+                matches = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
+                for match in matches:
+                    text = re.sub(r'<[^>]+>', ' ', match)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if text and len(text) > 50:  # Only substantial content
+                        content_parts.append(text)
+            
+            if content_parts:
+                content = '\n\n'.join(content_parts)
+                metadata = {
+                    "extraction_method": "selectors",
+                    "selectors_used": selectors,
+                    "content_length": len(content),
+                    "word_count": len(content.split()),
+                    "parts_found": len(content_parts)
+                }
+                return content, metadata
+            
+            return None, {"error": "no_selector_matches"}
+            
+        except Exception as e:
+            return None, {"error": f"selector_extraction_failed_{type(e).__name__}"}
+    
+    # ───── Text chunking for vector stores ─────
+    @staticmethod
+    def _chunk_text_semantic(
+        text: str, 
+        chunk_size: int = 1000, 
+        overlap: int = 200,
+        preserve_paragraphs: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Chunk text semantically for optimal vector embedding.
+        Preserves paragraph boundaries and maintains context.
+        """
+        if not text or len(text.strip()) < 50:
+            return []
+        
+        # Split into paragraphs first
+        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+        if not paragraphs:
+            paragraphs = [text]
+        
+        chunks = []
+        current_chunk = ""
+        current_length = 0
+        chunk_id = 0
+        
+        for para in paragraphs:
+            para_length = len(para)
+            
+            # If paragraph is too long, split it at sentence boundaries
+            if para_length > chunk_size:
+                sentences = [s.strip() for s in para.split('.') if s.strip()]
+                
+                for sentence in sentences:
+                    sentence += '.'  # Restore period
+                    sentence_length = len(sentence)
+                    
+                    if current_length + sentence_length > chunk_size and current_chunk:
+                        # Save current chunk
+                        chunks.append({
+                            "chunk_id": chunk_id,
+                            "content": current_chunk.strip(),
+                            "token_count": len(current_chunk.split()),
+                            "char_count": len(current_chunk),
+                            "start_pos": len(' '.join(c["content"] for c in chunks)),
+                        })
+                        chunk_id += 1
+                        
+                        # Start new chunk with overlap
+                        if overlap > 0 and len(current_chunk) > overlap:
+                            current_chunk = current_chunk[-overlap:] + ' ' + sentence
+                            current_length = len(current_chunk)
+                        else:
+                            current_chunk = sentence
+                            current_length = sentence_length
+                    else:
+                        current_chunk += ' ' + sentence if current_chunk else sentence
+                        current_length += sentence_length
+            else:
+                # Regular paragraph handling
+                if current_length + para_length > chunk_size and current_chunk:
+                    # Save current chunk
+                    chunks.append({
+                        "chunk_id": chunk_id,
+                        "content": current_chunk.strip(),
+                        "token_count": len(current_chunk.split()),
+                        "char_count": len(current_chunk),
+                        "start_pos": len(' '.join(c["content"] for c in chunks)),
+                    })
+                    chunk_id += 1
+                    
+                    # Start new chunk with overlap
+                    if overlap > 0 and len(current_chunk) > overlap:
+                        current_chunk = current_chunk[-overlap:] + '\n\n' + para
+                        current_length = len(current_chunk)
+                    else:
+                        current_chunk = para
+                        current_length = para_length
+                else:
+                    current_chunk += '\n\n' + para if current_chunk else para
+                    current_length += para_length
+        
+        # Add final chunk
+        if current_chunk.strip():
+            chunks.append({
+                "chunk_id": chunk_id,
+                "content": current_chunk.strip(),
+                "token_count": len(current_chunk.split()),
+                "char_count": len(current_chunk),
+                "start_pos": len(' '.join(c["content"] for c in chunks[:-1])) if chunks else 0,
+            })
+        
+        return chunks
+    
+    # ───── Main content extraction ─────
+    @staticmethod
+    async def _extract_content_from_html(
+        html_file: pathlib.Path,
+        url: str,
+        extraction_config: Dict[str, Any],
+        logger: logging.Logger
+    ) -> Dict[str, Any]:
+        """Extract clean content from a single HTML file."""
+        
+        try:
+            html = html_file.read_text(encoding='utf-8')
+        except Exception as e:
+            return {"status": "error", "error": f"read_failed_{type(e).__name__}", "url": url}
+        
+        # Try extraction strategies in order
+        content = None
+        extraction_metadata = {}
+        
+        # Strategy 1: Custom selectors (if provided)
+        if extraction_config.get("selectors"):
+            content, extraction_metadata = ExtractContentTask._extract_with_selectors(
+                html, extraction_config["selectors"]
+            )
+        
+        # Strategy 2: Readability algorithm (default)
+        if not content:
+            content, extraction_metadata = ExtractContentTask._extract_with_readability(html, url)
+        
+        if not content:
+            return {
+                "status": "error", 
+                "url": url,
+                "file": html_file.name,
+                **extraction_metadata
+            }
+        
+        # Text chunking
+        chunk_size = extraction_config.get("chunk_size", 1000)
+        overlap = extraction_config.get("overlap", 200)
+        
+        chunks = ExtractContentTask._chunk_text_semantic(
+            content, chunk_size=chunk_size, overlap=overlap
+        )
+        
+        if not chunks:
+            return {
+                "status": "error",
+                "error": "chunking_failed",
+                "url": url,
+                "file": html_file.name
+            }
+        
+        return {
+            "status": "success",
+            "url": url,
+            "file": html_file.name,
+            "total_chunks": len(chunks),
+            "total_tokens": sum(c["token_count"] for c in chunks),
+            "chunks": chunks,
+            **extraction_metadata
+        }
+    
+    # ───── Main entry point ─────
+    async def run(self, *, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+        """
+        Extract clean content from previously scraped HTML files.
+        
+        Expected input: Directory containing raw_html/ and crawl_metadata.json from scrape-site task
+        Output: Vector-store ready content with intelligent chunking
+        """
+        from .utils import save_json_atomic
+        
+        # Get source directory (either from params or same as output)
+        source_dir = pathlib.Path(params.get("source_dir", job_output_dir))
+        if not source_dir.exists():
+            raise ValueError(f"Source directory does not exist: {source_dir}")
+        
+        # Find HTML files
+        html_dir = source_dir / "raw_html"
+        if not html_dir.exists():
+            raise ValueError(f"HTML directory not found: {html_dir}. Run scrape-site task first.")
+        
+        # Load crawl metadata if available
+        metadata_file = source_dir / "crawl_metadata.json"
+        crawl_metadata = {}
+        if metadata_file.exists():
+            try:
+                crawl_metadata = json.loads(metadata_file.read_text())
+            except Exception:
+                logger.warning("Could not load crawl metadata")
+        
+        # Extraction configuration
+        extraction_config = {
+            "chunk_size": params.get("chunk_size", 1000),
+            "overlap": params.get("overlap", 200),
+            "selectors": params.get("selectors", []),  # Custom CSS selectors
+            "min_content_length": params.get("min_content_length", 100)
+        }
+        
+        # Setup output
+        out_dir = pathlib.Path(job_output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        content_dir = out_dir / "extracted_content"
+        content_dir.mkdir(exist_ok=True)
+        
+        # Process HTML files
+        html_files = list(html_dir.glob("*.html"))
+        logger.info(f"Processing {len(html_files)} HTML files")
+        
+        all_documents = []
+        successful_extractions = 0
+        failed_extractions = 0
+        total_chunks = 0
+        total_tokens = 0
+        
+        for i, html_file in enumerate(html_files, 1):
+            # Reconstruct URL from filename
+            url = urllib.parse.unquote(html_file.stem)
+            
+            logger.info(f"[{i}/{len(html_files)}] Extracting: {url[:80]}...")
+            
+            result = await ExtractContentTask._extract_content_from_html(
+                html_file, url, extraction_config, logger
+            )
+            
+            if result["status"] == "success":
+                successful_extractions += 1
+                total_chunks += result["total_chunks"]
+                total_tokens += result["total_tokens"]
+                
+                # Save individual document
+                doc_file = content_dir / f"doc_{i:04d}.json"
+                save_json_atomic(doc_file, result)
+                
+                # Add to collection
+                all_documents.append({
+                    "document_id": f"doc_{i:04d}",
+                    "url": url,
+                    "file": doc_file.name,
+                    "chunks": result["total_chunks"],
+                    "tokens": result["total_tokens"],
+                    "extraction_method": result.get("extraction_method", "unknown")
+                })
+            else:
+                failed_extractions += 1
+                logger.warning(f"Failed to extract {url}: {result.get('error', 'unknown')}")
+        
+        # Create final output for vector store
+        vector_store_output = {
+            "source_info": {
+                "base_domain": crawl_metadata.get("base_domain", "unknown"),
+                "start_url": crawl_metadata.get("start_url", "unknown"),
+                "crawl_timestamp": crawl_metadata.get("timestamp", "unknown")
+            },
+            "extraction_config": extraction_config,
+            "statistics": {
+                "total_html_files": len(html_files),
+                "successful_extractions": successful_extractions,
+                "failed_extractions": failed_extractions,
+                "total_documents": len(all_documents),
+                "total_chunks": total_chunks,
+                "total_tokens": total_tokens,
+                "avg_chunks_per_doc": round(total_chunks / len(all_documents), 2) if all_documents else 0,
+                "avg_tokens_per_chunk": round(total_tokens / total_chunks, 2) if total_chunks else 0
+            },
+            "documents": all_documents
+        }
+        
+        # Save final outputs
+        save_json_atomic(out_dir / "vector_store_ready.json", vector_store_output)
+        save_json_atomic(out_dir / "extraction_summary.json", {
+            "successful": successful_extractions,
+            "failed": failed_extractions,
+            "total_chunks": total_chunks,
+            "total_tokens": total_tokens,
+            "config": extraction_config
+        })
+        
+        logger.info(f"Content extraction completed: {successful_extractions}/{len(html_files)} files, {total_chunks} chunks, {total_tokens} tokens")
+        
+        return {
+            "source_directory": str(source_dir),
+            "html_files_found": len(html_files),
+            "successful_extractions": successful_extractions,
+            "failed_extractions": failed_extractions,
+            "total_chunks": total_chunks,
+            "total_tokens": total_tokens,
+            "content_directory": "extracted_content",
+            "vector_store_file": "vector_store_ready.json",
+            "summary_file": "extraction_summary.json"
+        }
+
+
+@_registry.register("extract-content")
+async def extract_content(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    task = ExtractContentTask()
     return await task.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
