@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import json
 import logging
@@ -766,6 +767,697 @@ class SaudiOpenDataTask:
 async def saudi_open_data(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
     task = SaudiOpenDataTask()
     return await task.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+
+
+# Register: booking-hotels
+@_registry.register("booking-hotels")
+async def booking_hotels(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await BookingHotelsTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+
+
+# ═══════════════════ Booking.com Hotels Scraper ═══════════════════
+
+class BookingHotelsTask:
+    """
+    Professional hotel data scraper for Booking.com with comprehensive filtering.
+    
+    Features:
+    - Location-based search (cities, neighborhoods, landmarks)
+    - Date range and guest configuration
+    - Price, rating, and amenity filters
+    - Proximity-based search near specific landmarks
+    - Reviews collection with quality metrics
+    - Anti-bot detection mitigation
+    """
+    
+    BASE_URL = "https://www.booking.com"
+    
+    # ───── Parameter validation and defaults ─────
+    @staticmethod
+    def _validate_params(params: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and normalize input parameters."""
+        import datetime
+        from dateutil.parser import parse as parse_date
+        
+        validated = {}
+        
+        # Required parameters
+        if not params.get("location"):
+            raise ValueError("location parameter is required")
+        validated["location"] = str(params["location"]).strip()
+        
+        if not params.get("check_in"):
+            raise ValueError("check_in date is required (YYYY-MM-DD format)")
+        if not params.get("check_out"):
+            raise ValueError("check_out date is required (YYYY-MM-DD format)")
+            
+        # Parse and validate dates
+        try:
+            check_in = parse_date(params["check_in"]).date()
+            check_out = parse_date(params["check_out"]).date()
+        except Exception:
+            raise ValueError("Invalid date format. Use YYYY-MM-DD")
+            
+        if check_in < datetime.date.today():
+            raise ValueError("check_in date cannot be in the past")
+        if check_out <= check_in:
+            raise ValueError("check_out must be after check_in")
+            
+        validated["check_in"] = check_in.strftime("%Y-%m-%d")
+        validated["check_out"] = check_out.strftime("%Y-%m-%d")
+        validated["nights"] = (check_out - check_in).days
+        
+        # Guest configuration with defaults
+        validated["adults"] = max(1, int(params.get("adults", 2)))
+        validated["children"] = max(0, int(params.get("children", 0)))
+        validated["rooms"] = max(1, int(params.get("rooms", 1)))
+        
+        # Optional filters
+        if "min_price" in params and params["min_price"] is not None:
+            validated["min_price"] = max(0, float(params["min_price"]))
+        if "max_price" in params and params["max_price"] is not None:
+            validated["max_price"] = max(0, float(params["max_price"]))
+            
+        if "min_rating" in params and params["min_rating"] is not None:
+            rating = float(params["min_rating"])
+            if not 0 <= rating <= 10:
+                raise ValueError("min_rating must be between 0 and 10")
+            validated["min_rating"] = rating
+            
+        if "star_rating" in params and params["star_rating"] is not None:
+            stars = params["star_rating"]
+            if isinstance(stars, (list, tuple)):
+                validated["star_rating"] = [int(s) for s in stars if 1 <= int(s) <= 5]
+            else:
+                star = int(stars)
+                if 1 <= star <= 5:
+                    validated["star_rating"] = [star]
+                    
+        # Amenities normalization
+        if "amenities" in params and params["amenities"]:
+            amenity_map = {
+                "wifi": "free_wifi",
+                "pool": "swimming_pool", 
+                "gym": "fitness_center",
+                "spa": "spa_wellness",
+                "parking": "parking",
+                "restaurant": "restaurant",
+                "bar": "bar",
+                "pets": "pets_allowed"
+            }
+            amenities = params["amenities"]
+            if isinstance(amenities, str):
+                amenities = [amenities]
+            validated["amenities"] = [amenity_map.get(a.lower(), a.lower()) for a in amenities]
+            
+        # Search radius for proximity searches
+        if "search_radius" in params:
+            radius = params["search_radius"]
+            if isinstance(radius, str) and radius.endswith("km"):
+                validated["search_radius_km"] = float(radius[:-2])
+            else:
+                validated["search_radius_km"] = float(radius)
+                
+        # Results configuration
+        validated["max_results"] = min(200, max(1, int(params.get("max_results", 50))))
+        validated["include_reviews"] = bool(params.get("include_reviews", True))
+        
+        return validated
+    
+    # ───── Browser context and anti-bot setup ─────
+    @staticmethod
+    async def _create_context(browser: Browser, params: Dict[str, Any]) -> BrowserContext:
+        """Create browser context with anti-bot measures."""
+        user_agent = params.get("user_agent") or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        
+        args = {
+            "user_agent": user_agent,
+            "viewport": {"width": 1920, "height": 1080},
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "permissions": ["geolocation"],
+            "extra_http_headers": {
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Upgrade-Insecure-Requests": "1"
+            }
+        }
+        
+        if "proxy" in params:
+            args["proxy"] = {"server": params["proxy"]}
+            
+        ctx = await browser.new_context(**args)
+        
+        # Anti-detection scripts
+        await ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+            
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+            
+            window.chrome = {
+                runtime: {},
+            };
+        """)
+        
+        return ctx
+    
+    # ───── Search form automation ─────
+    @staticmethod
+    async def _perform_search(page, validated_params: Dict[str, Any], logger: logging.Logger) -> None:
+        """Fill and submit the hotel search form."""
+        try:
+            # Navigate to booking.com
+            _log(logger, "info", "Navigating to Booking.com")
+            await page.goto(BookingHotelsTask.BASE_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(random.uniform(2000, 4000))
+            
+            # Accept cookies if modal appears
+            try:
+                cookie_button = page.locator("button[data-testid*='cookie'], button:has-text('Accept')")
+                await cookie_button.click(timeout=5000)
+                await page.wait_for_timeout(1000)
+            except:
+                pass
+            
+            # Fill location
+            location_input = page.locator("input[data-testid='destination-input'], input[name='ss'], input[placeholder*='destination']")
+            await location_input.clear()
+            await location_input.fill(validated_params["location"])
+            await page.wait_for_timeout(1500)
+            
+            # Wait for and click the first autocomplete suggestion
+            try:
+                suggestion = page.locator("li[data-testid*='autocomplete'], .sb-autocomplete__item").first
+                await suggestion.click(timeout=5000)
+            except:
+                # If no suggestions, just continue
+                pass
+            
+            await page.wait_for_timeout(1000)
+            
+            # Handle date selection
+            check_in_input = page.locator("button[data-testid='date-display-field-start'], input[data-testid='searchbox-dates-input']")
+            await check_in_input.click()
+            await page.wait_for_timeout(1000)
+            
+            # Select dates (simplified - select by date attributes)
+            check_in_date = validated_params["check_in"]
+            check_out_date = validated_params["check_out"]
+            
+            check_in_cell = page.locator(f"td[data-date='{check_in_date}'], span[data-date='{check_in_date}']")
+            await check_in_cell.click()
+            await page.wait_for_timeout(500)
+            
+            check_out_cell = page.locator(f"td[data-date='{check_out_date}'], span[data-date='{check_out_date}']")
+            await check_out_cell.click()
+            await page.wait_for_timeout(1000)
+            
+            # Configure guests and rooms
+            if validated_params["adults"] != 2 or validated_params["children"] > 0 or validated_params["rooms"] > 1:
+                guest_button = page.locator("button[data-testid='occupancy-config'], button:has-text('guests')")
+                await guest_button.click()
+                await page.wait_for_timeout(1000)
+                
+                # Adults
+                adults_current = await page.locator("input[data-testid='adults-input'], input[id*='adults']").input_value()
+                adults_diff = validated_params["adults"] - int(adults_current or "2")
+                if adults_diff > 0:
+                    for _ in range(adults_diff):
+                        await page.locator("button[data-testid='adults-increment'], button[aria-label*='Increase adults']").click()
+                elif adults_diff < 0:
+                    for _ in range(abs(adults_diff)):
+                        await page.locator("button[data-testid='adults-decrement'], button[aria-label*='Decrease adults']").click()
+                
+                # Children
+                if validated_params["children"] > 0:
+                    for _ in range(validated_params["children"]):
+                        await page.locator("button[data-testid='children-increment'], button[aria-label*='Increase children']").click()
+                
+                # Rooms
+                rooms_current = await page.locator("input[data-testid='rooms-input'], input[id*='rooms']").input_value()
+                rooms_diff = validated_params["rooms"] - int(rooms_current or "1")
+                if rooms_diff > 0:
+                    for _ in range(rooms_diff):
+                        await page.locator("button[data-testid='rooms-increment'], button[aria-label*='Increase rooms']").click()
+                
+                await page.wait_for_timeout(500)
+            
+            # Submit search
+            search_button = page.locator("button[data-testid='header-search-button'], button[type='submit']:has-text('Search')")
+            await search_button.click()
+            
+            # Wait for results to load
+            await page.wait_for_selector("[data-testid='property-card'], .sr_property_block", timeout=30000)
+            await page.wait_for_timeout(random.uniform(2000, 4000))
+            
+            _log(logger, "info", f"Search completed for {validated_params['location']}")
+            
+        except TimeoutError:
+            raise RuntimeError("Search form submission timed out")
+        except Exception as e:
+            raise RuntimeError(f"Search form error: {str(e)}")
+    
+    # ───── Filter application ─────
+    @staticmethod
+    async def _apply_filters(page, validated_params: Dict[str, Any], logger: logging.Logger) -> None:
+        """Apply price, rating, and amenity filters."""
+        try:
+            await page.wait_for_timeout(2000)
+            
+            # Price filters
+            if "min_price" in validated_params or "max_price" in validated_params:
+                try:
+                    # Try to find price filter section
+                    price_filter = page.locator("div[data-testid*='price'], div:has-text('Price per night')")
+                    await price_filter.click(timeout=5000)
+                    await page.wait_for_timeout(1000)
+                    
+                    if "min_price" in validated_params:
+                        min_input = page.locator("input[data-testid*='price-min'], input[name*='min'], input[placeholder*='min']")
+                        await min_input.fill(str(int(validated_params["min_price"])))
+                        
+                    if "max_price" in validated_params:
+                        max_input = page.locator("input[data-testid*='price-max'], input[name*='max'], input[placeholder*='max']")
+                        await max_input.fill(str(int(validated_params["max_price"])))
+                        
+                    await page.wait_for_timeout(500)
+                    _log(logger, "info", "Applied price filters")
+                except Exception:
+                    _log(logger, "warning", "Could not apply price filters")
+            
+            # Rating filter
+            if "min_rating" in validated_params:
+                try:
+                    rating_value = validated_params["min_rating"]
+                    # Convert to booking.com's rating categories
+                    if rating_value >= 9:
+                        rating_selector = "div[data-testid*='rating']:has-text('9+'), button:has-text('Wonderful: 9+')"
+                    elif rating_value >= 8:
+                        rating_selector = "div[data-testid*='rating']:has-text('8+'), button:has-text('Very good: 8+')"
+                    elif rating_value >= 7:
+                        rating_selector = "div[data-testid*='rating']:has-text('7+'), button:has-text('Good: 7+')"
+                    elif rating_value >= 6:
+                        rating_selector = "div[data-testid*='rating']:has-text('6+'), button:has-text('Pleasant: 6+')"
+                    else:
+                        rating_selector = None
+                        
+                    if rating_selector:
+                        rating_filter = page.locator(rating_selector).first
+                        await rating_filter.click(timeout=5000)
+                        await page.wait_for_timeout(1000)
+                        _log(logger, "info", f"Applied rating filter: {rating_value}+")
+                except Exception:
+                    _log(logger, "warning", "Could not apply rating filter")
+            
+            # Star rating filter
+            if "star_rating" in validated_params:
+                try:
+                    for star in validated_params["star_rating"]:
+                        star_checkbox = page.locator(f"input[name*='star'][value='{star}'], label:has-text('{star} star')")
+                        await star_checkbox.click(timeout=5000)
+                        await page.wait_for_timeout(500)
+                    _log(logger, "info", f"Applied star rating filter: {validated_params['star_rating']}")
+                except Exception:
+                    _log(logger, "warning", "Could not apply star rating filter")
+            
+            # Amenity filters
+            if "amenities" in validated_params:
+                try:
+                    for amenity in validated_params["amenities"]:
+                        amenity_checkbox = page.locator(f"input[value*='{amenity}'], label:has-text('{amenity.replace('_', ' ').title()}')")
+                        await amenity_checkbox.click(timeout=3000)
+                        await page.wait_for_timeout(300)
+                    _log(logger, "info", f"Applied amenity filters: {validated_params['amenities']}")
+                except Exception:
+                    _log(logger, "warning", "Could not apply amenity filters")
+            
+            # Wait for filters to take effect
+            await page.wait_for_timeout(3000)
+            
+        except Exception as e:
+            _log(logger, "warning", f"Filter application failed: {str(e)}")
+    
+    # ───── Hotel data extraction ─────
+    @staticmethod
+    async def _extract_hotel_data(page, hotel_element, logger: logging.Logger) -> Optional[Dict[str, Any]]:
+        """Extract comprehensive data from a single hotel card."""
+        try:
+            hotel_data = {}
+            
+            # Basic information
+            try:
+                name_elem = hotel_element.locator("[data-testid*='title'], .sr-hotel__name, h3, h4")
+                hotel_data["name"] = await name_elem.first.text_content()
+            except:
+                hotel_data["name"] = "Unknown Hotel"
+            
+            # Rating and reviews
+            try:
+                rating_elem = hotel_element.locator("[data-testid*='rating'], .bui-review-score__badge")
+                rating_text = await rating_elem.first.text_content()
+                hotel_data["rating"] = float(re.search(r"(\d+\.?\d*)", rating_text).group(1))
+            except:
+                hotel_data["rating"] = None
+                
+            try:
+                rating_desc_elem = hotel_element.locator("[data-testid*='rating-desc'], .bui-review-score__title")
+                hotel_data["rating_text"] = await rating_desc_elem.first.text_content()
+            except:
+                hotel_data["rating_text"] = None
+                
+            try:
+                reviews_elem = hotel_element.locator("[data-testid*='reviews'], .bui-review-score__text")
+                reviews_text = await reviews_elem.first.text_content()
+                match = re.search(r"(\d+(?:,\d+)*)", reviews_text)
+                if match:
+                    hotel_data["reviews_count"] = int(match.group(1).replace(",", ""))
+                else:
+                    hotel_data["reviews_count"] = 0
+            except:
+                hotel_data["reviews_count"] = 0
+            
+            # Price information
+            try:
+                price_elem = hotel_element.locator("[data-testid*='price'], .prco-valign-middle-helper, .bui-price-display__value")
+                price_text = await price_elem.first.text_content()
+                price_match = re.search(r"(\d+(?:,\d+)*)", price_text.replace(" ", ""))
+                if price_match:
+                    hotel_data["price_per_night"] = int(price_match.group(1).replace(",", ""))
+                    # Extract currency
+                    currency_match = re.search(r"([A-Z]{3}|[$€£¥])", price_text)
+                    hotel_data["currency"] = currency_match.group(1) if currency_match else "USD"
+                else:
+                    hotel_data["price_per_night"] = None
+                    hotel_data["currency"] = None
+            except:
+                hotel_data["price_per_night"] = None
+                hotel_data["currency"] = None
+            
+            # Location information
+            try:
+                location_elem = hotel_element.locator("[data-testid*='address'], .sr_card_address_line")
+                hotel_data["address"] = await location_elem.first.text_content()
+            except:
+                hotel_data["address"] = None
+                
+            try:
+                distance_elem = hotel_element.locator("[data-testid*='distance'], .sr_card__subtitle--info")
+                distance_text = await distance_elem.first.text_content()
+                hotel_data["distance_to_center"] = distance_text.strip()
+            except:
+                hotel_data["distance_to_center"] = None
+            
+            # Hotel URL for booking
+            try:
+                link_elem = hotel_element.locator("a[data-testid*='title'], .hotel_name_link")
+                hotel_url = await link_elem.first.get_attribute("href")
+                if hotel_url and not hotel_url.startswith("http"):
+                    hotel_url = "https://www.booking.com" + hotel_url
+                hotel_data["booking_url"] = hotel_url
+            except:
+                hotel_data["booking_url"] = None
+            
+            # Star rating
+            try:
+                stars_elem = hotel_element.locator("[data-testid*='stars'], .bui-rating__stars")
+                stars_html = await stars_elem.first.inner_html()
+                star_count = stars_html.count("star") or stars_html.count("★")
+                hotel_data["star_rating"] = min(5, max(1, star_count)) if star_count else None
+            except:
+                hotel_data["star_rating"] = None
+            
+            # Images
+            try:
+                img_elements = hotel_element.locator("img[data-testid*='image'], .sr_item_photo_link img")
+                images = []
+                for i in range(min(3, await img_elements.count())):
+                    img_src = await img_elements.nth(i).get_attribute("src")
+                    if img_src and img_src.startswith("http"):
+                        images.append(img_src)
+                hotel_data["images"] = images
+            except:
+                hotel_data["images"] = []
+            
+            # Generate unique ID
+            name_for_id = hotel_data["name"].lower().replace(" ", "_")
+            hotel_data["id"] = f"booking_{hashlib.md5(name_for_id.encode()).hexdigest()[:8]}"
+            
+            return hotel_data
+            
+        except Exception as e:
+            _log(logger, "warning", f"Failed to extract hotel data: {str(e)}")
+            return None
+    
+    # ───── Reviews collection ─────
+    @staticmethod
+    async def _collect_reviews(page, hotel_url: str, max_reviews: int, logger: logging.Logger) -> List[Dict[str, Any]]:
+        """Collect reviews for a specific hotel."""
+        reviews = []
+        try:
+            if not hotel_url:
+                return reviews
+                
+            # Navigate to hotel page
+            await page.goto(hotel_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(random.uniform(1000, 2000))
+            
+            # Try to find and click reviews section
+            try:
+                reviews_tab = page.locator("a:has-text('Reviews'), button:has-text('Reviews'), [data-testid*='reviews']")
+                await reviews_tab.first.click(timeout=5000)
+                await page.wait_for_timeout(2000)
+            except:
+                pass
+            
+            # Extract review elements
+            review_elements = page.locator(".c-review, .bui-review, [data-testid*='review']")
+            review_count = min(max_reviews, await review_elements.count())
+            
+            for i in range(review_count):
+                try:
+                    review_elem = review_elements.nth(i)
+                    
+                    review_data = {}
+                    
+                    # Review text
+                    try:
+                        review_text_elem = review_elem.locator(".c-review__text, .bui-review__content")
+                        review_data["text"] = await review_text_elem.first.text_content()
+                    except:
+                        review_data["text"] = ""
+                    
+                    # Review rating
+                    try:
+                        rating_elem = review_elem.locator(".c-review__score, .bui-review-score__badge")
+                        rating_text = await rating_elem.first.text_content()
+                        rating_match = re.search(r"(\d+\.?\d*)", rating_text)
+                        review_data["rating"] = float(rating_match.group(1)) if rating_match else None
+                    except:
+                        review_data["rating"] = None
+                    
+                    # Reviewer info
+                    try:
+                        reviewer_elem = review_elem.locator(".c-review__guest-name, .bui-review__guest-name")
+                        review_data["reviewer"] = await reviewer_elem.first.text_content()
+                    except:
+                        review_data["reviewer"] = "Anonymous"
+                    
+                    # Review date
+                    try:
+                        date_elem = review_elem.locator(".c-review__date, .bui-review__date")
+                        review_data["date"] = await date_elem.first.text_content()
+                    except:
+                        review_data["date"] = None
+                    
+                    if review_data["text"]:  # Only add non-empty reviews
+                        reviews.append(review_data)
+                        
+                except Exception:
+                    continue
+            
+            _log(logger, "info", f"Collected {len(reviews)} reviews")
+            
+        except Exception as e:
+            _log(logger, "warning", f"Failed to collect reviews: {str(e)}")
+        
+        return reviews
+    
+    # ───── Main execution method ─────
+    @staticmethod
+    async def run(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+        """Main execution method for the booking hotels task."""
+        start_time = datetime.datetime.utcnow()
+        
+        try:
+            # Validate parameters
+            validated_params = BookingHotelsTask._validate_params(params)
+            _log(logger, "info", f"Starting hotel search for {validated_params['location']}")
+            
+            # Create browser context
+            ctx = await BookingHotelsTask._create_context(browser, params)
+            page = await ctx.new_page()
+            
+            try:
+                # Perform search
+                await BookingHotelsTask._perform_search(page, validated_params, logger)
+                
+                # Apply filters
+                await BookingHotelsTask._apply_filters(page, validated_params, logger)
+                
+                # Collect hotels data
+                hotels = []
+                collected_count = 0
+                page_num = 1
+                max_results = validated_params["max_results"]
+                
+                while collected_count < max_results:
+                    _log(logger, "info", f"Processing page {page_num}")
+                    
+                    # Wait for hotels to load
+                    await page.wait_for_selector("[data-testid='property-card'], .sr_property_block", timeout=15000)
+                    await page.wait_for_timeout(random.uniform(1000, 2000))
+                    
+                    # Get hotel elements
+                    hotel_elements = page.locator("[data-testid='property-card'], .sr_property_block")
+                    hotel_count = await hotel_elements.count()
+                    
+                    if hotel_count == 0:
+                        _log(logger, "info", "No more hotels found")
+                        break
+                    
+                    # Extract data from each hotel
+                    for i in range(hotel_count):
+                        if collected_count >= max_results:
+                            break
+                            
+                        hotel_elem = hotel_elements.nth(i)
+                        hotel_data = await BookingHotelsTask._extract_hotel_data(hotel_elem, logger)
+                        
+                        if hotel_data:
+                            # Collect reviews if enabled
+                            if validated_params["include_reviews"] and hotel_data.get("booking_url"):
+                                # Open new page for reviews to avoid disrupting main flow
+                                review_page = await ctx.new_page()
+                                try:
+                                    reviews = await BookingHotelsTask._collect_reviews(
+                                        review_page, hotel_data["booking_url"], 5, logger
+                                    )
+                                    hotel_data["reviews"] = reviews
+                                except Exception:
+                                    hotel_data["reviews"] = []
+                                finally:
+                                    await review_page.close()
+                            else:
+                                hotel_data["reviews"] = []
+                            
+                            hotels.append(hotel_data)
+                            collected_count += 1
+                            
+                            if collected_count % 10 == 0:
+                                _log(logger, "info", f"Collected {collected_count}/{max_results} hotels")
+                    
+                    # Try to go to next page
+                    if collected_count < max_results:
+                        try:
+                            next_button = page.locator("a[aria-label*='Next'], button:has-text('Next'), .sr_pagination_item:has-text('Next')")
+                            if await next_button.count() > 0:
+                                await next_button.first.click()
+                                await page.wait_for_timeout(random.uniform(2000, 4000))
+                                page_num += 1
+                            else:
+                                _log(logger, "info", "No more pages available")
+                                break
+                        except Exception:
+                            _log(logger, "info", "Could not navigate to next page")
+                            break
+                    else:
+                        break
+                
+                # Save raw data
+                output_file = pathlib.Path(job_output_dir) / "hotels_data.json"
+                
+                result_data = {
+                    "search_metadata": {
+                        "location": validated_params["location"],
+                        "check_in": validated_params["check_in"],
+                        "check_out": validated_params["check_out"],
+                        "nights": validated_params["nights"],
+                        "guests": {
+                            "adults": validated_params["adults"],
+                            "children": validated_params["children"],
+                            "rooms": validated_params["rooms"]
+                        },
+                        "filters_applied": {k: v for k, v in validated_params.items() 
+                                          if k in ["min_price", "max_price", "min_rating", "star_rating", "amenities", "search_radius_km"]},
+                        "total_found": len(hotels),
+                        "scraped_count": collected_count,
+                        "search_completed_at": datetime.datetime.utcnow().isoformat()
+                    },
+                    "hotels": hotels
+                }
+                
+                output_file.write_text(json.dumps(result_data, indent=2, ensure_ascii=False), "utf-8")
+                
+                # Calculate statistics
+                avg_price = None
+                if hotels:
+                    prices = [h["price_per_night"] for h in hotels if h.get("price_per_night")]
+                    if prices:
+                        avg_price = sum(prices) / len(prices)
+                
+                avg_rating = None
+                if hotels:
+                    ratings = [h["rating"] for h in hotels if h.get("rating")]
+                    if ratings:
+                        avg_rating = sum(ratings) / len(ratings)
+                
+                end_time = datetime.datetime.utcnow()
+                duration = (end_time - start_time).total_seconds()
+                
+                _log(logger, "info", f"Hotel search completed: {collected_count} hotels in {duration:.1f}s")
+                
+                return {
+                    "success": True,
+                    "hotels_found": collected_count,
+                    "location": validated_params["location"],
+                    "date_range": f"{validated_params['check_in']} to {validated_params['check_out']}",
+                    "nights": validated_params["nights"],
+                    "average_price_per_night": round(avg_price, 2) if avg_price else None,
+                    "average_rating": round(avg_rating, 1) if avg_rating else None,
+                    "data_file": "hotels_data.json",
+                    "execution_time_seconds": round(duration, 1)
+                }
+                
+            finally:
+                await ctx.close()
+                
+        except Exception as e:
+            error_msg = str(e)
+            _log(logger, "error", f"Booking hotels task failed: {error_msg}")
+            
+            return {
+                "success": False,
+                "error": error_msg,
+                "location": params.get("location", "unknown"),
+                "execution_time_seconds": (datetime.datetime.utcnow() - start_time).total_seconds()
+            }
 
 
 # ═══════════════ Enhanced Website Scraper for Vector Stores ════════════════
