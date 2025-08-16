@@ -779,15 +779,102 @@ class ScrapeSiteTask:
     
     # ───── URL management utilities ─────
     @staticmethod
-    def _should_skip_url(url: str, base_domain: str) -> bool:
+    def _create_readable_filename(url: str) -> str:
+        """Create a readable filename from URL."""
+        import re
+        
+        parsed = urllib.parse.urlparse(url)
+        
+        # Start with domain
+        domain = parsed.netloc.replace('www.', '')
+        
+        # Add path, replacing slashes with underscores
+        path = parsed.path.strip('/')
+        if path:
+            # Clean up the path
+            path = re.sub(r'[^\w\-_/.]', '_', path)
+            path = path.replace('/', '_')
+            filename = f"{domain}_{path}"
+        else:
+            filename = domain
+            
+        # Add query params if they look meaningful (not just tracking)
+        if parsed.query:
+            query_parts = []
+            for param in parsed.query.split('&'):
+                if '=' in param:
+                    key, value = param.split('=', 1)
+                    # Skip common tracking parameters
+                    if key not in ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'ref', 'source']:
+                        query_parts.append(f"{key}_{value}")
+            if query_parts:
+                filename += '_' + '_'.join(query_parts[:3])  # Limit to first 3 meaningful params
+        
+        # Clean up and ensure reasonable length
+        filename = re.sub(r'[^\w\-_.]', '_', filename)
+        filename = re.sub(r'_+', '_', filename)  # Replace multiple underscores with single
+        filename = filename.strip('_')
+        
+        # Ensure reasonable length (filesystem limits)
+        if len(filename) > 200:
+            # Keep domain and truncate path
+            domain_part = domain.replace('.', '_')
+            remaining_length = 200 - len(domain_part) - 1
+            if remaining_length > 0:
+                truncated_path = filename[len(domain_part)+1:][:remaining_length]
+                filename = f"{domain_part}_{truncated_path}"
+            else:
+                filename = domain_part
+        
+        return filename or "webpage"
+    
+    @staticmethod
+    def _should_skip_url(url: str, base_domain: str, start_url: str = None) -> bool:
         """Filter out non-content URLs before fetching."""
         from .utils import extract_domain, is_same_domain
+        import urllib.parse
         
         # Domain check
         if not is_same_domain(url, f"https://{base_domain}"):
             return True
             
         url_lower = url.lower()
+        
+        # Special handling for GitHub repositories - restrict to specific repo
+        if 'github.com' in base_domain and start_url:
+            start_parsed = urllib.parse.urlparse(start_url.lower())
+            url_parsed = urllib.parse.urlparse(url_lower)
+            
+            # Extract repo path from start URL (e.g., "/0aub/qitta")
+            start_path_parts = [p for p in start_parsed.path.split('/') if p]
+            url_path_parts = [p for p in url_parsed.path.split('/') if p]
+            
+            if len(start_path_parts) >= 2:  # Should have at least user/repo
+                repo_owner = start_path_parts[0]
+                repo_name = start_path_parts[1]
+                
+                # Only allow URLs that start with the exact repository path
+                if len(url_path_parts) < 2:
+                    return True  # Skip GitHub root and single-level paths
+                
+                if url_path_parts[0] != repo_owner or url_path_parts[1] != repo_name:
+                    return True  # Skip URLs from different repositories or users
+                
+                # Skip signup/join URLs even within the same domain
+                if any(skip_word in url_lower for skip_word in ['join', 'signup', 'register', 'login']):
+                    return True
+                    
+                # Skip generic GitHub pages that aren't repository-specific
+                github_skip_paths = [
+                    'trending', 'features', 'solutions', 'enterprise', 
+                    'pricing', 'sponsors', 'collections', 'topics',
+                    'security', 'resources', 'customer-stories',
+                    'premium-support', 'newsroom', 'about', 'mobile',
+                    'edu', 'marketplace', 'logos', 'social-impact',
+                    'git-guides', 'github', 'team', 'password_reset'
+                ]
+                if len(url_path_parts) >= 3 and url_path_parts[2] in github_skip_paths:
+                    return True
         
         # Skip obvious non-content URLs
         skip_patterns = [
@@ -796,13 +883,30 @@ class ScrapeSiteTask:
             '.xml', '.json', '.rss', '.atom', '.pdf', '.doc', '.docx',
             '.xls', '.xlsx', '.ppt', '.pptx', '.zip', '.tar', '.gz',
             '/contact', '/privacy', '/terms', '/sitemap', '/robots.txt',
-            '/favicon.ico', '/apple-touch-icon', '/.css', '/.js', '/.map'
+            '/favicon.ico', '/apple-touch-icon', 'fluidicon.png',
+            'join?', 'signup?', 'register?'  # Query parameter based signup links
         ]
+        
+        # Skip files with non-HTML extensions
+        file_extensions_to_skip = [
+            '.css', '.js', '.map', '.scss', '.less',
+            '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.webp',
+            '.mp4', '.mp3', '.wav', '.avi', '.mov',
+            '.woff', '.woff2', '.ttf', '.eot',
+            '.zip', '.tar', '.gz', '.rar',
+            '.exe', '.dmg', '.deb', '.rpm'
+        ]
+        
+        # Check file extensions
+        parsed_url = urllib.parse.urlparse(url_lower)
+        path = parsed_url.path.lower()
+        if any(path.endswith(ext) for ext in file_extensions_to_skip):
+            return True
         
         return any(pattern in url_lower for pattern in skip_patterns)
     
     @staticmethod
-    def _extract_urls_from_page(html: str, current_url: str, base_domain: str) -> List[str]:
+    def _extract_urls_from_page(html: str, current_url: str, base_domain: str, start_url: str = None) -> List[str]:
         """Extract valid URLs from a page's HTML."""
         from .utils import extract_links_from_html, normalize_url
         
@@ -812,7 +916,7 @@ class ScrapeSiteTask:
         for link in all_links:
             try:
                 normalized = normalize_url(link)
-                if not ScrapeSiteTask._should_skip_url(normalized, base_domain):
+                if not ScrapeSiteTask._should_skip_url(normalized, base_domain, start_url):
                     valid_links.append(normalized)
             except Exception:
                 continue
@@ -985,8 +1089,8 @@ class ScrapeSiteTask:
                     logger.debug(f"Skipping low-content page: {current_url}")
                     continue
                 
-                # Save HTML atomically
-                safe_filename = urllib.parse.quote(current_url, safe='') + ".html"
+                # Save HTML atomically with readable filename
+                safe_filename = ScrapeSiteTask._create_readable_filename(current_url) + ".html"
                 html_file = html_dir / safe_filename
                 
                 save_success, save_error, file_meta = await save_content_atomic(
@@ -1015,7 +1119,7 @@ class ScrapeSiteTask:
                 
                 # Extract new URLs for crawling
                 if len(successful_pages) < (max_pages or float('inf')):
-                    new_urls = ScrapeSiteTask._extract_urls_from_page(html, current_url, base_domain)
+                    new_urls = ScrapeSiteTask._extract_urls_from_page(html, current_url, base_domain, start_url)
                     
                     for new_url in new_urls:
                         if new_url not in processed_urls and new_url not in url_queue:
@@ -1127,59 +1231,134 @@ class ExtractContentTask:
     # ───── Content extraction strategies ─────
     @staticmethod
     def _extract_with_readability(html: str, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
-        """Extract main content using readability algorithm."""
+        """Extract main content using enhanced readability algorithm."""
         try:
-            # Simple readability-like algorithm without external dependencies
             import re
             
-            # Remove script and style elements
+            # Step 1: Remove noise elements completely
             html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
             html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<noscript[^>]*>.*?</noscript>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
             
-            # Extract title
-            title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-            title = title_match.group(1).strip() if title_match else ""
-            
-            # Look for main content areas
-            content_patterns = [
-                r'<article[^>]*>(.*?)</article>',
-                r'<main[^>]*>(.*?)</main>',
-                r'<div[^>]*class=["\'][^"\']*content[^"\']*["\'][^>]*>(.*?)</div>',
-                r'<div[^>]*class=["\'][^"\']*article[^"\']*["\'][^>]*>(.*?)</div>',
-                r'<div[^>]*id=["\'][^"\']*content[^"\']*["\'][^>]*>(.*?)</div>',
+            # Remove common noise sections
+            noise_patterns = [
+                r'<nav[^>]*>.*?</nav>',
+                r'<header[^>]*>.*?</header>', 
+                r'<footer[^>]*>.*?</footer>',
+                r'<aside[^>]*>.*?</aside>',
+                r'<div[^>]*class=["\'][^"\']*(?:sidebar|navigation|nav|menu|header|footer|ad|advertisement|social|share|comment)[^"\']*["\'][^>]*>.*?</div>',
+                r'<div[^>]*id=["\'][^"\']*(?:sidebar|navigation|nav|menu|header|footer|ad|advertisement|social|share|comment)[^"\']*["\'][^>]*>.*?</div>',
             ]
             
-            best_content = ""
-            max_text_length = 0
+            for pattern in noise_patterns:
+                html = re.sub(pattern, '', html, flags=re.DOTALL | re.IGNORECASE)
             
-            for pattern in content_patterns:
+            # Extract title and meta description
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+            title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else ""
+            
+            meta_desc_match = re.search(r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']*)["\']', html, re.IGNORECASE)
+            meta_description = meta_desc_match.group(1).strip() if meta_desc_match else ""
+            
+            # Step 2: Score content areas by text density and semantic value
+            content_candidates = []
+            
+            # Primary content patterns (ordered by priority)
+            content_patterns = [
+                (r'<article[^>]*>(.*?)</article>', 10),
+                (r'<main[^>]*>(.*?)</main>', 9),
+                (r'<div[^>]*class=["\'][^"\']*(?:content|post|article|entry)[^"\']*["\'][^>]*>(.*?)</div>', 8),
+                (r'<div[^>]*id=["\'][^"\']*(?:content|post|article|entry|main)[^"\']*["\'][^>]*>(.*?)</div>', 7),
+                (r'<section[^>]*class=["\'][^"\']*(?:content|post|article|entry)[^"\']*["\'][^>]*>(.*?)</section>', 6),
+            ]
+            
+            for pattern, base_score in content_patterns:
                 matches = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
                 for match in matches:
-                    # Convert to text and measure
+                    # Clean HTML tags but preserve structure
                     text = re.sub(r'<[^>]+>', ' ', match)
                     text = re.sub(r'\s+', ' ', text).strip()
-                    if len(text) > max_text_length:
-                        max_text_length = len(text)
-                        best_content = text
+                    
+                    if len(text) > 100:  # Minimum content threshold
+                        # Calculate text density and other quality metrics
+                        word_count = len(text.split())
+                        char_count = len(text)
+                        
+                        # Score based on length, structure, and content quality
+                        score = base_score
+                        score += min(word_count / 100, 5)  # Length bonus (max 5 points)
+                        score += text.count('.') * 0.1  # Sentence structure bonus
+                        score += len(re.findall(r'\b\w{4,}\b', text)) * 0.01  # Complex words bonus
+                        
+                        content_candidates.append({
+                            'text': text,
+                            'score': score,
+                            'word_count': word_count,
+                            'char_count': char_count
+                        })
             
-            # Fallback: extract all paragraph text
-            if not best_content or len(best_content) < 200:
+            # Step 3: Fallback to paragraph extraction with scoring
+            if not content_candidates or max(c['score'] for c in content_candidates) < 8:
                 paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL | re.IGNORECASE)
-                paragraph_text = ' '.join(re.sub(r'<[^>]+>', ' ', p) for p in paragraphs)
-                paragraph_text = re.sub(r'\s+', ' ', paragraph_text).strip()
-                if len(paragraph_text) > len(best_content):
-                    best_content = paragraph_text
+                
+                if paragraphs:
+                    # Filter and score paragraphs
+                    quality_paragraphs = []
+                    for p in paragraphs:
+                        text = re.sub(r'<[^>]+>', ' ', p)
+                        text = re.sub(r'\s+', ' ', text).strip()
+                        
+                        if len(text) > 50:  # Minimum paragraph length
+                            word_count = len(text.split())
+                            # Score paragraphs based on length and content quality
+                            score = min(word_count / 20, 3) + text.count('.') * 0.2
+                            quality_paragraphs.append({'text': text, 'score': score})
+                    
+                    if quality_paragraphs:
+                        # Sort by score and take top paragraphs
+                        quality_paragraphs.sort(key=lambda x: x['score'], reverse=True)
+                        combined_text = '\n\n'.join(p['text'] for p in quality_paragraphs[:10])  # Top 10 paragraphs
+                        
+                        content_candidates.append({
+                            'text': combined_text,
+                            'score': 6,
+                            'word_count': len(combined_text.split()),
+                            'char_count': len(combined_text)
+                        })
             
-            if best_content:
+            # Step 4: Select best content
+            if content_candidates:
+                best_content = max(content_candidates, key=lambda x: x['score'])
+                
+                # Final cleaning
+                text = best_content['text']
+                # Remove excessive whitespace
+                text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)  # Max 2 consecutive newlines
+                text = re.sub(r'[ \t]+', ' ', text)  # Multiple spaces to single space
+                text = text.strip()
+                
+                # Add title if available and not already in content
+                if title and title.lower() not in text.lower()[:200]:
+                    text = f"{title}\n\n{text}"
+                
+                # Add meta description if available and substantial
+                if meta_description and len(meta_description) > 50 and meta_description.lower() not in text.lower()[:300]:
+                    text = f"{text}\n\n{meta_description}"
+                
                 metadata = {
-                    "extraction_method": "readability",
+                    "extraction_method": "enhanced_readability",
                     "title": title,
-                    "content_length": len(best_content),
-                    "word_count": len(best_content.split())
+                    "meta_description": meta_description,
+                    "content_length": len(text),
+                    "word_count": len(text.split()),
+                    "quality_score": best_content['score'],
+                    "candidates_found": len(content_candidates)
                 }
-                return best_content, metadata
+                
+                return text, metadata
             
-            return None, {"error": "no_content_found"}
+            return None, {"error": "no_quality_content_found"}
             
         except Exception as e:
             return None, {"error": f"readability_failed_{type(e).__name__}"}
@@ -1390,20 +1569,56 @@ class ExtractContentTask:
         """
         Extract clean content from previously scraped HTML files.
         
+        Parameters:
+        - job_id: ID of the scrape-site job to extract content from
+        - source_dir: Alternative to job_id - direct path to scraped data directory
+        
         Expected input: Directory containing raw_html/ and crawl_metadata.json from scrape-site task
         Output: Vector-store ready content with intelligent chunking
         """
         from .utils import save_json_atomic
         
-        # Get source directory (either from params or same as output)
-        source_dir = pathlib.Path(params.get("source_dir", job_output_dir))
-        if not source_dir.exists():
-            raise ValueError(f"Source directory does not exist: {source_dir}")
+        # Determine source directory
+        source_dir = None
+        
+        if "job_id" in params:
+            # Use job_id to find the scraped data directory
+            job_id = params["job_id"].strip()
+            if not job_id:
+                raise ValueError("job_id parameter cannot be empty")
+            
+            # Look for the job directory in common locations
+            from .config import DATA_ROOT
+            possible_paths = [
+                pathlib.Path(f"{DATA_ROOT}/scrape-site/{job_id}"),  # Main storage: task_name/job_id
+                pathlib.Path(f"{DATA_ROOT}/{job_id}"),  # Fallback: just job_id
+                pathlib.Path(f"/storage/scraped_data/scrape-site/{job_id}"),  # Container: task_name/job_id
+                pathlib.Path(f"/storage/scraped_data/{job_id}"),  # Container: just job_id
+                pathlib.Path(f"./output/{job_id}"),  # Local output
+                pathlib.Path(job_id),  # Direct path if job_id is actually a path
+            ]
+            
+            for path in possible_paths:
+                if path.exists() and (path / "raw_html").exists():
+                    source_dir = path
+                    logger.info(f"Found scraped data at: {source_dir}")
+                    break
+            
+            if not source_dir:
+                raise ValueError(f"Could not find scraped data for job_id: {job_id}. Tried: {[str(p) for p in possible_paths]}")
+                
+        elif "source_dir" in params:
+            # Use explicit source directory
+            source_dir = pathlib.Path(params["source_dir"])
+            if not source_dir.exists():
+                raise ValueError(f"Source directory does not exist: {source_dir}")
+        else:
+            raise ValueError("Either 'job_id' or 'source_dir' parameter is required")
         
         # Find HTML files
         html_dir = source_dir / "raw_html"
         if not html_dir.exists():
-            raise ValueError(f"HTML directory not found: {html_dir}. Run scrape-site task first.")
+            raise ValueError(f"HTML directory not found: {html_dir}. Make sure the scrape-site task completed successfully.")
         
         # Load crawl metadata if available
         metadata_file = source_dir / "crawl_metadata.json"
@@ -1519,4 +1734,582 @@ class ExtractContentTask:
 @_registry.register("extract-content")
 async def extract_content(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
     task = ExtractContentTask()
+    return await task.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+
+
+# ═══════════════ GitHub Repository Analyzer ════════════════
+class GitHubRepoTask:
+    """
+    Comprehensive GitHub repository analyzer that collects code, issues, releases, documentation,
+    and repository metadata for creating a complete knowledge base of a GitHub repository.
+    Uses the official GitHub API for efficient and reliable data collection.
+    """
+    
+    # ───── GitHub API utilities ─────
+    @staticmethod
+    def _parse_github_url(url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract owner and repo from GitHub URL."""
+        try:
+            parsed = urllib.parse.urlparse(url.lower())
+            if 'github.com' not in parsed.netloc:
+                return None, None
+            
+            path_parts = [p for p in parsed.path.split('/') if p]
+            if len(path_parts) >= 2:
+                return path_parts[0], path_parts[1]
+            return None, None
+        except Exception:
+            return None, None
+    
+    @staticmethod
+    async def _github_api_request(
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: Dict[str, str],
+        params: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """Make GitHub API request with error handling."""
+        try:
+            url = f"https://api.github.com/{endpoint.lstrip('/')}"
+            response = await client.get(url, headers=headers, params=params or {})
+            
+            if response.status_code == 200:
+                return True, response.json(), None
+            elif response.status_code == 403:
+                return False, None, "api_rate_limit"
+            elif response.status_code == 404:
+                return False, None, "not_found"
+            else:
+                return False, None, f"api_error_{response.status_code}"
+        except Exception as e:
+            return False, None, f"request_failed_{type(e).__name__}"
+    
+    # ───── Repository metadata collection ─────
+    @staticmethod
+    async def _get_repo_metadata(
+        client: httpx.AsyncClient,
+        owner: str,
+        repo: str,
+        headers: Dict[str, str],
+        logger: logging.Logger
+    ) -> Dict[str, Any]:
+        """Collect comprehensive repository metadata."""
+        
+        # Basic repository info
+        success, repo_data, error = await GitHubRepoTask._github_api_request(
+            client, f"repos/{owner}/{repo}", headers
+        )
+        
+        if not success:
+            logger.warning(f"Failed to get repo metadata: {error}")
+            return {"error": error}
+        
+        metadata = {
+            "repository": {
+                "owner": owner,
+                "name": repo,
+                "full_name": repo_data.get("full_name"),
+                "description": repo_data.get("description"),
+                "html_url": repo_data.get("html_url"),
+                "clone_url": repo_data.get("clone_url"),
+                "language": repo_data.get("language"),
+                "languages_url": repo_data.get("languages_url"),
+                "size": repo_data.get("size"),
+                "stargazers_count": repo_data.get("stargazers_count"),
+                "watchers_count": repo_data.get("watchers_count"),
+                "forks_count": repo_data.get("forks_count"),
+                "open_issues_count": repo_data.get("open_issues_count"),
+                "created_at": repo_data.get("created_at"),
+                "updated_at": repo_data.get("updated_at"),
+                "pushed_at": repo_data.get("pushed_at"),
+                "default_branch": repo_data.get("default_branch", "main"),
+                "license": repo_data.get("license", {}).get("name") if repo_data.get("license") else None,
+                "topics": repo_data.get("topics", [])
+            }
+        }
+        
+        # Get languages
+        success, languages, error = await GitHubRepoTask._github_api_request(
+            client, f"repos/{owner}/{repo}/languages", headers
+        )
+        if success:
+            metadata["repository"]["languages"] = languages
+        
+        # Get contributors (top 100)
+        success, contributors, error = await GitHubRepoTask._github_api_request(
+            client, f"repos/{owner}/{repo}/contributors", headers, {"per_page": 100}
+        )
+        if success:
+            metadata["repository"]["contributors"] = contributors
+        
+        return metadata
+    
+    # ───── Code content collection ─────
+    @staticmethod
+    async def _get_repository_tree(
+        client: httpx.AsyncClient,
+        owner: str,
+        repo: str,
+        headers: Dict[str, str],
+        branch: str = "main",
+        max_files: int = 500
+    ) -> List[Dict[str, Any]]:
+        """Get repository file tree with content."""
+        
+        # Get the tree recursively
+        success, tree_data, error = await GitHubRepoTask._github_api_request(
+            client, f"repos/{owner}/{repo}/git/trees/{branch}", headers, {"recursive": "1"}
+        )
+        
+        if not success:
+            # Try alternative branch names if default fails
+            if branch == "main":
+                success, tree_data, error = await GitHubRepoTask._github_api_request(
+                    client, f"repos/{owner}/{repo}/git/trees/master", headers, {"recursive": "1"}
+                )
+            elif branch == "master":
+                success, tree_data, error = await GitHubRepoTask._github_api_request(
+                    client, f"repos/{owner}/{repo}/git/trees/main", headers, {"recursive": "1"}
+                )
+            
+            if not success:
+                return []
+        
+        files = []
+        tree_items = tree_data.get("tree", [])
+        
+        # Filter for important files
+        important_files = []
+        code_files = []
+        
+        for item in tree_items:
+            if item.get("type") != "blob":  # Skip directories
+                continue
+                
+            path = item.get("path", "")
+            size = item.get("size", 0)
+            
+            # Skip very large files (>1MB)
+            if size > 1024 * 1024:
+                continue
+            
+            # Important files (prioritize)
+            if any(important in path.lower() for important in [
+                "readme", "license", "changelog", "contributing", "security",
+                "dockerfile", "docker-compose", "makefile", "package.json",
+                "requirements.txt", "setup.py", "cargo.toml", "go.mod",
+                ".gitignore", ".env.example"
+            ]):
+                important_files.append(item)
+            # Code files
+            elif any(path.lower().endswith(ext) for ext in [
+                '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c', '.h',
+                '.cs', '.php', '.rb', '.go', '.rs', '.swift', '.kt', '.scala',
+                '.html', '.css', '.scss', '.vue', '.md', '.yml', '.yaml',
+                '.json', '.xml', '.toml', '.cfg', '.ini'
+            ]):
+                code_files.append(item)
+        
+        # Combine and limit
+        selected_files = important_files + code_files[:max_files - len(important_files)]
+        
+        # Get file contents
+        for item in selected_files[:max_files]:
+            path = item.get("path")
+            sha = item.get("sha")
+            
+            if not path or not sha:
+                continue
+            
+            # Get file content
+            success, content_data, error = await GitHubRepoTask._github_api_request(
+                client, f"repos/{owner}/{repo}/git/blobs/{sha}", headers
+            )
+            
+            if success:
+                content = content_data.get("content", "")
+                encoding = content_data.get("encoding", "")
+                
+                # Decode content if base64
+                decoded_content = ""
+                if encoding == "base64":
+                    try:
+                        import base64
+                        decoded_content = base64.b64decode(content).decode('utf-8', errors='ignore')
+                    except Exception:
+                        decoded_content = "[Binary file or encoding error]"
+                else:
+                    decoded_content = content
+                
+                files.append({
+                    "path": path,
+                    "size": item.get("size", 0),
+                    "sha": sha,
+                    "content": decoded_content,
+                    "url": f"https://github.com/{owner}/{repo}/blob/{branch}/{path}"
+                })
+            
+            # Rate limiting
+            await asyncio.sleep(0.1)
+        
+        return files
+    
+    # ───── Issues collection ─────
+    @staticmethod
+    async def _get_issues(
+        client: httpx.AsyncClient,
+        owner: str,
+        repo: str,
+        headers: Dict[str, str],
+        max_issues: int = 200
+    ) -> List[Dict[str, Any]]:
+        """Get repository issues and pull requests."""
+        
+        issues = []
+        page = 1
+        per_page = 100
+        
+        while len(issues) < max_issues:
+            # Get both issues and pull requests
+            success, page_data, error = await GitHubRepoTask._github_api_request(
+                client, f"repos/{owner}/{repo}/issues", headers, {
+                    "state": "all",
+                    "sort": "updated",
+                    "direction": "desc",
+                    "per_page": per_page,
+                    "page": page
+                }
+            )
+            
+            if not success or not page_data:
+                break
+            
+            for issue in page_data:
+                # Get comments for important issues
+                comments = []
+                if issue.get("comments", 0) > 0 and len(issues) < 50:  # Get comments for first 50 issues
+                    comments_success, comments_data, _ = await GitHubRepoTask._github_api_request(
+                        client, f"repos/{owner}/{repo}/issues/{issue['number']}/comments", headers
+                    )
+                    if comments_success:
+                        comments = comments_data
+                
+                issue_data = {
+                    "number": issue.get("number"),
+                    "title": issue.get("title"),
+                    "body": issue.get("body", ""),
+                    "state": issue.get("state"),
+                    "labels": [label.get("name") for label in issue.get("labels", [])],
+                    "user": issue.get("user", {}).get("login"),
+                    "created_at": issue.get("created_at"),
+                    "updated_at": issue.get("updated_at"),
+                    "closed_at": issue.get("closed_at"),
+                    "is_pull_request": "pull_request" in issue,
+                    "html_url": issue.get("html_url"),
+                    "comments_count": issue.get("comments", 0),
+                    "comments": comments[:10]  # Limit comments per issue
+                }
+                
+                issues.append(issue_data)
+            
+            if len(page_data) < per_page:  # Last page
+                break
+                
+            page += 1
+            await asyncio.sleep(0.2)  # Rate limiting
+        
+        return issues[:max_issues]
+    
+    # ───── Releases collection ─────
+    @staticmethod
+    async def _get_releases(
+        client: httpx.AsyncClient,
+        owner: str,
+        repo: str,
+        headers: Dict[str, str],
+        max_releases: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Get repository releases."""
+        
+        success, releases_data, error = await GitHubRepoTask._github_api_request(
+            client, f"repos/{owner}/{repo}/releases", headers, {"per_page": max_releases}
+        )
+        
+        if not success:
+            return []
+        
+        releases = []
+        for release in releases_data:
+            release_data = {
+                "tag_name": release.get("tag_name"),
+                "name": release.get("name"),
+                "body": release.get("body", ""),
+                "draft": release.get("draft"),
+                "prerelease": release.get("prerelease"),
+                "created_at": release.get("created_at"),
+                "published_at": release.get("published_at"),
+                "author": release.get("author", {}).get("login"),
+                "html_url": release.get("html_url"),
+                "assets": [
+                    {
+                        "name": asset.get("name"),
+                        "download_count": asset.get("download_count"),
+                        "size": asset.get("size"),
+                        "browser_download_url": asset.get("browser_download_url")
+                    }
+                    for asset in release.get("assets", [])
+                ]
+            }
+            releases.append(release_data)
+        
+        return releases
+    
+    
+    # ───── Main execution ─────
+    async def run(self, *, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+        """
+        Main entry point for GitHub repository scraping.
+        
+        Collects repository metadata, code files, issues, releases, and documentation
+        to create a comprehensive knowledge base of the repository.
+        """
+        from .utils import save_json_atomic
+        
+        # Validate parameters
+        repo_url = params.get("repo_url", "").strip()
+        if not repo_url:
+            raise ValueError("Parameter 'repo_url' is required (GitHub repository URL)")
+        
+        owner, repo_name = GitHubRepoTask._parse_github_url(repo_url)
+        if not owner or not repo_name:
+            raise ValueError(f"Invalid GitHub repository URL: {repo_url}")
+        
+        # Configuration - all unlimited by default, user can specify limits
+        github_token = params.get("github_token", "")  # Optional for higher rate limits and private repos
+        max_files = params.get("max_files", None)  # None = unlimited (all files)
+        max_issues = params.get("max_issues", None)  # None = unlimited (all issues)
+        max_releases = params.get("max_releases", None)  # None = unlimited (all releases)
+        include_code = params.get("include_code", True)
+        include_issues = params.get("include_issues", True)
+        include_releases = params.get("include_releases", True)
+        
+        # Setup headers
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "GitHub-Repo-Scraper/1.0"
+        }
+        if github_token:
+            headers["Authorization"] = f"token {github_token}"
+        
+        # Setup output directory
+        out_dir = pathlib.Path(job_output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Starting GitHub repository scrape: {owner}/{repo_name}")
+        
+        # Collect data
+        results = {
+            "repository_url": repo_url,
+            "owner": owner,
+            "repo_name": repo_name,
+            "scrape_timestamp": asyncio.get_event_loop().time(),
+            "metadata": {},
+            "files": [],
+            "issues": [],
+            "releases": [],
+            "statistics": {}
+        }
+        
+        timeout = httpx.Timeout(30.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            
+            # 1. Repository metadata
+            logger.info("Collecting repository metadata...")
+            results["metadata"] = await GitHubRepoTask._get_repo_metadata(
+                client, owner, repo_name, headers, logger
+            )
+            
+            if "error" in results["metadata"]:
+                error_type = results["metadata"]["error"]
+                
+                # Provide clear error messages and suggestions
+                if error_type == "api_rate_limit":
+                    raise RuntimeError(
+                        "GitHub API rate limit exceeded (60 requests/hour for unauthenticated requests). "
+                        "Solutions: 1) Provide a 'github_token' parameter for 5000 requests/hour, "
+                        "2) Wait an hour for rate limit reset, "
+                        "3) Use 'scrape-site' task directly on the repository URL for basic content extraction."
+                    )
+                elif error_type == "not_found":
+                    raise RuntimeError(
+                        f"Repository '{owner}/{repo_name}' not found. "
+                        "Check if: 1) Repository exists, 2) Repository is private (requires github_token), "
+                        "3) Owner/repository name is correct."
+                    )
+                else:
+                    raise RuntimeError(f"Failed to access repository: {error_type}")
+            
+            default_branch = results["metadata"]["repository"].get("default_branch", "main")
+            
+            # 2. Code files
+            if include_code:
+                files_limit = max_files or 9999  # Use high number if unlimited
+                logger.info(f"Collecting code files ({'unlimited' if max_files is None else f'max: {max_files}'})...")
+                results["files"] = await GitHubRepoTask._get_repository_tree(
+                    client, owner, repo_name, headers, default_branch, files_limit
+                )
+                logger.info(f"Collected {len(results['files'])} files")
+            
+            # 3. Issues and pull requests
+            if include_issues:
+                issues_limit = max_issues or 9999  # Use high number if unlimited
+                logger.info(f"Collecting issues and PRs ({'unlimited' if max_issues is None else f'max: {max_issues}'})...")
+                results["issues"] = await GitHubRepoTask._get_issues(
+                    client, owner, repo_name, headers, issues_limit
+                )
+                logger.info(f"Collected {len(results['issues'])} issues/PRs")
+            
+            # 4. Releases
+            if include_releases:
+                releases_limit = max_releases or 9999  # Use high number if unlimited
+                logger.info(f"Collecting releases ({'unlimited' if max_releases is None else f'max: {max_releases}'})...")
+                results["releases"] = await GitHubRepoTask._get_releases(
+                    client, owner, repo_name, headers, releases_limit
+                )
+                logger.info(f"Collected {len(results['releases'])} releases")
+        
+        # Calculate statistics
+        total_code_size = sum(f.get("size", 0) for f in results["files"])
+        code_files = [f for f in results["files"] if not any(
+            doc in f.get("path", "").lower() for doc in ["readme", "license", "changelog"]
+        )]
+        doc_files = [f for f in results["files"] if any(
+            doc in f.get("path", "").lower() for doc in ["readme", "license", "changelog", ".md"]
+        )]
+        
+        issues_by_state = {}
+        for issue in results["issues"]:
+            state = issue.get("state", "unknown")
+            issues_by_state[state] = issues_by_state.get(state, 0) + 1
+        
+        results["statistics"] = {
+            "total_files": len(results["files"]),
+            "code_files": len(code_files),
+            "documentation_files": len(doc_files),
+            "total_code_size": total_code_size,
+            "total_issues": len(results["issues"]),
+            "issues_by_state": issues_by_state,
+            "total_releases": len(results["releases"]),
+            "languages": results["metadata"]["repository"].get("languages", {}),
+            "stars": results["metadata"]["repository"].get("stargazers_count", 0),
+            "forks": results["metadata"]["repository"].get("forks_count", 0)
+        }
+        
+        # Save outputs
+        save_json_atomic(out_dir / "repository_complete.json", results)
+        save_json_atomic(out_dir / "metadata.json", results["metadata"])
+        save_json_atomic(out_dir / "files.json", results["files"])
+        save_json_atomic(out_dir / "issues.json", results["issues"])
+        save_json_atomic(out_dir / "releases.json", results["releases"])
+        save_json_atomic(out_dir / "statistics.json", results["statistics"])
+        
+        # Create vector-store ready content
+        vector_content = []
+        
+        # Add repository overview
+        repo_info = results["metadata"]["repository"]
+        overview = f"""Repository: {repo_info['full_name']}
+Description: {repo_info.get('description', 'No description')}
+Language: {repo_info.get('language', 'Multiple')}
+Stars: {repo_info.get('stargazers_count', 0)}
+Forks: {repo_info.get('forks_count', 0)}
+License: {repo_info.get('license', 'Not specified')}
+Topics: {', '.join(repo_info.get('topics', []))}
+"""
+        vector_content.append({
+            "type": "repository_overview",
+            "content": overview,
+            "metadata": {"source": "repository_metadata"}
+        })
+        
+        # Add file contents
+        for file_info in results["files"]:
+            if file_info.get("content") and len(file_info["content"]) > 50:
+                vector_content.append({
+                    "type": "code_file",
+                    "content": f"File: {file_info['path']}\n\n{file_info['content']}",
+                    "metadata": {
+                        "source": "code_file",
+                        "path": file_info["path"],
+                        "size": file_info.get("size", 0),
+                        "url": file_info.get("url")
+                    }
+                })
+        
+        # Add issues
+        for issue in results["issues"]:
+            issue_content = f"Issue #{issue['number']}: {issue['title']}\n\n{issue.get('body', '')}"
+            if issue.get("comments"):
+                issue_content += "\n\nComments:\n"
+                for comment in issue["comments"]:
+                    issue_content += f"- {comment.get('body', '')}\n"
+            
+            vector_content.append({
+                "type": "issue" if not issue.get("is_pull_request") else "pull_request",
+                "content": issue_content,
+                "metadata": {
+                    "source": "issue",
+                    "number": issue["number"],
+                    "state": issue["state"],
+                    "labels": issue.get("labels", []),
+                    "url": issue.get("html_url")
+                }
+            })
+        
+        # Add releases
+        for release in results["releases"]:
+            if release.get("body"):
+                release_content = f"Release {release['tag_name']}: {release.get('name', '')}\n\n{release['body']}"
+                vector_content.append({
+                    "type": "release",
+                    "content": release_content,
+                    "metadata": {
+                        "source": "release",
+                        "tag": release["tag_name"],
+                        "url": release.get("html_url")
+                    }
+                })
+        
+        save_json_atomic(out_dir / "vector_store_content.json", {
+            "repository": f"{owner}/{repo_name}",
+            "total_items": len(vector_content),
+            "items": vector_content
+        })
+        
+        logger.info(f"GitHub scrape completed: {len(results['files'])} files, {len(results['issues'])} issues, {len(results['releases'])} releases")
+        
+        return {
+            "repository_url": repo_url,
+            "owner": owner,
+            "repo_name": repo_name,
+            "files_collected": len(results["files"]),
+            "issues_collected": len(results["issues"]),
+            "releases_collected": len(results["releases"]),
+            "total_code_size": total_code_size,
+            "vector_items": len(vector_content),
+            "output_files": {
+                "complete": "repository_complete.json",
+                "metadata": "metadata.json", 
+                "files": "files.json",
+                "issues": "issues.json",
+                "releases": "releases.json",
+                "statistics": "statistics.json",
+                "vector_content": "vector_store_content.json"
+            }
+        }
+
+
+@_registry.register("github-repo")
+async def github_repo(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    task = GitHubRepoTask()
     return await task.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)

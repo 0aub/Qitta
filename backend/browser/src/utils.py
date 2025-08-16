@@ -88,6 +88,10 @@ def normalize_url(url: str, base_url: Optional[str] = None) -> str:
     if not url:
         return ""
     
+    # Add protocol if missing
+    if not url.lower().startswith(('http://', 'https://', '//')):
+        url = 'https://' + url
+    
     # Convert relative to absolute if base_url provided
     if base_url and not url.lower().startswith(('http://', 'https://')):
         url = urllib.parse.urljoin(base_url, url)
@@ -243,8 +247,24 @@ def is_content_page(url: str, html: str) -> bool:
     # Check content indicators
     html_lower = html.lower()
     
-    # Skip if it's mostly navigation/UI
-    if html_lower.count('<nav') > 3 or html_lower.count('menu') > 10:
+    # Special handling for GitHub and code repositories
+    if 'github.com' in url_lower:
+        # GitHub pages are valuable even with lots of navigation
+        # Check for repository content indicators
+        github_content_indicators = [
+            'readme', 'blob/', 'tree/', 'commits', 'issues', 'wiki',
+            'repository', 'code', '.md', '.py', '.js', '.html', '.css'
+        ]
+        if any(indicator in url_lower or indicator in html_lower for indicator in github_content_indicators):
+            return True
+        # Even main repo pages are valuable
+        if '/tree/' in url_lower or '/blob/' in url_lower or url_lower.count('/') <= 4:
+            return True
+    
+    # Skip if it's mostly navigation/UI (but be more lenient for code sites)
+    nav_count = html_lower.count('<nav')
+    menu_count = html_lower.count('menu')
+    if nav_count > 5 and menu_count > 15:  # More lenient thresholds
         return False
     
     # Check for substantial text content
@@ -252,7 +272,10 @@ def is_content_page(url: str, html: str) -> bool:
     text_content = re.sub(r'<[^>]+>', ' ', html)
     word_count = len(text_content.split())
     
-    return word_count > 100  # Minimum content threshold
+    # Lower threshold for code repositories and technical sites
+    min_words = 50 if any(domain in url_lower for domain in ['github.com', 'gitlab.com', 'docs.']) else 100
+    
+    return word_count > min_words
 
 
 # ───────── Content quality scoring ─────────
@@ -283,6 +306,18 @@ def score_content_quality(html: str) -> float:
     if html_lower.count('<p>') > 3:
         score += 0.2
     if html_lower.count('<h') > 0:  # Headers indicate structure
+        score += 0.1
+    
+    # Special scoring for code repositories (GitHub, GitLab, etc.)
+    code_indicators = [
+        'readme', 'blob/', 'tree/', '.md', '.py', '.js', '.html', '.css',
+        'commits', 'issues', 'wiki', 'repository', 'code', 'class=', 'function'
+    ]
+    if any(indicator in html_lower for indicator in code_indicators):
+        score += 0.2  # Boost for code-related content
+    
+    # Boost for files and documentation
+    if any(ext in html_lower for ext in ['.md', '.rst', '.txt', 'readme', 'license']):
         score += 0.1
     
     return min(score, 1.0)

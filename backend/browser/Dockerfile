@@ -16,6 +16,4 @@ ENV SERVICE_PORT=${SERVICE_PORT}
 EXPOSE ${SERVICE_PORT}
 
 # 2 ▸ run uvicorn under xvfb; respect $BROWSER_HEADLESS
-# CMD ["xvfb-run", "-a", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "${SERVICE_PORT}"]
-# CMD ["xvfb-run", "-a", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
 CMD ["sh", "-c", "xvfb-run -a uvicorn src.main:app --host 0.0.0.0 --port $SERVICE_PORT"]
