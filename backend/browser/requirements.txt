@@ -4,3 +4,4 @@ httpx==0.28.1
 pydantic==2.11.7
 playwright==1.54.0
 prometheus-client==0.22.1
+beautifulsoup4==4.12.3
