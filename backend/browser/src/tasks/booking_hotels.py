@@ -248,7 +248,7 @@ class BookingHotelsTask:
                 method_icon = "🔥" if method_used == "graphql_api" else "🛡️" if method_used == "html_scraping" else "⚠️"
                 reliability = "Perfect" if method_used == "graphql_api" else "Reliable" if method_used == "html_scraping" else "Limited"
                 
-                _log(logger, "info", f"🏁 Hotel search completed: {len(hotels)} hotels in {execution_time:.1s}s ({method_icon} {reliability})")
+                _log(logger, "info", f"🏁 Hotel search completed: {len(hotels)} hotels in {execution_time:.1f}s ({method_icon} {reliability})")
                 
                 return result
             else:
@@ -952,10 +952,87 @@ class BookingHotelsTask:
             raw_responses = intercepted_data.get("raw_responses", [])
             _log(logger, "info", f"🔍 Debug: Intercepted {len(raw_responses)} API responses")
             
-            # Log structure of responses for debugging
-            for i, response in enumerate(raw_responses[:3]):  # Limit debug output
-                data_keys = list(response.get("data", {}).keys()) if response.get("data") else []
-                _log(logger, "info", f"   Response {i+1}: {len(data_keys)} top-level keys: {data_keys[:10]}")
+            # Enhanced debugging - look for hotel-like data structures
+            hotel_like_responses = []
+            for i, response in enumerate(raw_responses):
+                try:
+                    data = response.get('data', {})
+                    url = response.get('url', 'unknown')
+                    
+                    if isinstance(data, dict):
+                        # Deep search for arrays that might contain hotels
+                        def find_arrays_recursively(obj, path="", depth=0):
+                            if depth > 3:  # Prevent infinite recursion
+                                return []
+                            
+                            arrays_found = []
+                            if isinstance(obj, dict):
+                                for key, value in obj.items():
+                                    current_path = f"{path}.{key}" if path else key
+                                    
+                                    if isinstance(value, list) and len(value) > 0:
+                                        # Check if this array contains hotel-like objects
+                                        if isinstance(value[0], dict):
+                                            sample_keys = set(value[0].keys())
+                                            hotel_indicators = {
+                                                "name", "title", "hotelName", "propertyName", "displayName",
+                                                "id", "hotelId", "propertyId", "basicPropertyData", 
+                                                "price", "priceInfo", "pricing", "rates", "priceBreakdown",
+                                                "rating", "reviewScore", "guestReviewsRating", "reviewsCount",
+                                                "address", "location", "city", "countryCode", "distance",
+                                                "images", "photos", "gallery", "mainPhoto", "photoUrls",
+                                                "availability", "roomTypes", "accommodation"
+                                            }
+                                            
+                                            matching_indicators = sample_keys.intersection(hotel_indicators)
+                                            if matching_indicators or len(sample_keys) > 5:  # Either has hotel indicators or is complex object
+                                                arrays_found.append({
+                                                    'path': current_path,
+                                                    'length': len(value),
+                                                    'sample_keys': list(sample_keys)[:25],
+                                                    'matching_indicators': list(matching_indicators),
+                                                    'first_item': value[0] if len(value) > 0 else None
+                                                })
+                                    
+                                    # Recurse into nested objects
+                                    elif isinstance(value, (dict, list)):
+                                        arrays_found.extend(find_arrays_recursively(value, current_path, depth + 1))
+                            
+                            elif isinstance(obj, list):
+                                for idx, item in enumerate(obj):
+                                    current_path = f"{path}[{idx}]" if path else f"[{idx}]"
+                                    arrays_found.extend(find_arrays_recursively(item, current_path, depth + 1))
+                            
+                            return arrays_found
+                        
+                        arrays = find_arrays_recursively(data)
+                        if arrays:
+                            hotel_like_responses.append({
+                                'response_index': i,
+                                'url': url,
+                                'arrays': arrays
+                            })
+                            
+                            for array_info in arrays:
+                                _log(logger, "info", f"🎯 Response {i+1}: Found array at '{array_info['path']}' with {array_info['length']} items")
+                                _log(logger, "info", f"   Sample keys: {array_info['sample_keys'][:15]}")
+                                if array_info['matching_indicators']:
+                                    _log(logger, "info", f"   Hotel indicators: {array_info['matching_indicators']}")
+                                
+                                # Log first item structure for the most promising arrays
+                                if len(array_info['matching_indicators']) > 2:
+                                    first_item = array_info['first_item']
+                                    if first_item:
+                                        _log(logger, "info", f"   First item sample: {str(first_item)[:200]}...")
+                        
+                        # Also log top-level structure for context
+                        top_level_keys = list(data.keys())
+                        _log(logger, "info", f"   Response {i+1} top-level: {top_level_keys}")
+                        
+                except Exception as e:
+                    _log(logger, "debug", f"Error analyzing response {i}: {e}")
+            
+            _log(logger, "info", f"🔍 Found {len(hotel_like_responses)} responses with potential hotel data")
                 
         except Exception as e:
             _log(logger, "debug", f"Debug analysis error: {e}")
@@ -1195,31 +1272,301 @@ class BookingHotelsTask:
     
     @staticmethod
     async def _extract_complete_hotel_data(container, hotel_index: int, logger: logging.Logger) -> Dict[str, Any]:
-        """Extract comprehensive data from a hotel card container (simplified implementation)."""
+        """Extract comprehensive data from a hotel card container with real data extraction."""
         try:
-            # Simplified extraction for the modular implementation
+            # Initialize with extracted data, not fake data
             hotel_data = {
-                "id": f"hotel_{hotel_index}",
-                "name": f"Hotel {hotel_index}",
-                "price_per_night": 100.0 + hotel_index * 10,
-                "rating": 7.5 + (hotel_index % 3) * 0.5,
-                "review_count": 100 + hotel_index * 15,
-                "address": f"Address for Hotel {hotel_index}",
+                "id": f"property_{hotel_index}",
+                "name": "Unknown Hotel",
+                "price_per_night": None,
+                "rating": None,
+                "review_count": None,
+                "address": None,
                 "images": [],
-                "amenities": ["WiFi", "Pool"],
-                "booking_url": "https://booking.com/hotel",
-                "reviews": []
+                "amenities": [],
+                "booking_url": None,
+                "reviews": [],
+                "enhanced": True
             }
             
-            # Try to extract real data from container (basic implementation)
+            # Extract real name
             try:
-                name_element = await container.query_selector("h3, h2, [data-testid*='title'], .sr-hotel__name")
-                if name_element:
-                    name_text = await name_element.text_content()
-                    if name_text and name_text.strip():
-                        hotel_data["name"] = name_text.strip()
-            except:
-                pass
+                name_selectors = [
+                    "[data-testid='title']",
+                    "h3[data-testid*='title']", 
+                    "h2[data-testid*='title']",
+                    ".sr-hotel__name",
+                    "[data-testid='property-card-title']",
+                    "h3 a",
+                    "h2 a"
+                ]
+                for selector in name_selectors:
+                    name_element = await container.query_selector(selector)
+                    if name_element:
+                        name_text = await name_element.text_content()
+                        if name_text and name_text.strip():
+                            hotel_data["name"] = name_text.strip()
+                            break
+            except Exception as e:
+                _log(logger, "debug", f"Error extracting hotel name: {e}")
+            
+            # Extract real price with comprehensive selectors
+            try:
+                price_selectors = [
+                    # New Booking.com structure (2024/2025)
+                    "[data-testid='price-and-discounted-price'] .a78ca197d0",
+                    "[data-testid='price-and-discounted-price'] .fde1d5429e", 
+                    "[data-testid='price-and-discounted-price'] span",
+                    "[data-testid='price'] .a78ca197d0",
+                    "[data-testid='price'] .fde1d5429e",
+                    "[data-testid='price'] span",
+                    ".a78ca197d0",  # Main price class
+                    ".fde1d5429e",  # Alternative price class
+                    # Legacy selectors
+                    ".bui-price-display__value",
+                    ".sr-hotel__price .bui-price-display__value",
+                    ".prco-valign-middle-helper",
+                    # Generic price selectors
+                    "[class*='price'] span:contains('$')",
+                    "[class*='price'] span:contains('SAR')",
+                    "[class*='price'] span:contains('€')",
+                    # Search any element containing price-like text
+                    "*:contains('SAR'):contains('night')",
+                    "*:contains('$'):contains('night')"
+                ]
+                
+                for selector in price_selectors:
+                    try:
+                        # Handle special :contains() selectors differently
+                        if ':contains(' in selector:
+                            # Use manual text search for contains selectors
+                            all_elements = await container.query_selector_all("*")
+                            for element in all_elements:
+                                try:
+                                    text = await element.text_content()
+                                    if text and ('SAR' in text or '$' in text or '€' in text) and ('night' in text.lower() or 'per' in text.lower()):
+                                        price_text = text
+                                        break
+                                except:
+                                    continue
+                            else:
+                                continue
+                        else:
+                            price_element = await container.query_selector(selector)
+                            if not price_element:
+                                continue
+                            price_text = await price_element.text_content()
+                        
+                        if price_text and price_text.strip():
+                            # Extract numeric price from text like "SAR 450", "$120", "€85"
+                            import re
+                            # Look for numbers with currency symbols
+                            price_patterns = [
+                                r'SAR\s*[\d,]+',
+                                r'\$\s*[\d,]+', 
+                                r'€\s*[\d,]+',
+                                r'[\d,]+\s*SAR',
+                                r'[\d,]+\s*\$',
+                                r'[\d,]+\s*€',
+                                r'[\d,]+'  # Fallback to any number
+                            ]
+                            
+                            for pattern in price_patterns:
+                                matches = re.findall(pattern, price_text.replace(',', ''))
+                                if matches:
+                                    # Extract just the numbers
+                                    numbers = re.findall(r'\d+', matches[0])
+                                    if numbers:
+                                        hotel_data["price_per_night"] = float(numbers[0])
+                                        
+                                        # Extract currency
+                                        if "SAR" in price_text or "ر.س" in price_text:
+                                            hotel_data["currency"] = "SAR"
+                                        elif "$" in price_text or "USD" in price_text:
+                                            hotel_data["currency"] = "USD"
+                                        elif "€" in price_text or "EUR" in price_text:
+                                            hotel_data["currency"] = "EUR"
+                                        else:
+                                            hotel_data["currency"] = "Unknown"
+                                        
+                                        _log(logger, "debug", f"Extracted price: {hotel_data['price_per_night']} {hotel_data['currency']} from '{price_text.strip()}'")
+                                        break
+                            
+                            if hotel_data["price_per_night"] is not None:
+                                break
+                    except Exception as e:
+                        _log(logger, "debug", f"Error with price selector '{selector}': {e}")
+                        continue
+                        
+            except Exception as e:
+                _log(logger, "debug", f"Error extracting price: {e}")
+            
+            # Extract real rating with comprehensive selectors
+            try:
+                rating_selectors = [
+                    # New Booking.com structure (2024/2025)
+                    "[data-testid='review-score'] div",
+                    "[data-testid='review-score'] span", 
+                    "[data-testid='review-score'] .a3b8729ab1",
+                    "[data-testid='review-score'] .d10a6220b4",
+                    "[aria-label*='Scored'] div",
+                    "[aria-label*='rating'] div",
+                    # Legacy selectors
+                    ".bui-review-score__badge",
+                    ".sr-hotel__review-score .bui-review-score__badge",
+                    "[data-testid*='rating']",
+                    # Class-based selectors for current structure
+                    ".a3b8729ab1",  # Common rating class
+                    ".d10a6220b4",  # Alternative rating class
+                    # Generic rating selectors
+                    "[class*='review'] [class*='score']",
+                    "[class*='rating'] span",
+                    "[class*='badge'] span"
+                ]
+                
+                for selector in rating_selectors:
+                    try:
+                        rating_element = await container.query_selector(selector)
+                        if rating_element:
+                            rating_text = await rating_element.text_content()
+                            if rating_text and rating_text.strip():
+                                # Extract rating from text - look for decimal numbers like 8.5, 9.2, etc.
+                                import re
+                                rating_match = re.search(r'\b(\d+\.?\d*)\b', rating_text.strip())
+                                if rating_match:
+                                    rating_value = float(rating_match.group(1))
+                                    # Validate rating is in reasonable range (0-10)
+                                    if 0 <= rating_value <= 10:
+                                        hotel_data["rating"] = rating_value
+                                        _log(logger, "debug", f"Extracted rating: {rating_value} from '{rating_text.strip()}'")
+                                        break
+                    except Exception as e:
+                        _log(logger, "debug", f"Error with rating selector '{selector}': {e}")
+                        continue
+                        
+            except Exception as e:
+                _log(logger, "debug", f"Error extracting rating: {e}")
+            
+            # Extract review count with comprehensive selectors
+            try:
+                review_selectors = [
+                    # New Booking.com structure (2024/2025)
+                    "[data-testid='review-score'] ~ div",
+                    "[data-testid='review-score'] + div", 
+                    "[data-testid='reviews-count']",
+                    "[data-testid*='review'] span",
+                    "[aria-label*='review'] span",
+                    # Legacy selectors
+                    ".bui-review-score__text",
+                    "[data-testid='review-score'] .bui-review-score__text",
+                    # Generic review count selectors
+                    "[class*='review'] span:contains('review')",
+                    "*:contains('review'):contains('based')",
+                    "*[class*='review'][class*='count']",
+                    # Alternative patterns
+                    "span:contains('reviews')",
+                    "div:contains('reviews')"
+                ]
+                
+                for selector in review_selectors:
+                    try:
+                        # Handle special :contains() selectors differently  
+                        if ':contains(' in selector:
+                            # Use manual text search for contains selectors
+                            all_elements = await container.query_selector_all("span, div")
+                            for element in all_elements:
+                                try:
+                                    text = await element.text_content()
+                                    if text and ('review' in text.lower() or 'based on' in text.lower()):
+                                        review_text = text
+                                        break
+                                except:
+                                    continue
+                            else:
+                                continue
+                        else:
+                            review_element = await container.query_selector(selector)
+                            if not review_element:
+                                continue
+                            review_text = await review_element.text_content()
+                        
+                        if review_text and review_text.strip():
+                            # Extract number from text like "based on 1,234 reviews" or "1,234 reviews"
+                            import re
+                            numbers = re.findall(r'[\d,]+', review_text.replace(',', ''))
+                            if numbers:
+                                # Take the first number found
+                                review_count = int(numbers[0])
+                                # Validate it's a reasonable review count (not year, rating, etc.)
+                                if 1 <= review_count <= 50000:
+                                    hotel_data["review_count"] = review_count
+                                    _log(logger, "debug", f"Extracted review count: {review_count} from '{review_text.strip()}'")
+                                    break
+                    except Exception as e:
+                        _log(logger, "debug", f"Error with review count selector '{selector}': {e}")
+                        continue
+                        
+            except Exception as e:
+                _log(logger, "debug", f"Error extracting review count: {e}")
+            
+            # Extract real address/location
+            try:
+                address_selectors = [
+                    "[data-testid='address']",
+                    ".sr-hotel__address",
+                    "[data-testid*='location']",
+                    ".bui-card__subtitle"
+                ]
+                for selector in address_selectors:
+                    address_element = await container.query_selector(selector)
+                    if address_element:
+                        address_text = await address_element.text_content()
+                        if address_text and address_text.strip():
+                            hotel_data["address"] = address_text.strip()
+                            break
+            except Exception as e:
+                _log(logger, "debug", f"Error extracting address: {e}")
+            
+            # Extract real booking URL
+            try:
+                link_selectors = [
+                    "a[data-testid='title-link']",
+                    "h3 a",
+                    "h2 a",
+                    "a[href*='/hotel/']"
+                ]
+                for selector in link_selectors:
+                    link_element = await container.query_selector(selector)
+                    if link_element:
+                        href = await link_element.get_attribute("href")
+                        if href:
+                            # Make URL absolute if needed
+                            if href.startswith("/"):
+                                hotel_data["booking_url"] = f"https://www.booking.com{href}"
+                            elif href.startswith("http"):
+                                hotel_data["booking_url"] = href
+                            break
+            except Exception as e:
+                _log(logger, "debug", f"Error extracting booking URL: {e}")
+            
+            # Extract amenities
+            try:
+                amenity_selectors = [
+                    "[data-testid*='facility']",
+                    ".sr-hotel__facility",
+                    ".bui-list .bui-list__item"
+                ]
+                amenities = []
+                for selector in amenity_selectors:
+                    amenity_elements = await container.query_selector_all(selector)
+                    for element in amenity_elements:
+                        amenity_text = await element.text_content()
+                        if amenity_text and amenity_text.strip():
+                            amenities.append(amenity_text.strip())
+                if amenities:
+                    hotel_data["amenities"] = amenities[:10]  # Limit to first 10
+            except Exception as e:
+                _log(logger, "debug", f"Error extracting amenities: {e}")
             
             return hotel_data
             
