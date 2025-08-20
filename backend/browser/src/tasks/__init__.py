@@ -35,7 +35,7 @@ _registry = TaskRegistry()
 # Register task wrapper functions
 @_registry.register("booking-hotels")
 async def booking_hotels(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-    return await BookingHotelsTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+    return await BookingHotelsTask.run(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
 
 @_registry.register("scrape-site") 
 async def scrape_site(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
