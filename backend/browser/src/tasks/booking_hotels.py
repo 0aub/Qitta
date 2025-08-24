@@ -159,8 +159,15 @@ class EnhancedScraperEngine:
             # Store search results HTML for URL extraction
             self.intercepted_data["search_results_html"] = await page.content()
             
-            # Parse weekend deals
-            hotels = await self._parse_weekend_deals()
+            # Parse weekend deals AND actual search results
+            weekend_deals = await self._parse_weekend_deals()
+            search_results = await self._parse_search_results(page)
+            
+            # Combine and deduplicate results, prioritizing search results
+            hotels = self._combine_hotel_results(search_results, weekend_deals)
+            
+            # Apply location validation and filtering
+            hotels = self._apply_location_filtering(hotels, params)
             
             # Fix URLs and images
             hotels = await self._fix_hotel_data(page, hotels)
@@ -526,89 +533,445 @@ class EnhancedScraperEngine:
             return images[:30] if images else []
     
     async def _extract_reviews_fixed(self, page) -> Optional[Dict[str, Any]]:
-        """Extract reviews using the correct selectors from the HTML structure."""
+        """Extract individual reviews with all available details from reviewers."""
         try:
             reviews = []
+            
+            # Try to navigate to a dedicated reviews page or click review opener
+            try:
+                # Check if there's a dedicated reviews URL
+                current_url = page.url
+                reviews_url = current_url.replace('.html', '/reviews.html')
+                
+                # Try navigating to reviews page first
+                try:
+                    await page.goto(reviews_url, wait_until="networkidle", timeout=10000)
+                    self.logger.info(f"✅ Navigated to dedicated reviews page: {reviews_url}")
+                    await page.wait_for_timeout(3000)
+                except:
+                    # If that doesn't work, try clicking review links/buttons
+                    self.logger.debug(f"Could not navigate to reviews page, trying click approach")
+                    
+                    # Look for various "show reviews" buttons
+                    show_reviews_selectors = [
+                        'a[href*="reviews.html"]',  # Direct link to reviews
+                        '[data-testid="reviews-toggle-button"]',
+                        '.reviews_header_count',
+                        '[data-testid="reviews-opener"]', 
+                        'a[href*="#reviews"]',
+                        'a:has-text("reviews")',
+                        'button:has-text("review")',
+                        '.bui-link--sr-only:has-text("review")',
+                        '#show_reviews_trigger',
+                        '.bui-review-score__link'
+                    ]
+                    
+                    for selector in show_reviews_selectors:
+                        try:
+                            await page.click(selector, timeout=3000)
+                            self.logger.info(f"✅ Clicked reviews opener: {selector}")
+                            await page.wait_for_timeout(5000)
+                            break
+                        except:
+                            continue
+                
+            except Exception as e:
+                self.logger.debug(f"Could not access reviews: {e}")
+            
+            # Wait longer for reviews to load dynamically and scroll to trigger loading
+            await page.evaluate("""
+                () => {
+                    // Scroll down to trigger lazy loading of reviews
+                    window.scrollTo(0, document.body.scrollHeight);
+                }
+            """)
+            await page.wait_for_timeout(5000)
             
             # Scroll to reviews section to ensure they're loaded
             await page.evaluate("""
                 () => {
-                    const reviewSection = document.querySelector('#reviewlist, [data-testid="reviews-section"], .review_list');
-                    if (reviewSection) reviewSection.scrollIntoView();
+                    const reviewSelectors = [
+                        '#reviewlist', 
+                        '[data-testid="reviews-section"]', 
+                        '.review_list',
+                        '.reviews-container',
+                        '.review-card',
+                        '[data-testid="review-card"]',
+                        '.review_item_block',
+                        '[class*="review_item"]'
+                    ];
+                    
+                    for (let selector of reviewSelectors) {
+                        const reviewSection = document.querySelector(selector);
+                        if (reviewSection) {
+                            reviewSection.scrollIntoView({ behavior: 'smooth' });
+                            return;
+                        }
+                    }
+                    
+                    // Scroll back to top, then down again slowly
+                    window.scrollTo(0, 0);
+                    setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 1000);
                 }
             """)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(7000)
             
-            # Extract reviews using the UPDATED correct selectors based on current HTML
-            reviews = await page.evaluate("""
+            # Extract reviews using multiple selector strategies with detailed logging
+            result = await page.evaluate("""
                 () => {
                     const reviews = [];
-                    const reviewCards = document.querySelectorAll('[data-testid="review-card"]');
+                    const debug = {
+                        url: window.location.href,
+                        title: document.title,
+                        selectors_tried: [],
+                        elements_found: {}
+                    };
+                    
+                    // Try multiple selectors for review cards, excluding UI elements
+                    const cardSelectors = [
+                        '[data-testid="review-card"]',
+                        '.review_list_new_item_block', 
+                        '.review_item_wrapper',
+                        '.c-review-block',
+                        '.review-card',
+                        '[data-review-item]',
+                        '.bk-review',
+                        '.review_item',
+                        '.review-section .review',
+                        '.bk-review-item', 
+                        '.review_list .review',
+                        '.review_item_block',
+                        '[class*="review_item_"]',
+                        '.review_block',
+                        // More specific patterns to exclude UI elements
+                        '[class*="review"]:not([class*="button"]):not([class*="link"]):not([class*="footer"]):not([class*="write"]):not([class*="login"])'
+                    ];
+                    
+                    let reviewCards = [];
+                    let usedSelector = null;
+                    
+                    for (let selector of cardSelectors) {
+                        reviewCards = document.querySelectorAll(selector);
+                        debug.selectors_tried.push({selector, count: reviewCards.length});
+                        if (reviewCards.length > 0) {
+                            usedSelector = selector;
+                            break;
+                        }
+                    }
+                    
+                    debug.final_selector = usedSelector;
+                    debug.final_count = reviewCards.length;
+                    
+                    // If no review cards found, log available elements for debugging
+                    if (reviewCards.length === 0) {
+                        const allDivs = document.querySelectorAll('div[class*="review"], div[data-testid*="review"]');
+                        debug.elements_found.divs_with_review = allDivs.length;
+                        
+                        const allElements = document.querySelectorAll('*[class*="review"]');
+                        debug.elements_found.all_with_review = allElements.length;
+                        
+                        // Sample first few elements with review-related classes
+                        const reviewElements = Array.from(allElements).slice(0, 10);
+                        debug.elements_found.sample_elements = reviewElements.map(el => ({
+                            tag: el.tagName,
+                            class: el.className,
+                            testid: el.getAttribute('data-testid'),
+                            text_preview: el.textContent ? el.textContent.substring(0, 100) : ''
+                        }));
+                    }
+                    
+                    // Add detailed debug for found elements
+                    debug.sample_card_details = [];
                     
                     reviewCards.forEach((card, index) => {
-                        if (index >= 20) return; // Limit to 20 reviews
+                        if (index >= 30) return; // Limit to 30 reviews for better performance
                         
-                        const review = {};
+                        const review = {
+                            review_index: index + 1,
+                            raw_html_classes: card.className || '',
+                            card_text_preview: card.textContent ? card.textContent.substring(0, 200).replace(/\\s+/g, ' ') : '',
+                            card_tag: card.tagName
+                        };
                         
-                        // Extract reviewer name - UPDATED selector
-                        const nameEl = card.querySelector('.b08850ce41.f546354b44');
-                        if (nameEl) review.reviewer = nameEl.textContent.trim();
-                        
-                        // Extract review score - UPDATED selector  
-                        const scoreEl = card.querySelector('[data-testid="review-score"] .f63b14ab7a.dff2e52086');
-                        if (scoreEl) {
-                            const scoreText = scoreEl.textContent;
-                            const match = scoreText.match(/\\d+\\.?\\d*/);
-                            if (match) review.score = parseFloat(match[0]);
+                        // Store debug info for first few cards
+                        if (index < 3) {
+                            debug.sample_card_details.push({
+                                index: index + 1,
+                                tag: card.tagName,
+                                class: card.className,
+                                text_preview: card.textContent ? card.textContent.substring(0, 300).replace(/\\s+/g, ' ') : '',
+                                children_count: card.children.length,
+                                has_data_testid: !!card.getAttribute('data-testid')
+                            });
                         }
                         
-                        // Extract review title - UPDATED selector
-                        const titleEl = card.querySelector('[data-testid="review-title"]');
-                        if (titleEl) review.title = titleEl.textContent.trim();
+                        // === REVIEWER INFORMATION ===
                         
-                        // Extract positive text - UPDATED selector
-                        const positiveEl = card.querySelector('[data-testid="review-positive-text"] .b99b6ef58f');
-                        if (positiveEl) review.positive = positiveEl.textContent.trim();
+                        // Extract reviewer name with multiple selectors
+                        const nameSelectors = [
+                            '.bui-avatar-block__title',
+                            '.c-guest-name', 
+                            '.reviewer-name',
+                            '[data-testid="review-author-name"]',
+                            '.review-author__name',
+                            '.b08850ce41.f546354b44',
+                            '.reviewer_info .bui-link',
+                            'span[data-testid="reviewer-name"]',
+                            '.review_item_reviewer .bui-link',
+                            '.review-author',
+                            'h3', 'h4', 'strong',  // Try generic elements that might contain names
+                            '[class*="name"]', '[class*="author"]'
+                        ];
                         
-                        // Extract negative text - UPDATED selector
-                        const negativeEl = card.querySelector('[data-testid="review-negative-text"] .b99b6ef58f');
-                        if (negativeEl) review.negative = negativeEl.textContent.trim();
-                        
-                        // Extract review date - UPDATED selector
-                        const dateEl = card.querySelector('[data-testid="review-date"]');
-                        if (dateEl) {
-                            const dateText = dateEl.textContent;
-                            review.date = dateText.replace('Reviewed:', '').trim();
+                        for (let selector of nameSelectors) {
+                            const nameEl = card.querySelector(selector);
+                            if (nameEl && nameEl.textContent.trim()) {
+                                review.reviewer_name = nameEl.textContent.trim();
+                                break;
+                            }
                         }
                         
-                        // Extract room type - UPDATED selector
-                        const roomEl = card.querySelector('[data-testid="review-room-name"]');
-                        if (roomEl) review.room_type = roomEl.textContent.trim();
+                        // Extract reviewer country/location
+                        const countrySelectors = [
+                            '.bui-avatar-block__subtitle',
+                            '.c-guest-location',
+                            '.reviewer-country',
+                            '.reviewer_info .country',
+                            '.d838fb5f41.aea5eccb71',
+                            '[data-testid="reviewer-country"]',
+                            '.review_item_reviewer .bui-text--variant'
+                        ];
                         
-                        // Extract traveler type - UPDATED selector
-                        const travelerEl = card.querySelector('[data-testid="review-traveler-type"]');
-                        if (travelerEl) review.traveler_type = travelerEl.textContent.trim();
+                        for (let selector of countrySelectors) {
+                            const countryEl = card.querySelector(selector);
+                            if (countryEl && countryEl.textContent.trim()) {
+                                review.reviewer_country = countryEl.textContent.trim();
+                                break;
+                            }
+                        }
                         
-                        // Extract country - UPDATED selector
-                        const countryEl = card.querySelector('.d838fb5f41.aea5eccb71');
-                        if (countryEl) review.country = countryEl.textContent.trim();
+                        // Extract reviewer avatar
+                        const avatarEl = card.querySelector('.bui-avatar img, .reviewer-avatar img, img[alt*="reviewer"]');
+                        if (avatarEl) {
+                            review.reviewer_avatar = avatarEl.src;
+                        }
                         
-                        // Extract stay info
-                        const nightsEl = card.querySelector('[data-testid="review-num-nights"]');
-                        if (nightsEl) review.nights = nightsEl.textContent.trim();
+                        // === REVIEW SCORE ===
+                        const scoreSelectors = [
+                            '.bui-review-score__badge',
+                            '.c-score-bar__score',
+                            '[data-testid="review-score"]',
+                            '.review-score-badge',
+                            '.review_score .bui-review-score__badge',
+                            '.f63b14ab7a.dff2e52086'
+                        ];
                         
-                        const stayDateEl = card.querySelector('[data-testid="review-stay-date"]');
-                        if (stayDateEl) review.stay_date = stayDateEl.textContent.trim();
+                        for (let selector of scoreSelectors) {
+                            const scoreEl = card.querySelector(selector);
+                            if (scoreEl) {
+                                const scoreText = scoreEl.textContent;
+                                const match = scoreText.match(/\\d+\\.?\\d*/);
+                                if (match) {
+                                    review.review_score = parseFloat(match[0]);
+                                    break;
+                                }
+                            }
+                        }
                         
-                        // Only add if we have some content
-                        if (review.score || review.positive || review.negative || review.title) {
+                        // === REVIEW DATE ===
+                        const dateSelectors = [
+                            '.c-review__date',
+                            '[data-testid="review-date"]',
+                            '.review_item_date',
+                            '.review-date',
+                            '.bui-review-score .review_item_date',
+                            '.review_score_date span'
+                        ];
+                        
+                        for (let selector of dateSelectors) {
+                            const dateEl = card.querySelector(selector);
+                            if (dateEl && dateEl.textContent.trim()) {
+                                review.review_date = dateEl.textContent.replace(/Reviewed:?\\s*/i, '').trim();
+                                break;
+                            }
+                        }
+                        
+                        // === REVIEW TITLE ===
+                        const titleSelectors = [
+                            '[data-testid="review-title"]',
+                            '.c-review__title',
+                            '.review-title',
+                            '.bui-review-score__title',
+                            '.review_item_header_content .review_item_header_content_title'
+                        ];
+                        
+                        for (let selector of titleSelectors) {
+                            const titleEl = card.querySelector(selector);
+                            if (titleEl && titleEl.textContent.trim()) {
+                                review.review_title = titleEl.textContent.trim();
+                                break;
+                            }
+                        }
+                        
+                        // === POSITIVE REVIEW TEXT ===
+                        const positiveSelectors = [
+                            '[data-testid="review-positive-text"]',
+                            '.c-review__positive',
+                            '.review-positive',
+                            '.c-review-text--positive .b99b6ef58f',
+                            '.review_pos .review_item_review_content',
+                            '.review_item_review_content_positive'
+                        ];
+                        
+                        for (let selector of positiveSelectors) {
+                            const positiveEl = card.querySelector(selector);
+                            if (positiveEl) {
+                                // Try to get the actual review text, not just the label
+                                const textEl = positiveEl.querySelector('.b99b6ef58f, .c-review-text, .review-text') || positiveEl;
+                                if (textEl && textEl.textContent.trim() && !textEl.textContent.includes('Liked most:')) {
+                                    review.review_positive = textEl.textContent.trim();
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // === NEGATIVE REVIEW TEXT ===
+                        const negativeSelectors = [
+                            '[data-testid="review-negative-text"]',
+                            '.c-review__negative',
+                            '.review-negative',
+                            '.c-review-text--negative .b99b6ef58f',
+                            '.review_neg .review_item_review_content',
+                            '.review_item_review_content_negative'
+                        ];
+                        
+                        for (let selector of negativeSelectors) {
+                            const negativeEl = card.querySelector(selector);
+                            if (negativeEl) {
+                                // Try to get the actual review text, not just the label
+                                const textEl = negativeEl.querySelector('.b99b6ef58f, .c-review-text, .review-text') || negativeEl;
+                                if (textEl && textEl.textContent.trim() && !textEl.textContent.includes('Liked least:')) {
+                                    review.review_negative = textEl.textContent.trim();
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // === STAY INFORMATION ===
+                        
+                        // Room type
+                        const roomSelectors = [
+                            '[data-testid="review-room-name"]',
+                            '.c-review__room-type',
+                            '.review-room-type',
+                            '.review_item_info_tags .review_item_info_tag'
+                        ];
+                        
+                        for (let selector of roomSelectors) {
+                            const roomEl = card.querySelector(selector);
+                            if (roomEl && roomEl.textContent.trim()) {
+                                review.room_type = roomEl.textContent.trim();
+                                break;
+                            }
+                        }
+                        
+                        // Traveler type
+                        const travelerSelectors = [
+                            '[data-testid="review-traveler-type"]',
+                            '.c-review__traveler-type',
+                            '.review-traveler-type',
+                            '.review_item_info_tags .review_traveler_type'
+                        ];
+                        
+                        for (let selector of travelerSelectors) {
+                            const travelerEl = card.querySelector(selector);
+                            if (travelerEl && travelerEl.textContent.trim()) {
+                                review.traveler_type = travelerEl.textContent.trim();
+                                break;
+                            }
+                        }
+                        
+                        // Number of nights
+                        const nightsSelectors = [
+                            '[data-testid="review-num-nights"]',
+                            '.c-review__nights',
+                            '.review-nights',
+                            '.review_item_info_tags .nights'
+                        ];
+                        
+                        for (let selector of nightsSelectors) {
+                            const nightsEl = card.querySelector(selector);
+                            if (nightsEl && nightsEl.textContent.trim()) {
+                                review.nights_stayed = nightsEl.textContent.trim();
+                                break;
+                            }
+                        }
+                        
+                        // Stay date
+                        const stayDateSelectors = [
+                            '[data-testid="review-stay-date"]',
+                            '.c-review__stay-date',
+                            '.review-stay-date'
+                        ];
+                        
+                        for (let selector of stayDateSelectors) {
+                            const stayDateEl = card.querySelector(selector);
+                            if (stayDateEl && stayDateEl.textContent.trim()) {
+                                review.stay_date = stayDateEl.textContent.trim();
+                                break;
+                            }
+                        }
+                        
+                        // === REVIEW HELPFULNESS ===
+                        const helpfulEl = card.querySelector('.review-helpful, .helpful-count, [data-testid="helpful-count"]');
+                        if (helpfulEl) {
+                            const helpfulMatch = helpfulEl.textContent.match(/\\d+/);
+                            if (helpfulMatch) {
+                                review.helpful_count = parseInt(helpfulMatch[0]);
+                            }
+                        }
+                        
+                        // Only add review if we have meaningful content
+                        const hasContent = review.reviewer_name || review.review_positive || review.review_negative || review.review_score || review.review_title;
+                        
+                        if (hasContent) {
+                            // Add timestamp
+                            review.extracted_at = new Date().toISOString();
                             reviews.push(review);
                         }
                     });
                     
-                    return reviews;
+                    debug.extracted_count = reviews.length;
+                    return { reviews, debug };
                 }
             """)
+            
+            # Extract reviews and debug info
+            reviews = result.get('reviews', [])
+            debug_info = result.get('debug', {})
+            
+            # Log debug information for troubleshooting
+            self.logger.info(f"🔍 Review extraction debug:")
+            self.logger.info(f"   URL: {debug_info.get('url', 'unknown')}")
+            self.logger.info(f"   Title: {debug_info.get('title', 'unknown')}")
+            self.logger.info(f"   Final selector: {debug_info.get('final_selector')}")
+            self.logger.info(f"   Final count: {debug_info.get('final_count', 0)}")
+            
+            if debug_info.get('elements_found'):
+                elements = debug_info['elements_found']
+                self.logger.info(f"   Elements found: {elements.get('all_with_review', 0)} total with 'review' in class")
+                
+                if elements.get('sample_elements'):
+                    self.logger.info(f"   Sample elements:")
+                    for i, el in enumerate(elements['sample_elements'][:3]):
+                        self.logger.info(f"     {i+1}: {el['tag']}.{el['class'][:50]}...")
+            
+            if debug_info.get('sample_card_details'):
+                self.logger.info(f"   Detailed card analysis:")
+                for card in debug_info['sample_card_details']:
+                    self.logger.info(f"     Card {card['index']}: {card['tag']}.{card['class'][:50]}")
+                    self.logger.info(f"       Text: {card['text_preview'][:100]}...")
+                    self.logger.info(f"       Children: {card['children_count']}, Has data-testid: {card['has_data_testid']}")
             
             # Get total review count - UPDATED selector
             total_count = await page.evaluate("""
@@ -1115,6 +1478,185 @@ class EnhancedScraperEngine:
         """Extract count of weekend deals from response."""
         deals = self._get_nested_value(data, ["data", "weekendDeals", "weekendDealsProperties"])
         return len(deals) if deals and isinstance(deals, list) else 0
+    
+    async def _parse_search_results(self, page) -> List[Dict[str, Any]]:
+        """Parse actual search results from the page - location-specific results."""
+        hotels = []
+        try:
+            # Wait for search results to load
+            await page.wait_for_selector("[data-testid='property-card']", timeout=10000)
+            
+            # Extract hotel data from property cards
+            hotel_cards = await page.query_selector_all("[data-testid='property-card']")
+            
+            self.logger.info(f"📍 Found {len(hotel_cards)} location-specific search results")
+            
+            for card in hotel_cards:
+                try:
+                    hotel = await self._extract_hotel_from_card(card)
+                    if hotel:
+                        hotels.append(hotel)
+                except Exception as e:
+                    self.logger.debug(f"Error extracting hotel card: {e}")
+                    continue
+            
+            self.logger.info(f"✅ Parsed {len(hotels)} hotels from search results")
+            
+        except Exception as e:
+            self.logger.warning(f"Could not find search results: {e}")
+        
+        return hotels
+    
+    async def _extract_hotel_from_card(self, card) -> Optional[Dict[str, Any]]:
+        """Extract hotel information from a property card."""
+        try:
+            # Extract hotel name
+            name_element = await card.query_selector("[data-testid='title']")
+            name = await name_element.inner_text() if name_element else None
+            
+            if not name:
+                return None
+            
+            # Extract price
+            price = None
+            price_element = await card.query_selector("[data-testid='price-and-discounted-price']")
+            if price_element:
+                price_text = await price_element.inner_text()
+                price_match = re.search(r'[\d,]+', price_text.replace(',', ''))
+                if price_match:
+                    price = float(price_match.group())
+            
+            # Extract rating
+            rating = None
+            rating_element = await card.query_selector("[data-testid='review-score'] div")
+            if rating_element:
+                rating_text = await rating_element.inner_text()
+                rating_match = re.search(r'([\d.]+)', rating_text)
+                if rating_match:
+                    rating = float(rating_match.group(1))
+            
+            # Extract review count
+            review_count = None
+            review_element = await card.query_selector("[data-testid='review-score'] + div")
+            if review_element:
+                review_text = await review_element.inner_text()
+                review_match = re.search(r'([\d,]+)', review_text.replace(',', ''))
+                if review_match:
+                    review_count = int(review_match.group(1))
+            
+            # Extract location/address
+            address_element = await card.query_selector("[data-testid='address']")
+            address = await address_element.inner_text() if address_element else None
+            
+            # Extract image
+            img_element = await card.query_selector("img")
+            image = await img_element.get_attribute("src") if img_element else None
+            images = [image] if image else []
+            
+            # Extract hotel URL for ID
+            link_element = await card.query_selector("a[data-testid='title-link']")
+            booking_url = await link_element.get_attribute("href") if link_element else None
+            
+            # Generate hotel ID from URL or name
+            hotel_id = None
+            if booking_url:
+                id_match = re.search(r'hotel/([^/]+)', booking_url)
+                if id_match:
+                    hotel_id = id_match.group(1)
+            
+            if not hotel_id:
+                hotel_id = hashlib.md5(name.encode()).hexdigest()[:8]
+            
+            return {
+                "id": hotel_id,
+                "name": name,
+                "price_per_night": price,
+                "rating": rating,
+                "review_count": review_count,
+                "address": address,
+                "images": images,
+                "amenities": [],
+                "booking_url": booking_url,
+                "source": "search_results"
+            }
+            
+        except Exception as e:
+            self.logger.debug(f"Hotel card extraction error: {e}")
+            return None
+    
+    def _combine_hotel_results(self, search_results: List[Dict[str, Any]], weekend_deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Combine search results with weekend deals, prioritizing search results and removing duplicates."""
+        combined = []
+        seen_names = set()
+        
+        # First add search results (location-specific)
+        for hotel in search_results:
+            name = hotel.get('name', '').strip().lower()
+            if name and name not in seen_names:
+                seen_names.add(name)
+                combined.append(hotel)
+        
+        # Then add weekend deals that aren't duplicates
+        for hotel in weekend_deals:
+            name = hotel.get('name', '').strip().lower()
+            if name and name not in seen_names:
+                seen_names.add(name)
+                combined.append(hotel)
+        
+        self.logger.info(f"🔄 Combined results: {len(search_results)} search + {len(weekend_deals)} weekend deals = {len(combined)} unique hotels")
+        
+        return combined
+    
+    def _apply_location_filtering(self, hotels: List[Dict[str, Any]], params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Apply location-based filtering to ensure results match the requested location."""
+        requested_location = params.get("location", "").lower()
+        filtered_hotels = []
+        
+        # Extract location keywords for matching
+        location_keywords = self._extract_location_keywords(requested_location)
+        
+        for hotel in hotels:
+            # Prioritize search_results over weekend_deals
+            if hotel.get("source") == "search_results":
+                filtered_hotels.append(hotel)
+            elif hotel.get("source") == "weekend_deals":
+                # For weekend deals, check if address matches requested location
+                if self._location_matches(hotel.get("address", ""), location_keywords):
+                    filtered_hotels.append(hotel)
+                else:
+                    self.logger.debug(f"Filtered out weekend deal: {hotel.get('name')} - location mismatch")
+        
+        self.logger.info(f"📍 Location filtering: {len(hotels)} -> {len(filtered_hotels)} hotels match '{requested_location}'")
+        
+        return filtered_hotels
+    
+    def _extract_location_keywords(self, location: str) -> List[str]:
+        """Extract keywords from location string for matching."""
+        # Remove common words and normalize
+        common_words = {"hotel", "hotels", "in", "at", "near", "area", "district", "city"}
+        location_clean = location.lower().replace(",", " ")
+        
+        keywords = []
+        for word in location_clean.split():
+            word = word.strip()
+            if len(word) > 2 and word not in common_words:
+                keywords.append(word)
+        
+        return keywords
+    
+    def _location_matches(self, address: str, keywords: List[str]) -> bool:
+        """Check if hotel address matches the requested location keywords."""
+        if not address or not keywords:
+            return True  # If no address info, don't filter out
+        
+        address_lower = address.lower()
+        
+        # Check if any keyword matches
+        for keyword in keywords:
+            if keyword in address_lower:
+                return True
+        
+        return False
     
     def _calculate_completeness(self, hotel: Dict[str, Any]) -> float:
         """Calculate data completeness score."""
