@@ -20,12 +20,15 @@ from typing import Any, Dict
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from pydantic import BaseModel
+from typing import List, Optional
 
 from .config import LOG_ROOT, DATA_ROOT, MAX_CONCURRENT_JOBS, API_KEY, HEADLESS
 from .jobs import JobRecord, SubmitRequest, JobStore
 from .runtime import BrowserRuntime
 from .workers import WorkerPool
 from .tasks import task_registry, normalise_task
+from .exploration import PageExplorer
 
 # ----------------------------------------------------------------------------
 # Logging (kept in main as requested)
@@ -69,6 +72,31 @@ REQUEST_LATENCY = Histogram(
 )
 
 # ----------------------------------------------------------------------------
+# Pydantic models for exploration API
+# ----------------------------------------------------------------------------
+
+class PageStructureRequest(BaseModel):
+    url: str
+    wait_timeout: int = 10000
+
+class SelectorTestRequest(BaseModel):
+    url: str
+    selectors: List[str]
+    extract_text: bool = True
+    extract_attributes: bool = False
+    wait_timeout: int = 10000
+
+class DataExtractionRequest(BaseModel):
+    url: str
+    extraction_config: Dict[str, Any]
+    wait_timeout: int = 10000
+
+class BookingExploreRequest(BaseModel):
+    location: str = "Dubai"
+    check_in: str = "2025-12-01"
+    check_out: str = "2025-12-03"
+
+# ----------------------------------------------------------------------------
 # App + global runtime (kept in main)
 # ----------------------------------------------------------------------------
 
@@ -77,6 +105,7 @@ app = FastAPI(title="Browser Automation Service")
 job_store: JobStore | None = None
 browser_runtime: BrowserRuntime | None = None
 worker_pool: WorkerPool | None = None
+page_explorer: PageExplorer | None = None
 
 
 @app.middleware("http")
@@ -164,13 +193,98 @@ async def get_job(job_id: str):
 
 
 # ----------------------------------------------------------------------------
+# Page Exploration API Endpoints
+# ----------------------------------------------------------------------------
+
+@app.post("/explore/page-structure")
+async def explore_page_structure(request: PageStructureRequest):
+    """Analyze the basic DOM structure and elements of a webpage."""
+    global page_explorer
+    
+    if not page_explorer:
+        raise HTTPException(status_code=503, detail="Page explorer not initialized")
+    
+    try:
+        result = await page_explorer.analyze_page_structure(
+            url=request.url,
+            wait_timeout=request.wait_timeout
+        )
+        return result
+    except Exception as e:
+        service_logger.error(f"Page structure exploration failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/explore/selectors")
+async def explore_selectors(request: SelectorTestRequest):
+    """Test multiple selectors against a webpage and return what they find."""
+    global page_explorer
+    
+    if not page_explorer:
+        raise HTTPException(status_code=503, detail="Page explorer not initialized")
+    
+    try:
+        result = await page_explorer.test_selectors(
+            url=request.url,
+            selectors=request.selectors,
+            extract_text=request.extract_text,
+            extract_attributes=request.extract_attributes,
+            wait_timeout=request.wait_timeout
+        )
+        return result
+    except Exception as e:
+        service_logger.error(f"Selector testing failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/explore/data-extraction")
+async def explore_data_extraction(request: DataExtractionRequest):
+    """Debug data extraction with detailed logging and validation."""
+    global page_explorer
+    
+    if not page_explorer:
+        raise HTTPException(status_code=503, detail="Page explorer not initialized")
+    
+    try:
+        result = await page_explorer.extract_data_debug(
+            url=request.url,
+            extraction_config=request.extraction_config,
+            wait_timeout=request.wait_timeout
+        )
+        return result
+    except Exception as e:
+        service_logger.error(f"Data extraction debugging failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/explore/booking-hotel")
+async def explore_booking_hotel(request: BookingExploreRequest):
+    """Booking.com specific exploration to understand current page structure."""
+    global page_explorer
+    
+    if not page_explorer:
+        raise HTTPException(status_code=503, detail="Page explorer not initialized")
+    
+    try:
+        result = await page_explorer.explore_booking_hotel(
+            location=request.location,
+            check_in=request.check_in,
+            check_out=request.check_out
+        )
+        return result
+    except Exception as e:
+        service_logger.error(f"Booking.com exploration failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+# ----------------------------------------------------------------------------
 # Startup and shutdown (kept in main)
 # ----------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def on_startup() -> None:
     """Initialise the Playwright runtime and worker pool."""
-    global job_store, browser_runtime, worker_pool
+    global job_store, browser_runtime, worker_pool, page_explorer
 
     service_logger.info("Starting browser automation service…")
 
@@ -181,6 +295,10 @@ async def on_startup() -> None:
     launch_args = ["--disable-blink-features=AutomationControlled"]
     browser_runtime = BrowserRuntime(headless=HEADLESS, args=launch_args, logger=service_logger)
     await browser_runtime.start()
+
+    # Page Explorer (for debugging and development)
+    page_explorer = PageExplorer(browser_runtime.browser, service_logger)  # type: ignore[arg-type]
+    service_logger.info("Initialized page exploration API")
 
     # Workers
     worker_pool = WorkerPool(

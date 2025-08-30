@@ -37,6 +37,14 @@ _registry = TaskRegistry()
 async def booking_hotels(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
     return await BookingHotelsTask.run(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
 
+@_registry.register("booking-hotels-investigation")
+async def booking_hotels_investigation(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await BookingHotelsTask.investigate_review_structure(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
+
+@_registry.register("booking-hotels-price-investigation")
+async def booking_hotels_price_investigation(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await BookingHotelsTask.investigate_price_selectors(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
+
 @_registry.register("scrape-site") 
 async def scrape_site(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
     return await ScrapeSiteTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
