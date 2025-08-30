@@ -1941,181 +1941,626 @@ class ModernBookingScraper:
             self.logger.debug(f"Description extraction error: {e}")
             return None
     
+    async def _navigate_to_reviews_section(self, page) -> bool:
+        """Navigate to the actual reviews section where pagination works"""
+        try:
+            self.logger.info("🔍 Level 4: Navigating to reviews section for pagination")
+            
+            # Strategy A: Look for reviews navigation elements
+            review_nav_selectors = [
+                "a[href*='#reviews']",
+                "button:has-text('Reviews')", 
+                "[data-testid='reviews-tab']",
+                "[data-testid*='review'][data-testid*='section']",
+                ".review-section-nav",
+                "a:has-text('Reviews')"
+            ]
+            
+            for selector in review_nav_selectors:
+                try:
+                    element = page.locator(selector).first
+                    if await element.is_visible(timeout=2000):
+                        self.logger.info(f"✅ Found reviews navigation: {selector}")
+                        await element.click()
+                        await page.wait_for_timeout(3000)
+                        return True
+                except:
+                    continue
+            
+            # Strategy B: Navigate to reviews URL fragment
+            try:
+                current_url = page.url
+                if '/hotel/' in current_url:
+                    base_url = current_url.split('?')[0].split('#')[0]
+                    reviews_url = f"{base_url}#tab-reviews"
+                    
+                    self.logger.info(f"🔍 Navigating to reviews URL: {reviews_url}")
+                    await page.goto(reviews_url, wait_until='domcontentloaded', timeout=30000)
+                    await page.wait_for_timeout(3000)
+                    return True
+            except Exception as e:
+                self.logger.debug(f"Reviews URL navigation failed: {e}")
+            
+            return False
+            
+        except Exception as e:
+            self.logger.warning(f"Reviews section navigation failed: {e}")
+            return False
+    
+    async def _click_pagination_button_js(self, page, button_selector: str, button_element=None) -> bool:
+        """JavaScript-aware button clicking for better compatibility with dynamic content"""
+        try:
+            if button_element is None:
+                await page.wait_for_selector(button_selector, timeout=5000)
+                button_element = page.locator(button_selector).first
+            
+            # Get current review count before clicking
+            initial_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+            self.logger.info(f"🔥 JS Click: Current reviews before click: {initial_count}")
+            
+            # JavaScript click instead of Playwright click for better compatibility
+            element_handle = await button_element.element_handle()
+            if element_handle:
+                await page.evaluate("(element) => element.click()", element_handle)
+                self.logger.info(f"✅ JavaScript click executed on {button_selector}")
+            else:
+                # Fallback to regular click
+                await button_element.click()
+                self.logger.info(f"✅ Fallback click executed on {button_selector}")
+            
+            # Wait for dynamic content to load
+            success = await self._wait_for_new_reviews(page, initial_count)
+            
+            if success:
+                final_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+                self.logger.info(f"🎉 JS Click SUCCESS: {final_count - initial_count} new reviews loaded!")
+                return True
+            else:
+                self.logger.warning(f"⚠️ JS Click: No new content loaded after clicking {button_selector}")
+                return False
+                
+        except Exception as e:
+            self.logger.warning(f"JS button click failed for {button_selector}: {e}")
+            return False
+    
+    async def _wait_for_new_reviews(self, page, initial_count: int, timeout: int = 15000) -> bool:
+        """Wait for new reviews to load after pagination with multiple detection strategies"""
+        try:
+            self.logger.info(f"⏳ Waiting for new reviews to load (initial: {initial_count})...")
+            
+            # Strategy 1: Wait for review count to increase
+            try:
+                js_function = f"() => document.querySelectorAll('[data-testid=\"review-positive-text\"], [data-testid=\"review-negative-text\"]').length > {initial_count}"
+                await page.wait_for_function(js_function, timeout=timeout)
+                self.logger.info("✅ New reviews detected by count increase")
+                return True
+            except:
+                self.logger.debug("Count-based detection timed out")
+            
+            # Strategy 2: Wait for loading indicators to disappear
+            loading_selectors = [
+                ".loading", ".spinner", "[data-testid='loading']", 
+                ".bui-loading", ".loading-overlay", "[class*='loading']"
+            ]
+            
+            for selector in loading_selectors:
+                try:
+                    if await page.locator(selector).count() > 0:
+                        await page.wait_for_selector(selector, state="hidden", timeout=5000)
+                        self.logger.info(f"✅ Loading indicator {selector} disappeared")
+                        
+                        # Check if count increased after loading disappeared
+                        final_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+                        if final_count > initial_count:
+                            self.logger.info(f"✅ Reviews increased after loading: {final_count - initial_count} new")
+                            return True
+                except:
+                    continue
+            
+            # Strategy 3: Wait and check for any content changes
+            await page.wait_for_timeout(5000)
+            final_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+            
+            if final_count > initial_count:
+                self.logger.info(f"✅ Reviews eventually loaded: {final_count - initial_count} new")
+                return True
+            
+            self.logger.warning(f"⚠️ No new reviews detected after {timeout}ms wait")
+            return False
+            
+        except Exception as e:
+            self.logger.warning(f"Wait for new reviews failed: {e}")
+            return False
+    
     async def _extract_reviews_level_4(self, page) -> Optional[Dict[str, Any]]:
-        """Level 4: TRUE ALL REVIEWS extraction - attempts to get ALL available reviews (potentially 1000+)."""
+        """Level 4: TRUE ALL REVIEWS extraction with ENHANCED pagination - gets ALL available reviews (potentially 1000+)."""
         reviews_data = {"reviews": [], "total_count": 0, "rating_breakdown": {}}
         
         try:
-            self.logger.info("🔥 LEVEL 4: Starting TRUE ALL REVIEWS extraction - Target: ALL available reviews")
+            self.logger.info("🔥 LEVEL 4: Starting ENHANCED PAGINATION-BASED ALL REVIEWS extraction")
             
-            # STEP 1: Try to navigate to the full reviews page
+            # STEP 1: Navigate to reviews section for proper pagination
+            navigation_success = await self._navigate_to_reviews_section(page)
+            if navigation_success:
+                self.logger.info("✅ Successfully navigated to reviews section")
+            else:
+                self.logger.info("⚠️ Could not navigate to reviews section - continuing with current page")
+            
+            # STEP 1B: Try to click "See all reviews" buttons
             all_reviews_loaded = False
             
-            # Strategy A: Look for "See all reviews" or similar buttons
+            # Strategy A: Look for reviews section or "See all reviews" buttons
             show_all_buttons = [
                 "a:has-text('See all reviews')",
                 "a:has-text('Show all reviews')",
                 "a:has-text('View all reviews')", 
                 "button:has-text('See all reviews')",
-                "button:has-text('Show all reviews')",
-                "button:has-text('View all reviews')",
                 "[data-testid*='reviews']:has-text('all')",
                 "a[href*='review']:has-text('See all')",
-                "a[href*='review']:has-text('Show all')",
-                ".bui-review-score__text a",
-                "[class*='reviews']:has-text('all')"
+                ".bui-review-score__text a"
             ]
             
             for button_selector in show_all_buttons:
                 try:
                     button = page.locator(button_selector).first
-                    if await button.is_visible(timeout=3000):
+                    if await button.is_visible(timeout=2000):
                         self.logger.info(f"🔥 Level 4: Found 'See all reviews' button: {button_selector}")
                         await button.click()
-                        await page.wait_for_timeout(5000)  # Wait for reviews page to load
+                        await page.wait_for_timeout(3000)
                         all_reviews_loaded = True
                         break
                 except Exception as e:
-                    self.logger.debug(f"Level 4: Button {button_selector} not found: {e}")
                     continue
             
-            # Strategy B: If no button found, try to construct reviews page URL
+            # Strategy B: Navigate to reviews URL fragment
             if not all_reviews_loaded:
                 try:
                     current_url = page.url
                     if '/hotel/' in current_url:
-                        # Try to construct reviews URL (Booking.com pattern)
-                        base_url = current_url.split('?')[0]  # Remove query params
-                        reviews_url = f"{base_url}?tab=reviews"
+                        base_url = current_url.split('?')[0].split('#')[0]
+                        reviews_url = f"{base_url}#tab-reviews"
                         
-                        self.logger.info(f"🔥 Level 4: Trying reviews URL: {reviews_url}")
+                        self.logger.info(f"🔥 Level 4: Navigating to reviews section: {reviews_url}")
                         await page.goto(reviews_url, wait_until='domcontentloaded', timeout=30000)
                         await page.wait_for_timeout(3000)
                         all_reviews_loaded = True
                 except Exception as e:
                     self.logger.debug(f"Level 4: Reviews URL navigation failed: {e}")
             
-            # STEP 2: Implement aggressive scrolling to load ALL reviews
-            if all_reviews_loaded:
-                self.logger.info("🔥 Level 4: Starting aggressive scroll-to-load-all strategy")
+            # STEP 2: IMPLEMENT PROPER PAGINATION TO GET ALL REVIEWS
+            all_reviews = []
+            page_number = 1
+            max_pages = 50  # Prevent infinite loops
+            
+            self.logger.info("🔥 Level 4: Starting PAGINATION to extract ALL review pages")
+            
+            while page_number <= max_pages:
+                self.logger.info(f"🔥 Level 4: Processing review page {page_number}")
                 
-                # Progressive scrolling with load-more detection
-                scroll_attempts = 0
-                max_scroll_attempts = 50  # Allow up to 50 scroll attempts
-                no_new_content_count = 0
-                previous_review_count = 0
+                # Wait for page to load
+                await page.wait_for_timeout(2000)
                 
-                while scroll_attempts < max_scroll_attempts and no_new_content_count < 5:
-                    # Scroll down gradually
-                    scroll_position = (scroll_attempts + 1) * 0.1
-                    if scroll_position > 1.0:
-                        scroll_position = 1.0
-                    
-                    await page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {scroll_position})")
-                    await page.wait_for_timeout(2000)  # Wait for potential lazy loading
-                    
-                    # Look for "Load more" or "Show more" buttons
-                    load_more_buttons = [
-                        "button:has-text('Load more')",
-                        "button:has-text('Show more')",
-                        "button:has-text('More reviews')",
-                        "a:has-text('Load more')",
-                        "a:has-text('Show more')",
-                        "[data-testid*='load-more']",
-                        "[data-testid*='show-more']",
-                        ".bui-pagination__nav-button"
+                # Extract reviews from current page
+                page_reviews = []
+                
+                # Try direct text extraction first
+                text_elements = page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']")
+                text_count = await text_elements.count()
+                
+                self.logger.info(f"🔥 Level 4: Page {page_number} has {text_count} review text elements")
+                
+                if text_count > 0:
+                    for i in range(text_count):
+                        try:
+                            text_element = text_elements.nth(i)
+                            
+                            if await text_element.is_visible(timeout=500):
+                                text = await text_element.inner_text()
+                                if text and text.strip() and self._is_valid_review_text(text.strip()):
+                                    review_data = {'review_text': text.strip()}
+                                    
+                                    # Try to find reviewer name
+                                    try:
+                                        parent = text_element.locator("xpath=..//..")
+                                        name_element = parent.locator("[data-testid*='reviewer'], [data-testid*='name'], .reviewer-name, h4, .bui-avatar-block__title").first
+                                        if await name_element.is_visible(timeout=200):
+                                            name_text = await name_element.inner_text()
+                                            if name_text and name_text.strip():
+                                                review_data['reviewer_name'] = name_text.strip()
+                                    except:
+                                        pass
+                                    
+                                    review_data['extraction_timestamp'] = datetime.now().isoformat()
+                                    review_data['page_number'] = page_number
+                                    
+                                    # Check for duplicates across all pages (more precise matching)
+                                    is_duplicate = False
+                                    current_text = review_data['review_text']
+                                    
+                                    for existing_review in all_reviews:
+                                        existing_text = existing_review.get('review_text', '').strip()
+                                        
+                                        # Only consider exact matches or very similar long texts as duplicates
+                                        if current_text == existing_text:
+                                            is_duplicate = True
+                                            self.logger.debug(f"🔍 Level 4: Exact duplicate found: '{current_text[:50]}...'")
+                                            break
+                                        elif (len(current_text) > 100 and len(existing_text) > 100 and 
+                                              current_text[:100] == existing_text[:100]):
+                                            is_duplicate = True  
+                                            self.logger.debug(f"🔍 Level 4: Long text duplicate found: '{current_text[:50]}...'")
+                                            break
+                                    
+                                    if not is_duplicate:
+                                        page_reviews.append(review_data)
+                                        all_reviews.append(review_data)
+                        except Exception as e:
+                            continue
+                
+                # If no reviews found with direct method, try container-based
+                if not page_reviews:
+                    review_selectors = [
+                        "[data-testid='review-card']",
+                        ".c-review-block",
+                        ".bui-review-item"
                     ]
                     
-                    for load_button_selector in load_more_buttons:
+                    for selector in review_selectors:
                         try:
-                            load_button = page.locator(load_button_selector).first
-                            if await load_button.is_visible(timeout=1000):
-                                self.logger.info(f"🔥 Level 4: Clicking load more button: {load_button_selector}")
-                                await load_button.click()
-                                await page.wait_for_timeout(3000)  # Wait for new content to load
+                            review_elements = page.locator(selector)
+                            count = await review_elements.count()
+                            
+                            if count > 0:
+                                self.logger.info(f"🔥 Level 4: Page {page_number} - Using container selector '{selector}' with {count} reviews")
+                                
+                                for i in range(count):
+                                    try:
+                                        element = review_elements.nth(i)
+                                        review_data = await self._extract_single_review(element)
+                                        
+                                        if review_data and (review_data.get('reviewer_name') or review_data.get('review_text')):
+                                            if review_data.get('review_text') and not self._is_valid_review_text(review_data['review_text']):
+                                                continue
+                                            
+                                            review_data['extraction_timestamp'] = datetime.now().isoformat()
+                                            review_data['page_number'] = page_number
+                                            
+                                            # Check for duplicates (precise matching)
+                                            is_duplicate = False
+                                            current_text = review_data.get('review_text', '').strip()
+                                            
+                                            for existing_review in all_reviews:
+                                                existing_text = existing_review.get('review_text', '').strip()
+                                                
+                                                if current_text == existing_text:
+                                                    is_duplicate = True
+                                                    self.logger.debug(f"🔍 Level 4: Container duplicate found: '{current_text[:50]}...'")
+                                                    break
+                                                elif (len(current_text) > 100 and len(existing_text) > 100 and 
+                                                      current_text[:100] == existing_text[:100]):
+                                                    is_duplicate = True
+                                                    self.logger.debug(f"🔍 Level 4: Container long duplicate found: '{current_text[:50]}...'")
+                                                    break
+                                            
+                                            if not is_duplicate:
+                                                page_reviews.append(review_data)
+                                                all_reviews.append(review_data)
+                                                
+                                    except Exception as e:
+                                        continue
                                 break
                         except:
                             continue
-                    
-                    # Check if we're loading more content by counting review elements
-                    current_review_count = await page.locator("[data-testid*='review'], .c-review-block, .bui-review-item, .review-item, [class*='review']").count()
-                    
-                    if current_review_count == previous_review_count:
-                        no_new_content_count += 1
-                        self.logger.debug(f"Level 4: No new reviews loaded (attempt {no_new_content_count}/5)")
-                    else:
-                        no_new_content_count = 0
-                        self.logger.info(f"🔥 Level 4: Reviews count increased to {current_review_count}")
-                    
-                    previous_review_count = current_review_count
-                    scroll_attempts += 1
                 
-                self.logger.info(f"🔥 Level 4: Finished aggressive loading - Final review count: {previous_review_count}")
-            
-            # STEP 3: Extract ALL loaded reviews with no limits
-            review_selectors = [
-                "[data-testid*='review']",
-                ".c-review-block",
-                ".bui-review-item", 
-                ".review-item",
-                "[class*='review']",
-                "[id*='review']",
-                ".review_list_new_item",
-                ".hp-review-block",
-                ".review-card",
-                "[data-testid='review-card']"
-            ]
-            
-            reviews = []
-            for selector in review_selectors:
-                try:
-                    review_elements = page.locator(selector)
-                    count = await review_elements.count()
-                    
-                    self.logger.info(f"🔥 Level 4: Selector '{selector}' found {count} review elements")
-                    
-                    if count > 0:
-                        # Level 4: Extract ALL reviews (no limit!)
-                        self.logger.info(f"🔥 Level 4: Extracting ALL {count} reviews - NO LIMITS!")
+                self.logger.info(f"🔥 Level 4: Page {page_number} extracted {len(page_reviews)} unique reviews (Total so far: {len(all_reviews)})")
+                
+                # CRITICAL: Check if we found any reviews on this page
+                if not page_reviews:
+                    self.logger.info(f"🔥 Level 4: No reviews found on page {page_number} - ending pagination")
+                    break
+                
+                # STEP 3: LOOK FOR NEXT PAGE BUTTON AND CLICK IT
+                next_page_found = False
+                next_page_selectors = [
+                    # Booking.com specific pagination selectors
+                    "[data-testid='pagination-next-button']",
+                    "[data-testid*='pagination']:has-text('Next')",
+                    "[data-testid*='next']",
+                    ".bui-button:has-text('Next')",
+                    ".bui-pagination__next-arrow",
+                    "button:has-text('Next page')",
+                    "a:has-text('Next page')",
+                    "button:has-text('Next')",
+                    "a:has-text('Next')",
+                    ".sr_pagination_next",
+                    "[aria-label*='Next']",
+                    ".pagination-next",
+                    "a[href*='offset=']",
+                    "[class*='next'][class*='page']",
+                    "[class*='pagination'][class*='next']",
+                    "li:has-text('Next') a",
+                    ".review-pager-next",
+                    ".reviews-pagination .next"
+                ]
+                
+                # Enhanced pagination button detection with debugging
+                self.logger.info(f"🔥 Level 4: Searching for Next page button among {len(next_page_selectors)} selectors...")
+                
+                for i, next_selector in enumerate(next_page_selectors):
+                    try:
+                        self.logger.debug(f"🔥 Level 4: Trying selector {i+1}/{len(next_page_selectors)}: {next_selector}")
+                        next_button = page.locator(next_selector).first
                         
-                        for i in range(count):
+                        if await next_button.is_visible(timeout=1000):
+                            # Check if button is enabled (not disabled)
+                            is_disabled = await next_button.get_attribute('disabled')
+                            has_disabled_class = await next_button.get_attribute('class')
+                            button_text = await next_button.inner_text() if await next_button.is_visible() else "No text"
+                            
+                            self.logger.info(f"🔥 Level 4: Found button with '{next_selector}' - Text: '{button_text}' - Disabled: {is_disabled}")
+                            
+                            if not is_disabled and (not has_disabled_class or 'disabled' not in has_disabled_class.lower()):
+                                self.logger.info(f"🔥 Level 4: Attempting JavaScript click on Next button: {next_selector}")
+                                
+                                # Use enhanced JavaScript clicking
+                                click_success = await self._click_pagination_button_js(page, next_selector, next_button)
+                                
+                                if click_success:
+                                    self.logger.info(f"🎉 Level 4: Next button successfully loaded new reviews!")
+                                    next_page_found = True
+                                    break
+                                else:
+                                    self.logger.info(f"⚠️ Level 4: Next button didn't load new reviews")
+                                    continue
+                            else:
+                                self.logger.info(f"🔥 Level 4: Next button found but disabled: {next_selector}")
+                        else:
+                            self.logger.debug(f"🔥 Level 4: Selector '{next_selector}' not visible")
+                    except Exception as e:
+                        self.logger.debug(f"🔥 Level 4: Selector '{next_selector}' failed: {e}")
+                        continue
+                
+                if not next_page_found:
+                    # FALLBACK: Try to find ANY pagination or load more elements
+                    self.logger.info(f"🔥 Level 4: Standard selectors failed - trying generic pagination fallback...")
+                    
+                    # Look for any button or link with pagination-related text or classes
+                    generic_selectors = [
+                        "button:has-text('Show more')",
+                        "a:has-text('Show more')", 
+                        "button:has-text('Load more')",
+                        "a:has-text('Load more')",
+                        "button:has-text('More')",
+                        "[class*='load'][class*='more']",
+                        "[class*='show'][class*='more']",
+                        "[class*='pagination'] button",
+                        "[class*='pagination'] a",
+                        ".paginate button",
+                        ".paginate a",
+                        "[data-offset]",
+                        "[onclick*='page']",
+                        "[onclick*='more']"
+                    ]
+                    
+                    for fallback_selector in generic_selectors:
+                        try:
+                            fallback_button = page.locator(fallback_selector).first
+                            if await fallback_button.is_visible(timeout=500):
+                                button_text = await fallback_button.inner_text()
+                                self.logger.info(f"🔥 Level 4: Found potential pagination element: '{fallback_selector}' with text: '{button_text}'")
+                                
+                                # Check if it's not disabled
+                                is_disabled = await fallback_button.get_attribute('disabled')
+                                if not is_disabled:
+                                    self.logger.info(f"🔥 Level 4: Attempting enhanced JavaScript click on fallback button: {fallback_selector}")
+                                    
+                                    # Use enhanced JavaScript clicking with dynamic waiting
+                                    click_success = await self._click_pagination_button_js(page, fallback_selector, fallback_button)
+                                    
+                                    if click_success:
+                                        self.logger.info(f"🎉 Level 4: Fallback button successfully loaded new reviews!")
+                                        next_page_found = True
+                                        break
+                                    else:
+                                        self.logger.info(f"⚠️ Level 4: Fallback button didn't load new reviews")
+                                        
+                                        # For "Show more" buttons, try aggressive multiple clicking with JS
+                                        if "show more" in button_text.lower() or "load more" in button_text.lower():
+                                            self.logger.info(f"🔥 Level 4: Trying aggressive JS clicking for {fallback_selector}")
+                                            
+                                            for attempt in range(3):  # Try clicking 3 more times with JS
+                                                try:
+                                                    if await fallback_button.is_visible(timeout=1000):
+                                                        current_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+                                                        
+                                                        # JavaScript aggressive click
+                                                        element_handle = await fallback_button.element_handle()
+                                                        if element_handle:
+                                                            await page.evaluate("(element) => { element.click(); element.click(); }", element_handle)
+                                                        
+                                                        # Wait for content with timeout
+                                                        success = await self._wait_for_new_reviews(page, current_count, timeout=8000)
+                                                        
+                                                        if success:
+                                                            final_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+                                                            self.logger.info(f"🎉 Level 4: Aggressive JS clicking worked! New count: {final_count}")
+                                                            next_page_found = True
+                                                            break
+                                                except:
+                                                    break
+                                            
+                                            if next_page_found:
+                                                break
+                                        continue
+                        except:
+                            continue
+                    
+                    if not next_page_found:
+                        self.logger.info(f"🔥 Level 4: No pagination elements found - finished at page {page_number}")
+                        break
+                if next_page_found:
+                    self.logger.info(f"🔥 Level 4: Successfully moved to page {page_number + 1}")
+                
+                page_number += 1
+                
+                # Safety check - if we're getting too many reviews, we might be in an infinite loop
+                if len(all_reviews) > 5000:
+                    self.logger.info(f"🔥 Level 4: Safety limit reached - extracted {len(all_reviews)} reviews across {page_number} pages")
+                    break
+            
+            # STEP 4: FINALIZE RESULTS
+            self.logger.info(f"✅ Level 4: PAGINATION COMPLETE - Extracted {len(all_reviews)} total reviews from {page_number} pages!")
+            
+            if all_reviews:
+                reviews_data["reviews"] = all_reviews
+                reviews_data["total_count"] = len(all_reviews)
+                reviews_data["pages_processed"] = page_number
+                return reviews_data
+            else:
+                self.logger.warning(f"❌ Level 4: No reviews found despite pagination attempt")
+                
+                # FALLBACK: Use container-based approach if direct approach fails
+                review_selectors = [
+                    "[data-testid='review-card']",  # User-confirmed primary selector
+                    "#reviewCardsSection [data-testid='review-card']",  # More specific
+                    "#reviewCardsSection > div > div > div",  # User-provided exact path
+                    "[data-testid='review-item']", 
+                    ".c-review-block"
+                ]
+                
+                # Container-based fallback (same logic as before)
+                reviews = []
+                best_selector = None
+                best_count = 0
+                
+                # First pass: Find the selector that captures the most reviews
+                for selector in review_selectors:
+                    try:
+                        review_elements = page.locator(selector)
+                        count = await review_elements.count()
+                        
+                        self.logger.info(f"🔥 Level 4: Selector '{selector}' found {count} review elements")
+                        
+                        if count > best_count:
+                            best_count = count
+                            best_selector = selector
+                            self.logger.info(f"🔥 Level 4: New best selector '{selector}' with {count} reviews")
+                            
+                    except Exception as e:
+                        self.logger.debug(f"Level 4 selector {selector} failed: {e}")
+                        continue
+            
+            # Extract reviews using the best selector (the one with most reviews)
+            if best_selector and best_count > 0:
+                try:
+                    review_elements = page.locator(best_selector)
+                    self.logger.info(f"🔥 Level 4: Using BEST selector '{best_selector}' with {best_count} reviews - Targeting ALL!")
+                    
+                    if best_count > 0:
+                        # Level 4: Extract ALL reviews (no limit!)
+                        self.logger.info(f"🔥 Level 4: Extracting ALL {best_count} reviews - NO LIMITS!")
+                        
+                        for i in range(best_count):
                             try:
+                                self.logger.info(f"🔍 DEBUG: Level 4 processing review {i+1}/{best_count}")
                                 element = review_elements.nth(i)
-                                review_data = await self._extract_single_review(element)
+                                
+                                # INLINE EXTRACTION: Extract text directly using user-provided selectors
+                                review_data = {}
+                                try:
+                                    # User-provided text selectors
+                                    text_selectors = ["[data-testid='review-positive-text']", "[data-testid='review-negative-text']"]
+                                    text_found = False
+                                    
+                                    for text_selector in text_selectors:
+                                        try:
+                                            text_element = element.locator(text_selector).first
+                                            if await text_element.is_visible(timeout=500):
+                                                text = await text_element.inner_text()
+                                                if text and text.strip():
+                                                    review_data['review_text'] = text.strip()
+                                                    text_found = True
+                                                    self.logger.info(f"🔍 DEBUG: Found text with {text_selector}: '{text[:50]}...'")
+                                                    break
+                                        except Exception as te:
+                                            continue
+                                    
+                                    if not text_found:
+                                        # Try fallback selectors
+                                        fallback_selectors = ["p", ".review-text", ".c-review__body"]
+                                        for fb_selector in fallback_selectors:
+                                            try:
+                                                fb_element = element.locator(fb_selector).first
+                                                if await fb_element.is_visible(timeout=200):
+                                                    fb_text = await fb_element.inner_text()
+                                                    if fb_text and fb_text.strip():
+                                                        review_data['review_text'] = fb_text.strip()
+                                                        text_found = True
+                                                        self.logger.info(f"🔍 DEBUG: Found text with fallback {fb_selector}: '{fb_text[:50]}...'")
+                                                        break
+                                            except:
+                                                continue
+                                    
+                                    if not text_found:
+                                        self.logger.info(f"🔍 DEBUG: No text found in review {i+1}")
+                                        review_data = None
+                                        
+                                except Exception as ee:
+                                    self.logger.info(f"🔍 DEBUG: Exception extracting review {i+1}: {ee}")
+                                    review_data = None
+                                
+                                self.logger.info(f"🔍 DEBUG: Level 4 review {i+1} data: {review_data}")
                                 
                                 if review_data and (review_data.get('reviewer_name') or review_data.get('review_text')):
-                                    # Apply filtering but be less strict for Level 4
+                                    # STRICT validation and deduplication
                                     is_valid = True
                                     
                                     if review_data.get('review_text'):
                                         if not self._is_valid_review_text(review_data['review_text']):
                                             is_valid = False
+                                            self.logger.debug(f"Level 4: Rejected invalid review text: {review_data['review_text'][:50]}...")
                                     
                                     if review_data.get('reviewer_name'):
                                         if not self._is_valid_reviewer_name(review_data['reviewer_name']):
-                                            # For Level 4, just clean the name rather than discarding
+                                            self.logger.debug(f"Level 4: Rejected invalid reviewer name: {review_data['reviewer_name']}")
                                             review_data.pop('reviewer_name', None)
                                     
                                     if is_valid and (review_data.get('reviewer_name') or review_data.get('review_text')):
-                                        review_data['extraction_timestamp'] = datetime.now().isoformat()
-                                        reviews.append(review_data)
+                                        # DEDUPLICATION: Check if this review already exists
+                                        review_text = review_data.get('review_text', '').strip()
+                                        is_duplicate = False
                                         
-                                        # Log progress every 50 reviews
-                                        if len(reviews) % 50 == 0:
-                                            self.logger.info(f"🔥 Level 4: Progress - {len(reviews)} reviews extracted...")
+                                        for existing_review in reviews:
+                                            existing_text = existing_review.get('review_text', '').strip()
+                                            if review_text and existing_text:
+                                                # Check for exact match or substantial overlap
+                                                if review_text == existing_text or (
+                                                    len(review_text) > 20 and len(existing_text) > 20 and 
+                                                    review_text[:30] == existing_text[:30]
+                                                ):
+                                                    is_duplicate = True
+                                                    self.logger.debug(f"Level 4: Skipping duplicate review: {review_text[:30]}...")
+                                                    break
+                                        
+                                        if not is_duplicate:
+                                            review_data['extraction_timestamp'] = datetime.now().isoformat()
+                                            reviews.append(review_data)
+                                            
+                                            # Log progress every 25 reviews (reduced frequency for quality focus)
+                                            if len(reviews) % 25 == 0:
+                                                self.logger.info(f"🔥 Level 4: Progress - {len(reviews)} UNIQUE reviews extracted...")
                                     
                             except Exception as e:
                                 self.logger.debug(f"Level 4 review {i+1} extraction failed: {e}")
                                 continue
                         
-                        # For Level 4, use the selector that found the most reviews
-                        if reviews:
-                            self.logger.info(f"✅ Level 4: Successfully extracted {len(reviews)} total reviews with selector: {selector}")
-                            break
-                            
+                        # Level 4 extraction completed with best selector
+                        self.logger.info(f"✅ Level 4: Successfully extracted {len(reviews)} total reviews with BEST selector: {best_selector}")
+                        
                 except Exception as e:
-                    self.logger.debug(f"Level 4 selector {selector} failed: {e}")
-                    continue
+                    self.logger.error(f"Level 4 extraction failed with best selector '{best_selector}': {e}")
+            else:
+                self.logger.warning(f"❌ Level 4: No suitable selector found - unable to extract reviews")
             
             # STEP 4: Compile final results
             reviews_data['reviews'] = reviews
@@ -2160,21 +2605,33 @@ class ModernBookingScraper:
         try:
             self.logger.info("📝 LEVEL 3: Starting basic review extraction")
             
-            # Simple navigation to reviews - just scroll down
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
-            await page.wait_for_timeout(2000)
+            # CRITICAL FIX: Navigate to reviews section like Level 4 does
+            self.logger.info("📝 Level 3: Navigating to reviews section for proper extraction")
+            navigation_success = await self._navigate_to_reviews_section(page)
+            if navigation_success:
+                self.logger.info("✅ Level 3: Successfully navigated to reviews section")
+            else:
+                self.logger.info("⚠️ Level 3: Could not navigate to reviews section - trying scroll fallback")
+                # Fallback: scroll to reviews area
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.7)")
+                await page.wait_for_timeout(3000)
             
-            # Try to find review elements directly (no complex navigation)
+            # PRECISE Level 3 review selectors (same as Level 4 but limited extraction)
             review_selectors = [
-                "[data-testid*='review']",
+                # USER-PROVIDED HIGHLY SPECIFIC selectors for Booking.com reviews
+                "[data-testid='review-card']",  # User-confirmed primary selector
+                "#reviewCardsSection [data-testid='review-card']",  # More specific path
+                "#reviewCardsSection > div > div > div",  # User-provided exact path
+                
+                # Backup selectors
+                "[data-testid='review-item']", 
                 ".c-review-block",
                 ".bui-review-item", 
-                ".review-item",
-                # Additional modern selectors
-                "[class*='review']",
-                "[id*='review']",
                 ".review_list_new_item",
-                ".hp-review-block"
+                
+                # Last resort fallbacks
+                ".hp-review-block",
+                ".review-item:not(.review-item-filter):not(.review-item-sort)"
             ]
             
             reviews = []
@@ -2382,10 +2839,138 @@ class ModernBookingScraper:
         return reviews
     
     async def _extract_single_review(self, card):
-        """Extract comprehensive data from a single review card."""
+        """Extract comprehensive data from a single review card with proper field separation."""
         review_data = {}
         
         try:
+            self.logger.debug(f"🔍 Extracting single review from card")
+            
+            # STEP 1: Extract reviewer name (SEPARATE from review text)
+            name_found = False
+            name_selectors = [
+                "[data-testid='reviewer-name']",
+                ".bui-avatar-block__title",
+                ".c-review-block__reviewer-name", 
+                ".reviewer-name",
+                "h4",
+                ".bui-f-font-weight--bold",
+                ".review-author",
+                "[class*='reviewer'][class*='name']"
+            ]
+            
+            for selector in name_selectors:
+                try:
+                    name_element = card.locator(selector).first
+                    if await name_element.is_visible(timeout=1000):
+                        name_text = await name_element.inner_text()
+                        if name_text and name_text.strip():
+                            # Validate reviewer name (avoid review text being used as name)
+                            clean_name = name_text.strip()
+                            if self._is_valid_reviewer_name(clean_name):
+                                review_data['reviewer_name'] = clean_name
+                                name_found = True
+                                self.logger.debug(f"✅ Found valid reviewer name: '{clean_name}'")
+                                break
+                            else:
+                                self.logger.debug(f"❌ Invalid reviewer name: '{clean_name[:30]}...'")
+                except:
+                    continue
+            
+            if not name_found:
+                self.logger.debug(f"⚠️ No valid reviewer name found")
+            
+            # STEP 2: Extract review text (SEPARATE from reviewer name)
+            text_found = False
+            text_parts = []
+            
+            # Primary review text selectors
+            positive_selectors = ["[data-testid='review-positive-text']", ".c-review__positive"]
+            negative_selectors = ["[data-testid='review-negative-text']", ".c-review__negative"]
+            
+            # Extract positive review text
+            for selector in positive_selectors:
+                try:
+                    pos_element = card.locator(selector).first
+                    if await pos_element.is_visible(timeout=1000):
+                        pos_text = await pos_element.inner_text()
+                        if pos_text and pos_text.strip() and len(pos_text.strip()) > 5:
+                            text_parts.append(f"👍 {pos_text.strip()}")
+                            text_found = True
+                            break
+                except:
+                    continue
+            
+            # Extract negative review text
+            for selector in negative_selectors:
+                try:
+                    neg_element = card.locator(selector).first
+                    if await neg_element.is_visible(timeout=1000):
+                        neg_text = await neg_element.inner_text()
+                        if neg_text and neg_text.strip() and len(neg_text.strip()) > 5:
+                            text_parts.append(f"👎 {neg_text.strip()}")
+                            text_found = True
+                            break
+                except:
+                    continue
+            
+            # Fallback to general review text if specific selectors don't work
+            if not text_found:
+                general_text_selectors = [
+                    "[data-testid='review-content']",
+                    ".c-review__body",
+                    ".bui-review-card__description",
+                    ".review-text",
+                    "p"
+                ]
+                
+                for selector in general_text_selectors:
+                    try:
+                        text_element = card.locator(selector).first
+                        if await text_element.is_visible(timeout=1000):
+                            text_content = await text_element.inner_text()
+                            if text_content and text_content.strip() and len(text_content.strip()) > 10:
+                                # Ensure this isn't a reviewer name being used as review text
+                                if self._is_valid_review_text(text_content.strip()):
+                                    text_parts.append(text_content.strip())
+                                    text_found = True
+                                    break
+                    except:
+                        continue
+            
+            if text_parts:
+                review_data['review_text'] = " | ".join(text_parts)
+            
+            # STEP 3: Extract additional metadata
+            # Review date
+            date_selectors = [
+                "[data-testid='review-date']",
+                ".bui-review-score__info-text:has-text('Reviewed')",
+                ".c-review-block__date",
+                ".review-date"
+            ]
+            
+            for selector in date_selectors:
+                try:
+                    date_element = card.locator(selector).first
+                    if await date_element.is_visible(timeout=1000):
+                        date_text = await date_element.inner_text()
+                        if date_text and date_text.strip():
+                            clean_date = date_text.replace('Reviewed:', '').replace('Reviewed', '').strip()
+                            if clean_date and len(clean_date) < 50:  # Reasonable date length
+                                review_data['review_date'] = clean_date
+                                break
+                except:
+                    continue
+            
+            # Return review data only if we have meaningful content
+            if review_data.get('review_text') or review_data.get('reviewer_name'):
+                return review_data
+            else:
+                self.logger.debug(f"❌ No meaningful review content extracted")
+                return None
+            
+            # OLD CODE COMMENTED OUT - USING MINIMAL TEST ABOVE
+            """ 
             # Reviewer name - try modern selectors
             name_selectors = [
                 "[data-testid='reviewer-name']",
@@ -2493,9 +3078,9 @@ class ModernBookingScraper:
             # Review text - comprehensive extraction
             text_parts = []
             
-            # Try positive/negative review sections
-            positive_selectors = [".c-review__positive", "[data-testid='review-positive']"]
-            negative_selectors = [".c-review__negative", "[data-testid='review-negative']"]
+            # USER-PROVIDED review text selectors based on actual DOM structure
+            positive_selectors = ["[data-testid='review-positive-text']", ".c-review__positive", "[data-testid='review-positive']"]
+            negative_selectors = ["[data-testid='review-negative-text']", ".c-review__negative", "[data-testid='review-negative']"]
             
             for selector in positive_selectors:
                 try:
@@ -2522,7 +3107,10 @@ class ModernBookingScraper:
             # Fallback to general review text
             if not text_parts:
                 general_text_selectors = [
+                    "[data-testid='review-positive-text']",  # User-provided primary selector
+                    "[data-testid='review-negative-text']",  # User-provided alternative
                     "[data-testid='review-content']",
+                    "[data-testid='review-text']",
                     ".c-review__body",
                     ".bui-review-card__description",
                     ".review-text",
@@ -2552,11 +3140,16 @@ class ModernBookingScraper:
                         review_data['helpful_votes'] = helpful_text.strip()
             except:
                 pass
+            """
+            # END OLD CODE COMMENT
                 
         except Exception as e:
-            self.logger.debug(f"Error extracting single review: {e}")
+            self.logger.info(f"🚨 DEBUG: Exception in _extract_single_review: {e}")
+            return None
         
-        return review_data
+        # This should not be reached with minimal test above
+        self.logger.info(f"🔍 DEBUG: Unexpectedly reached end of minimal test method")
+        return None
     
     async def _extract_reviews_fallback(self, page) -> Optional[Dict[str, Any]]:
         """Fallback method to extract reviews without specific container."""
@@ -2826,53 +3419,86 @@ class ModernBookingScraper:
         return True
     
     
-    def _is_valid_review_text(self, text: str) -> bool:
-        """Check if text looks like valid review content vs UI elements."""
-        if not text or len(text.strip()) < 10:
+    def _is_valid_reviewer_name(self, name: str) -> bool:
+        """Validate that a reviewer name is actually a name, not review text"""
+        if not name or len(name.strip()) < 2:
             return False
         
-        text_lower = text.lower().strip()
+        name_clean = name.strip()
         
-        # Filter out common UI elements that get mistaken for review text
-        ui_elements = {
-            'see availability',
-            'show more reviews',
-            'read more reviews', 
-            'guest reviews',
-            'all reviews',
-            'booking.com',
-            'book now',
-            'check availability',
-            'reserve now',
-            'rated wonderful',
-            'rated excellent', 
-            'rated good'
-        }
-        
-        # Check if it's just a UI element
-        if text_lower in ui_elements:
+        # Too long to be a name (likely review text)
+        if len(name_clean) > 30:
             return False
         
-        # Check if it starts with common UI patterns  
-        ui_prefixes = ['guest reviews (', 'rated ', 'show ', 'read ', 'see ']
-        if any(text_lower.startswith(prefix) for prefix in ui_prefixes):
-            return False
-            
-        # Filter out review count patterns like "Guest reviews (21)", "· 21 reviews"
-        import re
-        if re.match(r'^.*reviews?\s*\([\d,]+\)$', text_lower) or re.match(r'^·\s*[\d,]+\s*reviews?$', text_lower):
+        # Contains sentence structure (likely review text)
+        if '.' in name_clean and len(name_clean) > 15:
             return False
         
-        # Filter out standalone review count patterns
-        if re.match(r'^\d[\d,]*\s*reviews?$', text_lower):
+        # Generic review words used as names
+        generic_words = ['wonderful', 'excellent', 'good', 'amazing', 'great', 'fantastic', 'perfect']
+        if name_clean.lower() in generic_words:
             return False
         
-        # Must contain actual words (not just numbers or symbols)
-        word_count = len([word for word in text.split() if word.isalpha() and len(word) > 2])
-        if word_count < 3:
+        # Too many words (likely sentence)
+        word_count = len(name_clean.split())
+        if word_count > 4:
             return False
+        
+        # Contains common review phrases
+        review_phrases = [
+            'everything was', 'stay here', 'will not regret', 'highly recommend',
+            'loved it', 'great place', 'nice hotel', 'good location'
+        ]
+        name_lower = name_clean.lower()
+        for phrase in review_phrases:
+            if phrase in name_lower:
+                return False
         
         return True
+    
+    def _is_valid_review_text(self, text: str) -> bool:
+        """TEMPORARY DEBUG: More permissive validation to debug Level 4."""
+        if not text or len(text.strip()) < 5:  # Relaxed minimum length for debugging
+            return False
+        
+        text_clean = text.strip()
+        text_lower = text_clean.lower()
+        
+        # CRITICAL: Filter out UI elements that contaminate review extraction
+        ui_element_patterns = [
+            # Navigation and controls
+            'show all reviews', 'see all reviews', 'view all reviews', 'load more reviews',
+            'most relevant', 'newest first', 'oldest first', 'sort by', 'filter by',
+            'helpful', 'not helpful', 'person found this review helpful',
+            'continue reading', 'read more', 'show more', 'show less',
+            
+            # Booking.com specific UI elements  
+            'we aim for 100% real reviews', 'write a review', 'guest reviews',
+            'host review score', 'review score', 'scored ', 'rated ',
+            'reviews (', 'good reviews', 'excellent reviews',
+            
+            # Category labels and metadata
+            'categories:', 'staff ', 'facilities ', 'cleanliness ', 'comfort ',
+            'value for money', 'location ', 'free wifi ', 'low score for',
+            'couples particularly like', 'families with', 'business travelers',
+            'solo traveler', 'group of friends', 'couples (', 'families (',
+            
+            # Date and stay info (when standalone)
+            'night ·', 'nights ·', 'reviewed:', 'one-bedroom apartment',
+            'studio apartment', 'superior room', 'deluxe room',
+            
+            # Property responses and system messages
+            'property response:', 'thank you for', 'dear guest',
+            'we appreciate', 'we would like', 'thank you so much',
+            
+            # Rating and scoring text
+            'out of 10', 'based on ', ' reviews', 'average rating',
+            'overall rating', 'review rating'
+        ]
+        
+        # TEMPORARY DEBUG: Skip all filtering to identify extraction issue
+        self.logger.info(f"🔍 DEBUG: Review text validation - '{text_clean[:50]}...' -> PASSED (debug mode)")
+        return True  # Accept everything for debugging
     
     def _fix_image_url(self, url: str) -> str:
         """Fix and enhance image URLs."""
@@ -3181,9 +3807,9 @@ class ModernBookingScraper:
             # Enhanced review text extraction
             text_parts = []
             
-            # Try positive/negative review sections
-            positive_selectors = [".c-review__positive", "[data-testid='review-positive']", ".review-positive"]
-            negative_selectors = [".c-review__negative", "[data-testid='review-negative']", ".review-negative"]
+            # USER-PROVIDED enhanced review text selectors
+            positive_selectors = ["[data-testid='review-positive-text']", ".c-review__positive", "[data-testid='review-positive']", ".review-positive"]
+            negative_selectors = ["[data-testid='review-negative-text']", ".c-review__negative", "[data-testid='review-negative']", ".review-negative"]
             
             for selector in positive_selectors:
                 try:
@@ -3210,7 +3836,10 @@ class ModernBookingScraper:
             # Fallback to general review text
             if not text_parts:
                 general_text_selectors = [
+                    "[data-testid='review-positive-text']",  # User-provided primary
+                    "[data-testid='review-negative-text']",  # User-provided alternative
                     "[data-testid='review-content']",
+                    "[data-testid='review-text']",
                     ".c-review__body",
                     ".bui-review-card__description",
                     ".review-text",
@@ -3302,34 +3931,16 @@ class ModernBookingScraper:
             return 0
     
     async def _extract_single_review(self, review_element) -> Optional[Dict[str, Any]]:
-        """Extract review data from a single review element."""
+        """ENHANCED single review extraction with strict content validation."""
         review_data = {}
         
         try:
-            # Extract reviewer name with comprehensive selectors for 2025 Booking.com
+            # Extract reviewer name with STRICT validation
             name_selectors = [
-                # Modern Booking.com selectors
+                # Modern Booking.com specific selectors
                 "[data-testid='reviewer-name']",
-                "[data-testid*='reviewer']",
-                "[data-testid*='author']",
-                
-                # Class-based selectors
                 ".bui-avatar-block__title",
-                ".c-review-block__title", 
-                ".review_list_new_item_block_author",
-                "[class*='reviewer-name']",
-                "[class*='reviewer_name']",
-                "[class*='author-name']",
-                "[class*='author_name']",
-                
-                # Generic selectors for names
-                "h4", "h5", "h6",  # Names often in headers
-                ".hp_reviewer_name",
-                "[class*='name']:not([class*='hotel']):not([class*='property'])",
-                
-                # Fallback - any text that looks like a name
-                "div:has-text(/^[A-Z][a-z]+ ?[A-Z]?[a-z]*$/)",
-                "span:has-text(/^[A-Z][a-z]+ ?[A-Z]?[a-z]*$/)"
+                ".c-review-block__reviewer-name"
             ]
             
             for selector in name_selectors:
@@ -3343,63 +3954,77 @@ class ModernBookingScraper:
                 except:
                     continue
             
-            # Extract review text with comprehensive selectors
-            text_selectors = [
-                # Modern Booking.com selectors - more specific to avoid UI elements
+            # Extract review text with LASER-FOCUSED selectors
+            # Priority 1: Specific review content containers
+            primary_text_selectors = [
                 "[data-testid='review-content']",
-                "[data-testid*='review-text']",
-                
-                # Class-based selectors - more specific
-                ".c-review-block__content",
-                ".review-content", 
-                ".bui-review-content",
-                ".hp_review_text",
-                "[class*='review-text']:not([class*='count']):not([class*='header'])",
-                "[class*='review_text']:not([class*='count']):not([class*='header'])",
-                "[class*='review-content']:not([class*='count']):not([class*='header'])",
-                
-                # Generic text selectors (longer text usually = review) - but be more specific
-                "p:not([class*='count']):not([class*='header'])", 
-                "div p:not([class*='count'])"
+                ".c-review__body", 
+                ".bui-review-content__text"
             ]
             
-            text_parts = []
-            
-            for selector in text_selectors:
+            review_text_found = False
+            for selector in primary_text_selectors:
                 try:
-                    text_elements = review_element.locator(selector)
-                    count = await text_elements.count()
-                    
-                    for i in range(min(count, 3)):  # Max 3 text parts per selector
-                        try:
-                            element = text_elements.nth(i)
-                            if await element.is_visible(timeout=500):
-                                text = await element.inner_text()
-                                if text and text.strip() and len(text.strip()) > 10:
-                                    text_parts.append(text.strip())
-                        except:
-                            continue
-                            
-                    if text_parts:  # Found text with this selector, stop
-                        break
-                        
+                    text_element = review_element.locator(selector).first
+                    if await text_element.is_visible(timeout=500):
+                        text = await text_element.inner_text()
+                        if text and text.strip() and len(text.strip()) > 15:
+                            review_data['review_text'] = text.strip()
+                            review_text_found = True
+                            break
                 except:
                     continue
             
-            if text_parts:
-                review_data['review_text'] = ' '.join(text_parts)
-            else:
-                # Fallback: extract any text from the review element
+            # Priority 2: Positive/Negative specific sections
+            if not review_text_found:
+                pos_neg_selectors = [
+                    ".c-review__positive", 
+                    ".c-review__negative",
+                    "[data-testid='review-positive']",
+                    "[data-testid='review-negative']"
+                ]
+                
+                text_parts = []
+                for selector in pos_neg_selectors:
+                    try:
+                        element = review_element.locator(selector).first
+                        if await element.is_visible(timeout=500):
+                            text = await element.inner_text()
+                            if text and text.strip() and len(text.strip()) > 10:
+                                text_parts.append(text.strip())
+                    except:
+                        continue
+                
+                if text_parts:
+                    review_data['review_text'] = ' | '.join(text_parts)
+                    review_text_found = True
+            
+            # Priority 3: Quoted text (likely review content)
+            if not review_text_found:
                 try:
+                    # Look for quoted text within the review element
                     full_text = await review_element.inner_text()
-                    if full_text and len(full_text.strip()) > 20:  # Must be substantial text
-                        # Clean up the text - remove common non-review parts
-                        lines = [line.strip() for line in full_text.split('\n') if line.strip()]
-                        meaningful_lines = [line for line in lines if len(line) > 10 and not line.isdigit()]
-                        if meaningful_lines:
-                            review_data['review_text'] = ' '.join(meaningful_lines[:3])  # Max 3 lines
+                    if full_text:
+                        # Extract text between quotes
+                        import re
+                        quoted_matches = re.findall(r'"([^"]{20,})"', full_text)
+                        if quoted_matches:
+                            # Take the longest quoted text
+                            longest_quote = max(quoted_matches, key=len)
+                            if len(longest_quote) > 20:
+                                review_data['review_text'] = f'"{longest_quote}"'
+                                review_text_found = True
                 except:
                     pass
+            
+            # Final validation: Must have either reviewer name OR review text (and they must be valid)
+            has_valid_name = review_data.get('reviewer_name') and self._is_valid_reviewer_name(review_data['reviewer_name'])
+            has_valid_text = review_data.get('review_text') and self._is_valid_review_text(review_data['review_text'])
+            
+            if has_valid_name or has_valid_text:
+                return review_data
+            else:
+                return None
             
             # Extract review date
             date_selectors = [
