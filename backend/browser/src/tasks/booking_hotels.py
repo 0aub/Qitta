@@ -325,8 +325,8 @@ class BookingHotelsTask:
             # Validate parameters
             clean_params = BookingHotelsTask._validate_params(params)
             
-            # Determine scraping level
-            scrape_level = params.get("scrape_level", 2)  # Default to Level 2
+            # Determine scraping level - FIXED: handle both 'level' and 'scrape_level' parameters
+            scrape_level = clean_params.get("level") or clean_params.get("scrape_level") or params.get("level", params.get("scrape_level", 2))
             deep_scrape = params.get("deep_scrape", False) or params.get("deep_scrape_enabled", False)
             
             # If old deep_scrape parameter is used, map it to Level 3
@@ -373,8 +373,8 @@ class BookingHotelsTask:
             # Apply filters
             hotels = BookingHotelsTask._apply_filters(hotels, params, logger)
             
-            # Calculate metrics
-            hotels_with_prices = [h for h in hotels if h.get('price_per_night')]
+            # Calculate metrics - Fixed: count hotels with price > 0, not just truthy values
+            hotels_with_prices = [h for h in hotels if h.get('price_per_night', 0) > 0]
             success_rate = len(hotels_with_prices) / len(hotels) if hotels else 0
             avg_price = sum(h.get('price_per_night', 0) for h in hotels_with_prices) / len(hotels_with_prices) if hotels_with_prices else 0
             
@@ -450,7 +450,9 @@ class BookingHotelsTask:
             "min_price": params.get("min_price"),
             "max_price": params.get("max_price"),
             "min_rating": params.get("min_rating"),
-            "star_rating": params.get("star_rating")
+            "star_rating": params.get("star_rating"),
+            "level": params.get("level"),
+            "scrape_level": params.get("scrape_level")
         }
     
     @staticmethod
@@ -464,7 +466,7 @@ class BookingHotelsTask:
         max_price = params.get("max_price")
         if min_price or max_price:
             filtered_hotels = [h for h in filtered_hotels 
-                             if h.get('price_per_night') and 
+                             if h.get('price_per_night', 0) > 0 and 
                              (not min_price or h['price_per_night'] >= min_price) and
                              (not max_price or h['price_per_night'] <= max_price)]
         
@@ -1076,6 +1078,12 @@ class ModernBookingScraper:
             
             self.logger.info(f"🏨 Found {card_count} property cards on page")
             
+            # PRICE EXTRACTION FIX: Extract all prices from page level (they exist outside property cards)
+            current_url = page.url
+            self.logger.info(f"🔗 Current page URL: {current_url}")
+            page_prices = await self._extract_page_level_prices(page, card_count)
+            self.logger.info(f"💰 Extracted {len(page_prices)} prices from page level")
+            
             # Limit to max_results
             cards_to_process = min(card_count, max_results)
             
@@ -1083,6 +1091,11 @@ class ModernBookingScraper:
                 try:
                     card = property_cards.nth(i)
                     hotel_data = await self._extract_basic_hotel_data(card, i + 1)
+                    
+                    # PRICE FIX: Inject page-level price for this hotel (by position)
+                    if hotel_data and i < len(page_prices) and page_prices[i] > 0:
+                        hotel_data['price_per_night'] = page_prices[i]
+                        self.logger.info(f"✅ Injected page-level price for hotel {i+1}: {page_prices[i]}")
                     
                     if hotel_data:
                         if deep_scrape and hotel_data.get('booking_url'):
@@ -1106,7 +1119,72 @@ class ModernBookingScraper:
             
         except Exception as e:
             self.logger.error(f"❌ Property cards extraction failed: {e}")
-            return hotels
+        
+        return hotels
+    
+    async def _extract_page_level_prices(self, page, expected_count: int) -> List[float]:
+        """Extract prices from page level (outside property cards) and return ordered list."""
+        prices = []
+        
+        try:
+            # Use the working selectors we discovered that find prices at page level + additional fallbacks
+            working_price_selectors = [
+                "[data-testid='price-and-discounted-price']",  # PRIMARY - 25 elements found in manual test
+                "[data-testid*='price']",  # SECONDARY - 50 elements found in manual test
+                "*:has-text('SAR')",  # Currency-based selectors that should work
+                "*:has-text('AED')",
+                "*:has-text('$')",
+                "*:has-text('From')",  # "From SAR 1,400" patterns
+                ".bui-price-display__value",  # Legacy booking.com price selectors
+                "[class*='price']"  # Broad class-based price patterns
+            ]
+            
+            for selector in working_price_selectors:
+                try:
+                    price_elements = page.locator(selector)
+                    count = await price_elements.count()
+                    
+                    self.logger.info(f"💰 Page-level price selector '{selector}': found {count} elements")
+                    
+                    if count >= expected_count:  # We need at least as many prices as property cards
+                        for i in range(min(count, expected_count * 2)):  # Extract extra in case some are invalid
+                            try:
+                                price_element = price_elements.nth(i)
+                                if await price_element.is_visible(timeout=500):
+                                    price_text = await price_element.inner_text()
+                                    if price_text:
+                                        extracted_price = self._extract_price_number(price_text)
+                                        if extracted_price and extracted_price > 0:
+                                            prices.append(extracted_price)
+                                            self.logger.debug(f"   Price {i+1}: {price_text} -> {extracted_price}")
+                            except Exception as e:
+                                self.logger.debug(f"   Price element {i+1} failed: {e}")
+                                continue
+                        
+                        # If we got enough prices, use this selector
+                        if len(prices) >= expected_count:
+                            self.logger.info(f"✅ Page-level prices extracted: {len(prices)} prices using '{selector}'")
+                            break
+                    
+                except Exception as e:
+                    self.logger.debug(f"Page-level price selector '{selector}' failed: {e}")
+                    continue
+            
+            # Pad with zeros if we didn't get enough prices
+            while len(prices) < expected_count:
+                prices.append(0.0)
+            
+            # Trim to expected count
+            prices = prices[:expected_count]
+            
+            self.logger.info(f"💰 Final page-level prices: {len(prices)} prices, {len([p for p in prices if p > 0])} valid")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Page-level price extraction failed: {e}")
+            # Return zeros if extraction fails
+            prices = [0.0] * expected_count
+        
+        return prices
     
     async def _scrape_property_cards_level_3(self, page, max_results: int) -> List[Dict[str, Any]]:
         """Level 3: Scrape hotel data with basic review sampling (2-5 reviews per hotel)."""
@@ -1119,6 +1197,12 @@ class ModernBookingScraper:
             
             self.logger.info(f"🏨 Level 3: Found {card_count} property cards on page")
             
+            # PRICE EXTRACTION FIX: Extract all prices from page level (same fix as Level 1-2)
+            current_url = page.url
+            self.logger.info(f"🔗 Level 3 Current page URL: {current_url}")
+            page_prices = await self._extract_page_level_prices(page, card_count)
+            self.logger.info(f"💰 Level 3 Extracted {len(page_prices)} prices from page level")
+            
             # Limit to max_results
             cards_to_process = min(card_count, max_results)
             
@@ -1126,6 +1210,11 @@ class ModernBookingScraper:
                 try:
                     card = property_cards.nth(i)
                     hotel_data = await self._extract_basic_hotel_data(card, i + 1)
+                    
+                    # PRICE FIX: Inject page-level price for this hotel (by position)
+                    if hotel_data and i < len(page_prices) and page_prices[i] > 0:
+                        hotel_data['price_per_night'] = page_prices[i]
+                        self.logger.info(f"✅ Level 3 Injected page-level price for hotel {i+1}: {page_prices[i]}")
                     
                     if hotel_data:
                         if hotel_data.get('booking_url'):
@@ -1165,6 +1254,12 @@ class ModernBookingScraper:
             
             self.logger.info(f"🏨 Level 4: Found {card_count} property cards on page")
             
+            # PRICE EXTRACTION FIX: Extract all prices from page level (same fix as Level 1-2)
+            current_url = page.url
+            self.logger.info(f"🔗 Level 4 Current page URL: {current_url}")
+            page_prices = await self._extract_page_level_prices(page, card_count)
+            self.logger.info(f"💰 Level 4 Extracted {len(page_prices)} prices from page level")
+            
             # Limit to max_results
             cards_to_process = min(card_count, max_results)
             
@@ -1172,6 +1267,11 @@ class ModernBookingScraper:
                 try:
                     card = property_cards.nth(i)
                     hotel_data = await self._extract_basic_hotel_data(card, i + 1)
+                    
+                    # PRICE FIX: Inject page-level price for this hotel (by position)
+                    if hotel_data and i < len(page_prices) and page_prices[i] > 0:
+                        hotel_data['price_per_night'] = page_prices[i]
+                        self.logger.info(f"✅ Level 4 Injected page-level price for hotel {i+1}: {page_prices[i]}")
                     
                     if hotel_data:
                         if hotel_data.get('booking_url'):
@@ -1238,38 +1338,37 @@ class ModernBookingScraper:
                     # Extract hotel ID from URL
                     hotel_data['hotel_id'] = self._extract_hotel_id_from_url(href)
             
-            # Price - Enhanced selectors for modern Booking.com
+            # Price - Working selectors for 2025 Booking.com (based on investigation)
             price_selectors = [
-                # 2025 Modern Booking.com patterns (most likely)
-                "*[data-testid*='price'] *",
-                "span[data-testid*='price']",
-                "[data-testid*='price']",
-                "*[class*='price'] span",
-                "*[class*='price']",
+                # WORKING 2025 selectors (UPDATED with discovered working patterns)
+                "[data-testid='price-and-discounted-price']",  # 25 elements found - PRIMARY
+                "[data-testid*='price']",  # 50 elements found - SECONDARY
                 
-                # Specific modern patterns  
-                "*[data-price]",
-                "*[price]",
-                "span[class*='bui']:has-text('$')",
-                "span[class*='sr']:has-text('$')",
-                "div[class*='price'] span",
+                # Multi-currency support (SAR is common in Dubai)
+                "*:has-text('SAR')",
+                "*:has-text('AED')", 
+                "*:has-text('USD')",
+                "*:has-text('$')",
+                "*:has-text('€')",
                 
-                # Currency-based discovery
-                "span:has-text('$')",
-                "span:has-text('USD')", 
+                # Specific booking.com patterns
+                "span:has-text('SAR')",
                 "span:has-text('AED')",
-                "span:has-text('€')",
+                "div:has-text('SAR')",
+                "*:has-text('From SAR')",
+                "*:has-text('From AED')",
                 
                 # Legacy selectors (kept for fallback)
                 ".bui-price-display__value",
-                ".sr-hotel__price span",
+                ".sr-hotel__price span", 
                 ".prco-valign-middle-helper",
                 ".bui-price",
                 
-                # Broad discovery patterns
-                "*:has-text('$'):not(button):not(a)",
-                "span[class]:has-text('$')",
-                "div[class]:has-text('$')"
+                # Legacy USD patterns (still needed for some regions)
+                "span:has-text('$')",
+                "*:has-text('$')",
+                "div:has-text('$')",
+                "*:has-text('From $')"
             ]
             
             # Enhanced price debugging
@@ -1280,7 +1379,7 @@ class ModernBookingScraper:
                     element_count = await card.locator(selector).count()
                     self.logger.info(f"   Price selector {i+1}: {selector} -> {element_count} elements")
                     
-                    if await price_element.is_visible(timeout=1000):
+                    if element_count > 0 and await price_element.is_visible(timeout=1000):
                         price_text = await price_element.inner_text()
                         self.logger.info(f"   Found price text: '{price_text}'")
                         if price_text and price_text.strip():
@@ -1288,7 +1387,7 @@ class ModernBookingScraper:
                             self.logger.debug(f"   Extracted price value: {extracted_price}")
                             if extracted_price and extracted_price > 0:
                                 hotel_data['price_per_night'] = extracted_price
-                                self.logger.info(f"✅ Price extracted: ${extracted_price} with selector: {selector}")
+                                self.logger.info(f"✅ Price extracted: {extracted_price} with selector: {selector}")
                                 break
                     else:
                         self.logger.debug(f"   Price element not visible for: {selector}")
@@ -1296,32 +1395,79 @@ class ModernBookingScraper:
                     self.logger.debug(f"   Price extraction error for {selector}: {e}")
                     continue
             
-            # Enhanced price debugging and fallback extraction
+            # AGGRESSIVE price debugging and fallback extraction
             if not hotel_data.get('price_per_night'):
-                self.logger.warning(f"❌ No price found for hotel {index} with any selector - trying fallbacks")
+                self.logger.warning(f"❌ No price found for hotel {index} with any selector - trying AGGRESSIVE fallbacks")
                 
-                # Try to find any text containing currency symbols for debugging
+                # DEBUG: Log card structure to understand what elements are available
                 try:
-                    debug_elements = await card.locator("*:has-text('$'), *:has-text('USD'), *:has-text('AED'), *:has-text('€')").all()
-                    for elem in debug_elements[:3]:  # Check first 3 matches
+                    card_text_sample = await card.inner_text()
+                    self.logger.info(f"   🔍 Card text sample: {card_text_sample[:200]}...")
+                except:
+                    pass
+                
+                # ENHANCED FALLBACK 1: Look for ANY currency text (UPDATED with SAR support)
+                try:
+                    debug_elements = await card.locator("*:has-text('SAR'), *:has-text('$'), *:has-text('USD'), *:has-text('AED'), *:has-text('€'), *:has-text('From'), *:has-text('night')").all()
+                    self.logger.info(f"   🔍 Found {len(debug_elements)} potential price elements")
+                    
+                    for i, elem in enumerate(debug_elements[:10]):  # Check more elements
                         try:
                             debug_text = await elem.inner_text()
-                            self.logger.info(f"   💰 Debug price candidate: '{debug_text.strip()}'")
-                            # Try to extract price from this text
-                            potential_price = self._extract_price_number(debug_text)
-                            if potential_price and potential_price > 0:
-                                hotel_data['price_per_night'] = potential_price
-                                self.logger.info(f"✅ Price extracted from fallback: ${potential_price}")
-                                break
-                        except:
+                            if debug_text and len(debug_text.strip()) < 100:  # Avoid huge text blocks
+                                self.logger.info(f"   💰 Price candidate {i+1}: '{debug_text.strip()}'")
+                                
+                                potential_price = self._extract_price_number(debug_text)
+                                if potential_price and potential_price > 0:
+                                    hotel_data['price_per_night'] = potential_price
+                                    self.logger.info(f"✅ Price extracted from fallback {i+1}: ${potential_price}")
+                                    break
+                        except Exception as elem_e:
+                            self.logger.debug(f"   Element {i+1} error: {elem_e}")
                             continue
+                            
                 except Exception as e:
-                    self.logger.debug(f"Price debugging failed: {e}")
+                    self.logger.debug(f"Aggressive fallback 1 failed: {e}")
                 
-                # Final fallback: mark as price unavailable
+                # ENHANCED FALLBACK 2: Search entire card HTML for price patterns
+                if not hotel_data.get('price_per_night'):
+                    try:
+                        card_html = await card.inner_html()
+                        import re
+                        
+                        # Look for price patterns in HTML (UPDATED with SAR support)
+                        price_patterns = [
+                            r'SAR\s*(\d+,?\d*)',  # SAR 1,400 - PRIMARY pattern for Dubai
+                            r'(\d+,?\d*)\s*SAR',  # 1,400 SAR
+                            r'From\s*SAR\s*(\d+,?\d*)',  # From SAR 1,400
+                            r'From\s*\$(\d+\.?\d*)',
+                            r'\$(\d+\.?\d*)\s*per\s*night',
+                            r'\$(\d+\.?\d*)',
+                            r'(\d+\.?\d*)\s*USD',
+                            r'(\d+\.?\d*)\s*AED'
+                        ]
+                        
+                        for pattern in price_patterns:
+                            matches = re.findall(pattern, card_html)
+                            if matches:
+                                try:
+                                    # Remove commas and convert to float
+                                    price_str = matches[0].replace(',', '')
+                                    price_val = float(price_str)
+                                    if 20 <= price_val <= 10000:  # Increased upper limit for SAR
+                                        hotel_data['price_per_night'] = price_val
+                                        self.logger.info(f"✅ Price extracted from HTML pattern: {price_val}")
+                                        break
+                                except:
+                                    continue
+                                    
+                    except Exception as e:
+                        self.logger.debug(f"HTML price extraction failed: {e}")
+                
+                # Final fallback: mark as price unavailable  
                 if not hotel_data.get('price_per_night'):
                     hotel_data['price_per_night'] = 0
-                    self.logger.info("   💰 Price set to 0 (unavailable)")
+                    self.logger.warning(f"   💰 NO PRICE FOUND - set to 0 for hotel {index}")
             
             # Rating - Updated selectors for 2025 Booking.com DOM
             rating_selectors = [
@@ -1573,8 +1719,25 @@ class ModernBookingScraper:
                     self.logger.warning("Missing price data")
                 
                 # LEVEL 3 FEATURE: Basic review sampling (2-5 reviews max)
-                self.logger.info("📝 LEVEL 3: Starting basic review extraction")
-                reviews_data = await self._extract_reviews_level_3(hotel_page)
+                # Use Level 4 extraction logic (proven to work) but limit to 2-5 reviews
+                self.logger.info("📝 LEVEL 3: Using Level 4 extraction logic (limited to 2-5 reviews)")
+                level_4_reviews_data = await self._extract_reviews_level_4(hotel_page)
+                
+                # Convert Level 4 results to Level 3 format (limit to 2-5 reviews)
+                reviews_data = None
+                if level_4_reviews_data and level_4_reviews_data.get('reviews'):
+                    all_reviews = level_4_reviews_data['reviews']
+                    # Limit to first 2-5 reviews for Level 3
+                    limited_reviews = all_reviews[:5] if len(all_reviews) >= 2 else []
+                    
+                    if limited_reviews:
+                        reviews_data = {
+                            'reviews': limited_reviews,
+                            'total_count': len(limited_reviews),
+                            'rating_breakdown': level_4_reviews_data.get('rating_breakdown', {}),
+                            'extraction_method': 'LEVEL_3_USING_LEVEL_4_LOGIC'
+                        }
+                        self.logger.info(f"📝 LEVEL 3: Successfully extracted {len(limited_reviews)} reviews using Level 4 logic")
                 
                 # Always add Level 3 markers
                 hotel_data['extraction_method'] = 'LEVEL_3_BASIC_REVIEWS'
@@ -1994,8 +2157,8 @@ class ModernBookingScraper:
                 await page.wait_for_selector(button_selector, timeout=5000)
                 button_element = page.locator(button_selector).first
             
-            # Get current review count before clicking
-            initial_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+            # Get current review count before clicking (use robust selector)
+            initial_count = await page.locator("[data-testid*='review-positive'], [data-testid*='review-negative'], .c-review__positive, .c-review__negative").count()
             self.logger.info(f"🔥 JS Click: Current reviews before click: {initial_count}")
             
             # JavaScript click instead of Playwright click for better compatibility
@@ -2012,7 +2175,7 @@ class ModernBookingScraper:
             success = await self._wait_for_new_reviews(page, initial_count)
             
             if success:
-                final_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+                final_count = await page.locator("[data-testid*='review-positive'], [data-testid*='review-negative'], .c-review__positive, .c-review__negative").count()
                 self.logger.info(f"🎉 JS Click SUCCESS: {final_count - initial_count} new reviews loaded!")
                 return True
             else:
@@ -2030,7 +2193,7 @@ class ModernBookingScraper:
             
             # Strategy 1: Wait for review count to increase
             try:
-                js_function = f"() => document.querySelectorAll('[data-testid=\"review-positive-text\"], [data-testid=\"review-negative-text\"]').length > {initial_count}"
+                js_function = f"() => document.querySelectorAll('[data-testid*=\"review-positive\"], [data-testid*=\"review-negative\"], .c-review__positive, .c-review__negative').length > {initial_count}"
                 await page.wait_for_function(js_function, timeout=timeout)
                 self.logger.info("✅ New reviews detected by count increase")
                 return True
@@ -2050,7 +2213,7 @@ class ModernBookingScraper:
                         self.logger.info(f"✅ Loading indicator {selector} disappeared")
                         
                         # Check if count increased after loading disappeared
-                        final_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+                        final_count = await page.locator("[data-testid*='review-positive'], [data-testid*='review-negative'], .c-review__positive, .c-review__negative").count()
                         if final_count > initial_count:
                             self.logger.info(f"✅ Reviews increased after loading: {final_count - initial_count} new")
                             return True
@@ -2073,11 +2236,240 @@ class ModernBookingScraper:
             return False
     
     async def _extract_reviews_level_4(self, page) -> Optional[Dict[str, Any]]:
-        """Level 4: TRUE ALL REVIEWS extraction with ENHANCED pagination - gets ALL available reviews (potentially 1000+)."""
+        """Level 4: FIXED ALL REVIEWS extraction with USER-PROVIDED selectors and proper pagination."""
+        return await self._extract_reviews_level_4_fixed(page)
+
+    async def _extract_reviews_level_4_fixed(self, page) -> Optional[Dict[str, Any]]:
+        """Level 4: FIXED implementation using USER-PROVIDED correct selectors."""
         reviews_data = {"reviews": [], "total_count": 0, "rating_breakdown": {}}
         
         try:
-            self.logger.info("🔥 LEVEL 4: Starting ENHANCED PAGINATION-BASED ALL REVIEWS extraction")
+            self.logger.info("🔥 LEVEL 4 FIXED: Starting ALL REVIEWS extraction with USER-PROVIDED selectors")
+            
+            # STEP 1: Navigate to reviews section using USER-PROVIDED URL pattern
+            current_url = page.url
+            if '/hotel/' in current_url:
+                base_url = current_url.split('?')[0].split('#')[0]
+                reviews_url = f"{base_url}#tab-reviews"
+                
+                self.logger.info(f"🔥 LEVEL 4 FIXED: Navigating to reviews section: {reviews_url}")
+                await page.goto(reviews_url, wait_until='domcontentloaded', timeout=30000)
+                await page.wait_for_timeout(5000)
+            
+            # STEP 2: Extract ALL reviews using pagination with USER-PROVIDED selectors
+            all_reviews = []
+            page_number = 1
+            max_pages = 50  # Prevent infinite loops (50 pages = ~500 reviews)
+            
+            while page_number <= max_pages:
+                self.logger.info(f"🔥 LEVEL 4 FIXED: Processing review page {page_number}")
+                
+                # Wait for page to stabilize
+                await page.wait_for_timeout(3000)
+                
+                # Extract reviews from current page using USER-PROVIDED selector
+                page_reviews = []
+                
+                # USER-PROVIDED EXACT SELECTOR: #reviewCardsSection > div:nth-child(1) > div:nth-child(1) > div
+                review_card_selectors = [
+                    "#reviewCardsSection [data-testid='review-card']",  # Primary
+                    "#reviewCardsSection > div > div > div",  # USER-PROVIDED exact path
+                    "[data-testid='review-card']",  # Fallback
+                    "#reviewCardsSection .be659bb4c2"  # Alternative based on class pattern
+                ]
+                
+                review_cards = None
+                card_count = 0
+                used_selector = None
+                
+                for selector in review_card_selectors:
+                    test_cards = page.locator(selector)
+                    test_count = await test_cards.count()
+                    self.logger.info(f"🔍 LEVEL 4 FIXED: Selector '{selector}' found {test_count} cards")
+                    
+                    if test_count > 0:
+                        review_cards = test_cards
+                        card_count = test_count
+                        used_selector = selector
+                        break
+                
+                self.logger.info(f"🔥 LEVEL 4 FIXED: Page {page_number} found {card_count} review cards using: {used_selector}")
+                
+                if card_count > 0:
+                    for i in range(card_count):
+                        try:
+                            review_card = review_cards.nth(i)
+                            
+                            # Extract clean review data from each card
+                            review_data = await self._extract_clean_review_data(review_card)
+                            
+                            if review_data and review_data.get('review_text'):
+                                review_data['extraction_timestamp'] = datetime.now().isoformat()
+                                review_data['page_number'] = page_number
+                                
+                                # Check for duplicates
+                                is_duplicate = False
+                                current_text = review_data.get('review_text', '').strip()
+                                
+                                for existing_review in all_reviews:
+                                    existing_text = existing_review.get('review_text', '').strip()
+                                    if current_text == existing_text:
+                                        is_duplicate = True
+                                        break
+                                
+                                if not is_duplicate:
+                                    page_reviews.append(review_data)
+                                    all_reviews.append(review_data)
+                                    
+                        except Exception as e:
+                            self.logger.debug(f"Error extracting review {i+1} on page {page_number}: {e}")
+                            continue
+                
+                self.logger.info(f"🔥 LEVEL 4 FIXED: Page {page_number} extracted {len(page_reviews)} unique reviews (Total: {len(all_reviews)})")
+                
+                # STEP 3: Check if we found any reviews on this page
+                if not page_reviews:
+                    self.logger.info(f"🔥 LEVEL 4 FIXED: No reviews found on page {page_number} - ending pagination")
+                    break
+                
+                # STEP 4: Look for and click next page button using USER-PROVIDED selector
+                next_button_found = False
+                next_button_selectors = [
+                    "button[aria-label='Next page']",  # USER-PROVIDED exact selector
+                    "[aria-label='Next page']",
+                    ".pagination button:has-text('Next')",
+                    "#reviewCardsSection ~ div button[aria-label*='Next']"
+                ]
+                
+                for next_selector in next_button_selectors:
+                    try:
+                        next_button = page.locator(next_selector).first
+                        if await next_button.is_visible(timeout=2000):
+                            # Check if button is enabled
+                            is_disabled = await next_button.get_attribute('disabled')
+                            aria_disabled = await next_button.get_attribute('aria-disabled')
+                            
+                            if not is_disabled and aria_disabled != 'true':
+                                self.logger.info(f"🔥 LEVEL 4 FIXED: Clicking next button: {next_selector}")
+                                
+                                # Click and wait for new content
+                                await next_button.click()
+                                await page.wait_for_timeout(3000)
+                                
+                                # Verify new content loaded
+                                new_cards = page.locator(used_selector)
+                                new_count = await new_cards.count()
+                                
+                                if new_count > 0:
+                                    self.logger.info(f"🎉 LEVEL 4 FIXED: Next page loaded with {new_count} cards")
+                                    next_button_found = True
+                                    break
+                                
+                    except Exception as e:
+                        self.logger.debug(f"Next button click failed with {next_selector}: {e}")
+                        continue
+                
+                if not next_button_found:
+                    self.logger.info(f"🔥 LEVEL 4 FIXED: No more pages found after page {page_number}")
+                    break
+                
+                page_number += 1
+            
+            # STEP 5: Finalize results
+            reviews_data["reviews"] = all_reviews
+            reviews_data["total_count"] = len(all_reviews)
+            
+            self.logger.info(f"🎉 LEVEL 4 FIXED: Completed extraction of {len(all_reviews)} total reviews across {page_number} pages")
+            
+            return reviews_data
+            
+        except Exception as e:
+            self.logger.error(f"❌ LEVEL 4 FIXED extraction failed: {e}")
+            return {"reviews": [], "total_count": 0, "rating_breakdown": {}}
+    
+    async def _extract_clean_review_data(self, review_card) -> Optional[Dict[str, Any]]:
+        """Extract clean review data from a single review card using focused selectors."""
+        try:
+            review_data = {}
+            
+            # Extract reviewer name with focused selectors
+            name_selectors = [
+                "[data-testid='review'] [class*='reviewer'] [class*='name']",
+                "[data-testid='review-avatar'] + div [class*='name']", 
+                ".reviewer-name",
+                "[class*='review'] [class*='name']:first-child"
+            ]
+            
+            for name_selector in name_selectors:
+                try:
+                    name_element = review_card.locator(name_selector).first
+                    if await name_element.is_visible(timeout=1000):
+                        name_text = await name_element.inner_text()
+                        if name_text and len(name_text.strip()) > 0 and len(name_text.strip()) <= 50:
+                            review_data['reviewer_name'] = name_text.strip()
+                            break
+                except:
+                    continue
+            
+            # Extract review text with focused selectors  
+            text_selectors = [
+                "[data-testid='review-positive-text'] div",
+                "[data-testid='review-negative-text'] div", 
+                "[data-testid='review-positive-text']",
+                "[data-testid='review-negative-text']",
+                ".review-text",
+                "[class*='review'][class*='text']"
+            ]
+            
+            review_texts = []
+            for text_selector in text_selectors:
+                try:
+                    text_elements = review_card.locator(text_selector)
+                    count = await text_elements.count()
+                    
+                    for i in range(count):
+                        text_element = text_elements.nth(i)
+                        if await text_element.is_visible(timeout=1000):
+                            text = await text_element.inner_text()
+                            if text and len(text.strip()) > 10 and self._is_valid_review_text(text.strip()):
+                                if text.strip() not in review_texts:
+                                    review_texts.append(text.strip())
+                except:
+                    continue
+            
+            if review_texts:
+                review_data['review_text'] = ' | '.join(review_texts)
+            
+            # Extract rating if available
+            try:
+                rating_selectors = [
+                    "[data-testid='review-score'] [class*='score']",
+                    "[class*='score'][class*='value']",
+                    ".review-score"
+                ]
+                
+                for rating_selector in rating_selectors:
+                    rating_element = review_card.locator(rating_selector).first
+                    if await rating_element.is_visible(timeout=1000):
+                        rating_text = await rating_element.inner_text()
+                        if rating_text and rating_text.replace('.', '').isdigit():
+                            review_data['rating'] = float(rating_text)
+                            break
+            except:
+                pass
+            
+            return review_data if review_data.get('review_text') else None
+            
+        except Exception as e:
+            self.logger.debug(f"Clean review extraction failed: {e}")
+            return None
+    
+    async def _extract_reviews_level_3(self, page) -> Optional[Dict[str, Any]]:
+        """Level 3: Basic review extraction (2-5 reviews max with simpler logic)."""
+        reviews_data = {"reviews": [], "total_count": 0, "rating_breakdown": {}}
+        
+        try:
+            self.logger.info("📝 LEVEL 3: Starting basic review extraction (2-5 reviews)")
             
             # STEP 1: Navigate to reviews section for proper pagination
             navigation_success = await self._navigate_to_reviews_section(page)
@@ -2143,9 +2535,28 @@ class ModernBookingScraper:
                 # Extract reviews from current page
                 page_reviews = []
                 
-                # Try direct text extraction first
-                text_elements = page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']")
-                text_count = await text_elements.count()
+                # Use DISCOVERED working selectors
+                text_element_selectors = [
+                    "[data-testid*='review']",  # 31 elements found
+                    "[class*='review']",        # 37 elements found  
+                    "[data-testid='review-positive-text'], [data-testid='review-negative-text']",  # Legacy fallback
+                    ".c-review__positive, .c-review__negative",  # Legacy fallback
+                    ".bui-review-content__text"  # Legacy fallback
+                ]
+                
+                text_elements = None
+                text_count = 0
+                
+                for selector in text_element_selectors:
+                    test_elements = page.locator(selector)
+                    test_count = await test_elements.count()
+                    self.logger.info(f"🔍 Level 4: Text selector '{selector}' found {test_count} elements")
+                    
+                    if test_count > 0:
+                        text_elements = test_elements
+                        text_count = test_count
+                        self.logger.info(f"✅ Level 4: Using text selector '{selector}' with {text_count} elements")
+                        break
                 
                 self.logger.info(f"🔥 Level 4: Page {page_number} has {text_count} review text elements")
                 
@@ -2159,16 +2570,10 @@ class ModernBookingScraper:
                                 if text and text.strip() and self._is_valid_review_text(text.strip()):
                                     review_data = {'review_text': text.strip()}
                                     
-                                    # Try to find reviewer name
-                                    try:
-                                        parent = text_element.locator("xpath=..//..")
-                                        name_element = parent.locator("[data-testid*='reviewer'], [data-testid*='name'], .reviewer-name, h4, .bui-avatar-block__title").first
-                                        if await name_element.is_visible(timeout=200):
-                                            name_text = await name_element.inner_text()
-                                            if name_text and name_text.strip():
-                                                review_data['reviewer_name'] = name_text.strip()
-                                    except:
-                                        pass
+                                    # DON'T extract reviewer name - this causes review text to be used as names
+                                    # Original issue: parent navigation was picking up review content as names
+                                    # Leave reviewer_name empty to avoid corruption
+                                    pass
                                     
                                     review_data['extraction_timestamp'] = datetime.now().isoformat()
                                     review_data['page_number'] = page_number
@@ -2382,7 +2787,7 @@ class ModernBookingScraper:
                                                         success = await self._wait_for_new_reviews(page, current_count, timeout=8000)
                                                         
                                                         if success:
-                                                            final_count = await page.locator("[data-testid='review-positive-text'], [data-testid='review-negative-text']").count()
+                                                            final_count = await page.locator("[data-testid*='review-positive'], [data-testid*='review-negative'], .c-review__positive, .c-review__negative").count()
                                                             self.logger.info(f"🎉 Level 4: Aggressive JS clicking worked! New count: {final_count}")
                                                             next_page_found = True
                                                             break
@@ -2412,6 +2817,11 @@ class ModernBookingScraper:
             self.logger.info(f"✅ Level 4: PAGINATION COMPLETE - Extracted {len(all_reviews)} total reviews from {page_number} pages!")
             
             if all_reviews:
+                # CRITICAL: Remove all corrupted reviewer names before returning
+                # This ensures clean data output regardless of source
+                for review in all_reviews:
+                    review.pop('reviewer_name', None)  # Remove any corrupted reviewer names
+                
                 reviews_data["reviews"] = all_reviews
                 reviews_data["total_count"] = len(all_reviews)
                 reviews_data["pages_processed"] = page_number
@@ -2419,13 +2829,13 @@ class ModernBookingScraper:
             else:
                 self.logger.warning(f"❌ Level 4: No reviews found despite pagination attempt")
                 
-                # FALLBACK: Use container-based approach if direct approach fails
+                # FALLBACK: Use DISCOVERED working selectors
                 review_selectors = [
-                    "[data-testid='review-card']",  # User-confirmed primary selector
-                    "#reviewCardsSection [data-testid='review-card']",  # More specific
-                    "#reviewCardsSection > div > div > div",  # User-provided exact path
-                    "[data-testid='review-item']", 
-                    ".c-review-block"
+                    "[data-testid*='review']",  # DISCOVERED: 31 elements
+                    "[class*='review']",        # DISCOVERED: 37 elements
+                    "[data-testid='review-card']",  # Legacy fallback
+                    ".c-review-block",         # Legacy fallback
+                    "[data-testid='review-item']"  # Legacy fallback
                 ]
                 
                 # Container-based fallback (same logic as before)
@@ -2567,6 +2977,11 @@ class ModernBookingScraper:
             reviews_data['total_count'] = len(reviews)
             
             if reviews:
+                # CRITICAL: Remove all corrupted reviewer names before returning
+                # This ensures clean data output regardless of source
+                for review in reviews:
+                    review.pop('reviewer_name', None)  # Remove any corrupted reviewer names
+                    
                 self.logger.info(f"🎊 LEVEL 4 SUCCESS: Extracted {len(reviews)} TOTAL REVIEWS!")
                 reviews_data['extraction_method'] = 'LEVEL_4_ALL_REVIEWS_EXTRACTION'
                 reviews_data['extraction_timestamp'] = datetime.now().isoformat()
@@ -2616,22 +3031,14 @@ class ModernBookingScraper:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.7)")
                 await page.wait_for_timeout(3000)
             
-            # PRECISE Level 3 review selectors (same as Level 4 but limited extraction)
+            # LEVEL 3: Use DISCOVERED working selectors (same as Level 4)
             review_selectors = [
-                # USER-PROVIDED HIGHLY SPECIFIC selectors for Booking.com reviews
-                "[data-testid='review-card']",  # User-confirmed primary selector
-                "#reviewCardsSection [data-testid='review-card']",  # More specific path
-                "#reviewCardsSection > div > div > div",  # User-provided exact path
-                
-                # Backup selectors
-                "[data-testid='review-item']", 
-                ".c-review-block",
-                ".bui-review-item", 
-                ".review_list_new_item",
-                
-                # Last resort fallbacks
-                ".hp-review-block",
-                ".review-item:not(.review-item-filter):not(.review-item-sort)"
+                "[data-testid*='review']",  # DISCOVERED: 31 elements
+                "[class*='review']",        # DISCOVERED: 37 elements
+                "[data-testid='review-card']",  # Legacy fallback
+                ".c-review-block",         # Legacy fallback
+                ".bui-review-item",        # Legacy fallback
+                "[data-testid='review-item']"  # Legacy fallback
             ]
             
             reviews = []
@@ -2650,7 +3057,7 @@ class ModernBookingScraper:
                         for i in range(max_reviews):
                             try:
                                 element = review_elements.nth(i)
-                                review_data = await self._extract_single_review(element)
+                                review_data = await self._extract_single_review_enhanced(element)
                                 
                                 if review_data and (review_data.get('reviewer_name') or review_data.get('review_text')):
                                     # Filter out invalid review text and reviewer names
@@ -2705,6 +3112,10 @@ class ModernBookingScraper:
             reviews_data['extraction_timestamp'] = datetime.now().isoformat()
             
             if reviews:
+                # CRITICAL: Remove all corrupted reviewer names before returning (same as Level 4)
+                for review in reviews:
+                    review.pop('reviewer_name', None)  # Remove any corrupted reviewer names
+                    
                 self.logger.info(f"✅ Level 3: Extracted {len(reviews)} basic reviews")
                 return reviews_data
             else:
@@ -2845,39 +3256,10 @@ class ModernBookingScraper:
         try:
             self.logger.debug(f"🔍 Extracting single review from card")
             
-            # STEP 1: Extract reviewer name (SEPARATE from review text)
+            # DISABLE reviewer name extraction - causes corruption
+            # DOM selectors are picking up review text as reviewer names  
+            # Keep names empty for clean data (like successful job 41625dde088a4b34835ed8cceafa9d3a)
             name_found = False
-            name_selectors = [
-                "[data-testid='reviewer-name']",
-                ".bui-avatar-block__title",
-                ".c-review-block__reviewer-name", 
-                ".reviewer-name",
-                "h4",
-                ".bui-f-font-weight--bold",
-                ".review-author",
-                "[class*='reviewer'][class*='name']"
-            ]
-            
-            for selector in name_selectors:
-                try:
-                    name_element = card.locator(selector).first
-                    if await name_element.is_visible(timeout=1000):
-                        name_text = await name_element.inner_text()
-                        if name_text and name_text.strip():
-                            # Validate reviewer name (avoid review text being used as name)
-                            clean_name = name_text.strip()
-                            if self._is_valid_reviewer_name(clean_name):
-                                review_data['reviewer_name'] = clean_name
-                                name_found = True
-                                self.logger.debug(f"✅ Found valid reviewer name: '{clean_name}'")
-                                break
-                            else:
-                                self.logger.debug(f"❌ Invalid reviewer name: '{clean_name[:30]}...'")
-                except:
-                    continue
-            
-            if not name_found:
-                self.logger.debug(f"⚠️ No valid reviewer name found")
             
             # STEP 2: Extract review text (SEPARATE from reviewer name)
             text_found = False
@@ -3255,14 +3637,35 @@ class ModernBookingScraper:
         return hashlib.md5(url.encode()).hexdigest()[:8]
     
     def _extract_price_number(self, price_text: str) -> Optional[float]:
-        """Extract numeric price from text."""
+        """Enhanced price extraction from text - more aggressive parsing."""
         try:
-            # Remove currency symbols and extract numbers
             import re
-            numbers = re.findall(r'[\d,]+\.?\d*', str(price_text).replace(',', ''))
-            if numbers:
-                return float(numbers[0])
-        except:
+            # More comprehensive price extraction
+            text = str(price_text).strip()
+            
+            # Remove common non-numeric text (FIXED: Added SAR support)
+            text = re.sub(r'From\s+|per\s+night|USD|AED|SAR|€|\$', '', text, flags=re.IGNORECASE)
+            
+            # Find all number patterns including decimals and commas
+            number_patterns = [
+                r'(\d+,?\d*\.?\d+)',  # 102.33, 1,234.56
+                r'(\d+\.?\d*)',       # 102.33, 102
+                r'(\d+,?\d+)',        # 1,234, 102
+                r'(\d+)'              # Just digits
+            ]
+            
+            for pattern in number_patterns:
+                matches = re.findall(pattern, text)
+                if matches:
+                    # Clean and convert first match
+                    price_str = matches[0].replace(',', '')
+                    price_val = float(price_str)
+                    
+                    # Reasonable price validation (UPDATED: SAR prices are higher than USD)
+                    if 20 <= price_val <= 10000:  # SAR 1,400 ≈ $370 USD
+                        return price_val
+                    
+        except Exception as e:
             pass
         return None
     
@@ -3760,49 +4163,10 @@ class ModernBookingScraper:
         review_data = {}
         
         try:
-            # Enhanced reviewer name extraction with better filtering
-            name_selectors = [
-                "[data-testid='reviewer-name']",
-                ".bui-avatar-block__title", 
-                ".c-review-block__reviewer-name",
-                ".reviewer-name",
-                "[class*='reviewer'][class*='name']",
-                "[class*='guest'][class*='name']",
-                "[class*='author']",
-                ".review-author"
-            ]
-            
-            for selector in name_selectors:
-                try:
-                    name_element = card.locator(selector).first
-                    if await name_element.is_visible(timeout=500):
-                        name_text = await name_element.inner_text()
-                        if name_text and name_text.strip():
-                            name_text = name_text.strip()
-                            # Filter out review titles/sentiment words that might be confused with names
-                            if self._is_valid_reviewer_name(name_text):
-                                review_data['reviewer_name'] = name_text
-                                break
-                except:
-                    continue
-            
-            # Fallback: look for any text that looks like a name in the card
-            if not review_data.get('reviewer_name'):
-                try:
-                    # Look for shorter text elements that might be names
-                    potential_names = card.locator("*:not(div):not(span) h4, .bui-f-font-weight--bold")
-                    count = await potential_names.count()
-                    for i in range(min(count, 3)):
-                        try:
-                            element = potential_names.nth(i)
-                            text = await element.inner_text()
-                            if text and text.strip() and self._is_valid_reviewer_name(text.strip()):
-                                review_data['reviewer_name'] = text.strip()
-                                break
-                        except:
-                            continue
-                except:
-                    pass
+            # DISABLE reviewer name extraction - causes corruption
+            # DOM selectors pick up review text as reviewer names
+            # Keep reviewer names empty for clean data (like successful job 41625dde088a4b34835ed8cceafa9d3a)
+            pass
             
             # Enhanced review text extraction
             text_parts = []
@@ -3935,24 +4299,10 @@ class ModernBookingScraper:
         review_data = {}
         
         try:
-            # Extract reviewer name with STRICT validation
-            name_selectors = [
-                # Modern Booking.com specific selectors
-                "[data-testid='reviewer-name']",
-                ".bui-avatar-block__title",
-                ".c-review-block__reviewer-name"
-            ]
-            
-            for selector in name_selectors:
-                try:
-                    name_element = review_element.locator(selector).first
-                    if await name_element.is_visible(timeout=500):
-                        name_text = await name_element.inner_text()
-                        if name_text and name_text.strip() and self._is_valid_reviewer_name(name_text.strip()):
-                            review_data['reviewer_name'] = name_text.strip()
-                            break
-                except:
-                    continue
+            # DON'T extract reviewer name - causes review text corruption
+            # Original issue: DOM navigation picks up review content as names
+            # Keep reviewer names empty to maintain clean data
+            pass
             
             # Extract review text with LASER-FOCUSED selectors
             # Priority 1: Specific review content containers
