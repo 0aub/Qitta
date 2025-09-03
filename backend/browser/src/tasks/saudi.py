@@ -93,7 +93,7 @@ def classify_payload(head: bytes, content_type: str = None) -> str:
     return "binary_unknown"
 
 
-class SaudiOpenDataTask:
+class SaudiTask:
     BASE = "https://open.data.gov.sa"
 
     # ───── filename / validation (Saudi-specific decisions kept here) ─────

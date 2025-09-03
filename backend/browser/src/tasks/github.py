@@ -16,7 +16,7 @@ import httpx
 from .base import _log
 
 
-class GitHubRepoTask:
+class GithubTask:
     """
     Comprehensive GitHub repository analyzer that collects code, issues, releases, documentation,
     and repository metadata for creating a complete knowledge base of a GitHub repository.

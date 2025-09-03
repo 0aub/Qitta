@@ -3,10 +3,11 @@ from typing import Dict, Any, Callable, Awaitable
 import logging
 from playwright.async_api import Browser
 
-from .booking_hotels import BookingHotelsTask
-from .scrape_site import ScrapeSiteTask
-from .saudi_open_data import SaudiOpenDataTask
-from .github_repo import GitHubRepoTask
+from .booking import BookingTask
+from .airbnb import AirbnbTask
+from .website import WebsiteTask
+from .saudi import SaudiTask
+from .github import GithubTask
 
 # Task registry system
 class TaskRegistry:
@@ -33,29 +34,25 @@ class TaskRegistry:
 _registry = TaskRegistry()
 
 # Register task wrapper functions
-@_registry.register("booking-hotels")
-async def booking_hotels(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-    return await BookingHotelsTask.run(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
+@_registry.register("booking")
+async def booking(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await BookingTask.run(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
 
-@_registry.register("booking-hotels-investigation")
-async def booking_hotels_investigation(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-    return await BookingHotelsTask.investigate_review_structure(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
+@_registry.register("airbnb")
+async def airbnb(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await AirbnbTask.run(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
 
-@_registry.register("booking-hotels-price-investigation")
-async def booking_hotels_price_investigation(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-    return await BookingHotelsTask.investigate_price_selectors(params=params, logger=logger, browser=browser, job_output_dir=job_output_dir)
+@_registry.register("website") 
+async def website(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await WebsiteTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
 
-@_registry.register("scrape-site") 
-async def scrape_site(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-    return await ScrapeSiteTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+@_registry.register("saudi")
+async def saudi(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await SaudiTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
 
-@_registry.register("saudi-open-data")
-async def saudi_open_data(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-    return await SaudiOpenDataTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
-
-@_registry.register("github-repo")
-async def github_repo(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-    return await GitHubRepoTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+@_registry.register("github")
+async def github(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await GithubTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
 
 # Exports for main.py
 task_registry = _registry.tasks
@@ -64,10 +61,11 @@ def normalise_task(name: str) -> str:
 
 # Export all task classes and registry functions
 __all__ = [
-    "BookingHotelsTask",
-    "ScrapeSiteTask", 
-    "SaudiOpenDataTask",
-    "GitHubRepoTask",
+    "BookingTask",
+    "AirbnbTask",
+    "WebsiteTask", 
+    "SaudiTask",
+    "GithubTask",
     "task_registry",
     "normalise_task"
 ]

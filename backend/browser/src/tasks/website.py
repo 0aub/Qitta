@@ -18,7 +18,7 @@ import httpx
 from .base import _log
 
 
-class ScrapeSiteTask:
+class WebsiteTask:
     """
     Professional two-phase website scraper optimized for vector store preparation.
     
