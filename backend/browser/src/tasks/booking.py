@@ -341,7 +341,7 @@ class BookingScraper:
         self.logger.info(f"🔍 Search URL: {search_url}")
         
         await page.goto(search_url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(5000)  # Increased timeout for stability
         
         # Handle popups and overlays
         await self._handle_popups(page)
@@ -367,13 +367,16 @@ class BookingScraper:
         cards = None
         for selector in card_selectors:
             try:
+                self.logger.info(f"  🔍 Testing selector: {selector}")
                 test_cards = page.locator(selector)
                 count = await test_cards.count()
+                self.logger.info(f"  📊 Selector {selector} found {count} elements")
                 if count > 0:
                     cards = test_cards
                     self.logger.info(f"✅ Found {count} hotels with selector: {selector}")
                     break
-            except:
+            except Exception as e:
+                self.logger.debug(f"  ❌ Selector {selector} failed: {e}")
                 continue
         
         if not cards:
@@ -1215,201 +1218,178 @@ class BookingScraper:
             return []
 
     async def _extract_location_data(self, page) -> Optional[Dict[str, Any]]:
-        """Extract Google Maps URL and coordinates with comprehensive approach."""
+        """Extract Google Maps URL and coordinates using the working method from backup."""
         try:
-            self.logger.info("🗺️ Starting comprehensive location data extraction")
+            self.logger.info("🗺️ Starting location data extraction (working method)")
+            location_data = {}
             
-            # Strategy 1: Extract coordinates from scripts (enhanced patterns)
-            scripts = page.locator("script")
-            count = await scripts.count()
-            self.logger.info(f"  📊 Found {count} script elements to analyze")
-            
-            for i in range(min(count, 20)):  # Check more scripts
-                try:
-                    script_content = await scripts.nth(i).inner_text()
-                    if len(script_content) < 50:  # Skip tiny scripts
-                        continue
+            # Strategy 1: Extract coordinates from JavaScript environment (WORKING METHOD)
+            self.logger.info("  🔍 Strategy 1: JavaScript environment coordinate extraction")
+            coordinates = await page.evaluate("""
+                () => {
+                    // Try multiple methods to get coordinates (from working backup code)
+                    try {
+                        // Method 1: window.B.env (primary method that was working)
+                        if (window.B && window.B.env) {
+                            const env = window.B.env;
+                            if (env.b_map_center_latitude && env.b_map_center_longitude) {
+                                console.log('Found coordinates in window.B.env:', env.b_map_center_latitude, env.b_map_center_longitude);
+                                return {
+                                    lat: parseFloat(env.b_map_center_latitude),
+                                    lng: parseFloat(env.b_map_center_longitude),
+                                    source: 'window.B.env'
+                                };
+                            }
+                        }
                         
-                    # Enhanced coordinate patterns
-                    if any(keyword in script_content.lower() for keyword in ['latitude', 'longitude', 'coords', 'location', 'map', 'hotel_coordinates']):
-                        self.logger.info(f"  🔍 Script {i+1} contains location keywords")
+                        // Method 2: Alternative Booking.com global objects
+                        if (window.page && window.page.b_map_center_latitude) {
+                            return {
+                                lat: parseFloat(window.page.b_map_center_latitude),
+                                lng: parseFloat(window.page.b_map_center_longitude),
+                                source: 'window.page'
+                            };
+                        }
                         
-                        # Multiple coordinate extraction patterns
-                        coordinate_patterns = [
-                            # Standard JSON patterns
-                            (r'"latitude":\s*([0-9.-]+)', r'"longitude":\s*([0-9.-]+)'),
-                            (r'latitude["\']:\s*([0-9.-]+)', r'longitude["\']:\s*([0-9.-]+)'), 
-                            (r'"lat":\s*([0-9.-]+)', r'"lng":\s*([0-9.-]+)'),
-                            (r'"lat":\s*([0-9.-]+)', r'"lon":\s*([0-9.-]+)'),
-                            
-                            # Hotel specific patterns
-                            (r'hotel_coordinates.*?latitude["\']:\s*([0-9.-]+)', r'hotel_coordinates.*?longitude["\']:\s*([0-9.-]+)'),
-                            (r'property.*?lat["\']:\s*([0-9.-]+)', r'property.*?lng["\']:\s*([0-9.-]+)'),
-                            
-                            # Alternative formats
-                            (r'coord.*?([0-9]+\.[0-9]+)', r'coord.*?([0-9]+\.[0-9]+)'),
-                            (r'position.*?([0-9]+\.[0-9]+)', r'position.*?([0-9]+\.[0-9]+)'),
-                            
-                            # Array format [lat, lng]
-                            (r'\[([0-9]+\.[0-9]+),\s*([0-9]+\.[0-9]+)\]', None),  # Special handling
-                        ]
+                        // Method 3: Check data attributes on map elements
+                        const mapElements = document.querySelectorAll('[data-lat], [data-latitude]');
+                        for (let element of mapElements) {
+                            const lat = element.getAttribute('data-lat') || element.getAttribute('data-latitude');
+                            const lng = element.getAttribute('data-lng') || element.getAttribute('data-longitude');
+                            if (lat && lng) {
+                                return {
+                                    lat: parseFloat(lat),
+                                    lng: parseFloat(lng),
+                                    source: 'data-attributes'
+                                };
+                            }
+                        }
                         
-                        for lat_pattern, lng_pattern in coordinate_patterns:
-                            try:
-                                if lng_pattern is None:  # Array format
-                                    match = re.search(lat_pattern, script_content)
-                                    if match:
-                                        lat = float(match.group(1))
-                                        lng = float(match.group(2))
-                                else:
-                                    lat_match = re.search(lat_pattern, script_content)
-                                    lng_match = re.search(lng_pattern, script_content)
-                                    
-                                    if not (lat_match and lng_match):
-                                        continue
-                                        
-                                    lat = float(lat_match.group(1))
-                                    lng = float(lng_match.group(1))
-                                
-                                # Validate Dubai area coordinates
-                                if 24.0 < lat < 26.0 and 54.0 < lng < 56.0:
-                                    google_maps_url = f"https://www.google.com/maps/search/{lat},{lng}"
-                                    self.logger.info(f"✅ Found coordinates from script {i+1}: {lat}, {lng}")
-                                    return {
-                                        'latitude': lat,
-                                        'longitude': lng,
-                                        'google_maps_url': google_maps_url
-                                    }
-                                else:
-                                    self.logger.info(f"  ❌ Invalid coordinates for Dubai: {lat}, {lng}")
-                            except (ValueError, AttributeError) as e:
-                                self.logger.debug(f"    Pattern failed: {e}")
-                                continue
-                except Exception as e:
-                    self.logger.debug(f"Script {i} processing failed: {e}")
-                    continue
-            
-            # Strategy 2: Look for map buttons and extract coordinates from onclick/data attributes
-            self.logger.info("  🔍 Strategy 2: Map buttons and data attributes")
-            map_button_selectors = [
-                "button:has-text('Show on map')",
-                "button:has-text('show map')",
-                "a:has-text('Show on map')",
-                "a:has-text('show map')",
-                "*[class*='map'] button",
-                "*[class*='map'] a",
-                "*[data-lat]",
-                "*[data-latitude]",
-                "*[data-coords]"
-            ]
-            
-            for selector in map_button_selectors:
-                try:
-                    elements = page.locator(selector)
-                    count = await elements.count()
-                    
-                    if count > 0:
-                        self.logger.info(f"    📍 Found {count} elements for: {selector}")
-                        for i in range(min(count, 3)):
-                            try:
-                                element = elements.nth(i)
-                                
-                                # Check data attributes for coordinates
-                                lat_attr = await element.get_attribute('data-lat') or await element.get_attribute('data-latitude')
-                                lng_attr = await element.get_attribute('data-lng') or await element.get_attribute('data-longitude')
-                                coords_attr = await element.get_attribute('data-coords')
-                                
-                                if lat_attr and lng_attr:
-                                    lat, lng = float(lat_attr), float(lng_attr)
-                                    if 24.0 < lat < 26.0 and 54.0 < lng < 56.0:
-                                        google_maps_url = f"https://www.google.com/maps/search/{lat},{lng}"
-                                        self.logger.info(f"✅ Found coordinates from data attributes: {lat}, {lng}")
+                        // Method 4: Parse from window.map_center or similar globals
+                        if (window.map_center) {
+                            return {
+                                lat: parseFloat(window.map_center.lat || window.map_center.latitude),
+                                lng: parseFloat(window.map_center.lng || window.map_center.longitude),
+                                source: 'window.map_center'
+                            };
+                        }
+                        
+                        // Method 5: Check for coordinates in any global Booking objects
+                        const globals = Object.keys(window);
+                        for (let key of globals) {
+                            if (key.includes('booking') || key.includes('map') || key.includes('coord')) {
+                                const obj = window[key];
+                                if (obj && typeof obj === 'object') {
+                                    if (obj.latitude && obj.longitude) {
                                         return {
-                                            'latitude': lat,
-                                            'longitude': lng,
-                                            'google_maps_url': google_maps_url
-                                        }
-                                
-                                if coords_attr:
-                                    # Try to parse coordinates from data-coords
-                                    coords_match = re.search(r'([0-9.-]+),\s*([0-9.-]+)', coords_attr)
-                                    if coords_match:
-                                        lat, lng = float(coords_match.group(1)), float(coords_match.group(2))
-                                        if 24.0 < lat < 26.0 and 54.0 < lng < 56.0:
-                                            google_maps_url = f"https://www.google.com/maps/search/{lat},{lng}"
-                                            self.logger.info(f"✅ Found coordinates from coords attribute: {lat}, {lng}")
-                                            return {
-                                                'latitude': lat,
-                                                'longitude': lng,
-                                                'google_maps_url': google_maps_url
-                                            }
-                                
-                                # Check onclick attributes
-                                onclick = await element.get_attribute('onclick')
-                                if onclick:
-                                    coords_match = re.search(r'([0-9]+\.[0-9]+),\s*([0-9]+\.[0-9]+)', onclick)
-                                    if coords_match:
-                                        lat, lng = float(coords_match.group(1)), float(coords_match.group(2))
-                                        if 24.0 < lat < 26.0 and 54.0 < lng < 56.0:
-                                            google_maps_url = f"https://www.google.com/maps/search/{lat},{lng}"
-                                            self.logger.info(f"✅ Found coordinates from onclick: {lat}, {lng}")
-                                            return {
-                                                'latitude': lat,
-                                                'longitude': lng,
-                                                'google_maps_url': google_maps_url
-                                            }
-                            except Exception as e:
-                                self.logger.debug(f"Element {i} failed: {e}")
-                                continue
-                except Exception as e:
-                    self.logger.debug(f"Selector '{selector}' failed: {e}")
-                    continue
-            
-            # Strategy 3: Look for direct Google Maps URLs or iframes
-            self.logger.info("  🔍 Strategy 3: Direct Google Maps URLs")
-            direct_map_selectors = [
-                "iframe[src*='google.com/maps']",
-                "iframe[src*='maps.google']", 
-                "a[href*='google.com/maps']",
-                "a[href*='maps.google.com']",
-                "*[data-maps-url*='google']"
-            ]
-            
-            for selector in direct_map_selectors:
-                try:
-                    elements = page.locator(selector)
-                    count = await elements.count()
-                    
-                    if count > 0:
-                        self.logger.info(f"    📍 Found {count} direct map elements for: {selector}")
-                        for i in range(min(count, 3)):
-                            try:
-                                element = elements.nth(i)
-                                
-                                # Check iframe src or href
-                                url = await element.get_attribute('src') or await element.get_attribute('href') or await element.get_attribute('data-maps-url')
-                                
-                                if url and ('google.com/maps' in url or 'maps.google.com' in url):
-                                    self.logger.info(f"✅ Found direct Google Maps URL: {url}")
-                                    return {
-                                        'google_maps_url': url,
-                                        'latitude': None,
-                                        'longitude': None
+                                            lat: parseFloat(obj.latitude),
+                                            lng: parseFloat(obj.longitude),
+                                            source: key
+                                        };
                                     }
-                            except Exception as e:
-                                self.logger.debug(f"Direct map element {i} failed: {e}")
-                                continue
-                except Exception as e:
-                    self.logger.debug(f"Direct map selector '{selector}' failed: {e}")
-                    continue
+                                    if (obj.lat && obj.lng) {
+                                        return {
+                                            lat: parseFloat(obj.lat),
+                                            lng: parseFloat(obj.lng),
+                                            source: key
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        
+                        console.log('No coordinates found in JavaScript environment');
+                        return null;
+                    } catch (error) {
+                        console.error('Error extracting coordinates:', error);
+                        return null;
+                    }
+                }
+            """)
             
-            self.logger.info("🗺️ No location data found")
-            return None
+            if coordinates:
+                self.logger.info(f"✅ Found coordinates via {coordinates.get('source', 'unknown')}: {coordinates['lat']}, {coordinates['lng']}")
+                # Validate Dubai area coordinates
+                lat, lng = coordinates['lat'], coordinates['lng']
+                if 24.0 < lat < 26.0 and 54.0 < lng < 56.0:
+                    location_data['latitude'] = lat
+                    location_data['longitude'] = lng
+                    location_data['google_maps_url'] = f"https://www.google.com/maps/search/{lat},{lng}"
+                    self.logger.info(f"✅ Valid Dubai coordinates: {lat}, {lng}")
+                else:
+                    self.logger.info(f"  ❌ Coordinates outside Dubai area: {lat}, {lng}")
+            
+            # Strategy 2: Try to find actual Google Maps links (backup method)
+            if not location_data:
+                self.logger.info("  🔍 Strategy 2: Direct Google Maps link detection")
+                try:
+                    maps_link = page.locator("a[href*='maps.google'], a[href*='google.com/maps']")
+                    if await maps_link.is_visible():
+                        href = await maps_link.get_attribute('href')
+                        if href:
+                            location_data['google_maps_url'] = href
+                            self.logger.info(f"✅ Found direct Google Maps link: {href}")
+                except Exception as e:
+                    self.logger.debug(f"Direct maps link search failed: {e}")
+            
+            # Strategy 3: Enhanced script-based search as final fallback
+            if not location_data:
+                self.logger.info("  🔍 Strategy 3: Enhanced script content search")
+                try:
+                    scripts = page.locator("script")
+                    count = await scripts.count()
                     
+                    for i in range(min(count, 10)):  # Check fewer scripts but more targeted
+                        try:
+                            script_content = await scripts.nth(i).inner_text()
+                            if len(script_content) < 100:  # Skip tiny scripts
+                                continue
+                                
+                            # Look for specific Booking.com coordinate patterns
+                            patterns = [
+                                r'b_map_center_latitude["\']?\s*[:=]\s*["\']?([0-9.-]+)',
+                                r'b_map_center_longitude["\']?\s*[:=]\s*["\']?([0-9.-]+)',
+                                r'"latitude"\s*:\s*([0-9.-]+)',
+                                r'"longitude"\s*:\s*([0-9.-]+)'
+                            ]
+                            
+                            lat_match = None
+                            lng_match = None
+                            
+                            for pattern in patterns[:2]:  # Booking-specific patterns first
+                                if 'latitude' in pattern:
+                                    lat_match = re.search(pattern, script_content)
+                                else:
+                                    lng_match = re.search(pattern, script_content)
+                            
+                            if not lat_match or not lng_match:
+                                for pattern in patterns[2:]:  # Generic patterns as backup
+                                    if 'latitude' in pattern:
+                                        lat_match = re.search(pattern, script_content)
+                                    else:
+                                        lng_match = re.search(pattern, script_content)
+                            
+                            if lat_match and lng_match:
+                                lat = float(lat_match.group(1))
+                                lng = float(lng_match.group(1))
+                                
+                                if 24.0 < lat < 26.0 and 54.0 < lng < 56.0:
+                                    location_data['latitude'] = lat
+                                    location_data['longitude'] = lng
+                                    location_data['google_maps_url'] = f"https://www.google.com/maps/search/{lat},{lng}"
+                                    self.logger.info(f"✅ Found coordinates from script parsing: {lat}, {lng}")
+                                    break
+                        except Exception as e:
+                            self.logger.debug(f"Script {i} parsing failed: {e}")
+                            continue
+                except Exception as e:
+                    self.logger.debug(f"Script-based search failed: {e}")
+            
+            return location_data if location_data else None
+            
         except Exception as e:
-            self.logger.warning(f"⚠️ Error extracting location: {e}")
-        
-        return None
+            self.logger.warning(f"⚠️ Location extraction error: {e}")
+            return None
 
     async def _extract_description(self, page) -> Optional[str]:
         """Extract hotel description with comprehensive approach."""
