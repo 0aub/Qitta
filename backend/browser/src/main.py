@@ -278,6 +278,54 @@ async def explore_booking_hotel(request: BookingExploreRequest):
 
 
 # ----------------------------------------------------------------------------
+# Session Management Endpoints
+# ----------------------------------------------------------------------------
+
+@app.post("/capture/twitter")
+async def capture_twitter_session():
+    """
+    Capture Twitter session by opening browser for user login.
+    
+    Returns session information and saves cookies to shared storage.
+    """
+    global browser_runtime
+    
+    if not browser_runtime:
+        raise HTTPException(status_code=503, detail="Browser runtime not initialized")
+    
+    try:
+        from .session_capture import session_capture
+        result = await session_capture.capture_session(browser_runtime.browser)
+        return JSONResponse(content=result)
+    except Exception as e:
+        service_logger.error(f"Session capture failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Session capture failed: {str(e)}")
+
+@app.get("/sessions")
+async def list_sessions():
+    """List available captured sessions."""
+    try:
+        from .session_capture import session_capture
+        return session_capture.list_sessions()
+    except Exception as e:
+        service_logger.error(f"Could not list sessions: {e}")
+        raise HTTPException(status_code=500, detail="Could not list sessions")
+
+@app.delete("/sessions/{filename}")
+async def delete_session(filename: str):
+    """Delete a captured session."""
+    try:
+        from .session_capture import session_capture
+        result = session_capture.delete_session(filename)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        service_logger.error(f"Could not delete session: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not delete session: {str(e)}")
+
+
+# ----------------------------------------------------------------------------
 # Startup and shutdown (kept in main)
 # ----------------------------------------------------------------------------
 

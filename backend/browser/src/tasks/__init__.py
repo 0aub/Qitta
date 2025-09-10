@@ -8,6 +8,7 @@ from .airbnb import AirbnbTask
 from .website import WebsiteTask
 from .saudi import SaudiTask
 from .github import GithubTask
+from .twitter import TwitterTask
 
 # Task registry system
 class TaskRegistry:
@@ -54,6 +55,10 @@ async def saudi(*, browser: Browser, params: Dict[str, Any], job_output_dir: str
 async def github(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
     return await GithubTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
 
+@_registry.register("twitter")
+async def twitter(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await TwitterTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+
 # Exports for main.py
 task_registry = _registry.tasks
 def normalise_task(name: str) -> str:
@@ -66,6 +71,7 @@ __all__ = [
     "WebsiteTask", 
     "SaudiTask",
     "GithubTask",
+    "TwitterTask",
     "task_registry",
     "normalise_task"
 ]
