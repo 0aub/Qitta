@@ -75,4 +75,3 @@ services:
       - ./storage:/storage                     # Access to scraped data and logs 
       
 
-  # Removed local WireGuard server; it does not help bypass WAF for outbound requests.
