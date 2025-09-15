@@ -3662,10 +3662,10 @@ class TwitterScraper:
     async def scrape_user_comprehensive(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Comprehensive user account scraping with all options."""
         username = params.get('target_username', '').replace('@', '')
-        
+
         # Initialize date filtering
         self.setup_date_filtering(params)
-        
+
         self.logger.info(f"👤 Starting comprehensive user scraping for @{username}")
         
         results = {
@@ -3782,7 +3782,6 @@ class TwitterScraper:
                 await self._human_delay(1, 2)
             else:
                 self.logger.warning(f"⚠️ Content loading timeout after {elapsed_time:.1f}s - proceeding with available content")
-
             # Extract profile information first
             self.logger.info("📋 Extracting profile information...")
             try:
@@ -3842,7 +3841,7 @@ class TwitterScraper:
             
             self.logger.info(f"🏁 Comprehensive user scraping completed for @{username}")
             return [results]
-            
+
         except Exception as e:
             self.logger.error(f"❌ Comprehensive user scraping failed: {e}")
             return [results]  # Return partial results
