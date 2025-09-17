@@ -2712,119 +2712,281 @@ class TwitterScraper:
             self.logger.debug(f"Failed to extract tweet {index}: {e}")
             return None
 
-    async def _extract_tweet_from_element(self, tweet_element, index: int, include_engagement: bool = True) -> Optional[Dict[str, Any]]:
-        """Extract comprehensive tweet data from element - FIXED for X/Twitter 2024+ selectors."""
+
+    async def _extract_tweet_from_element(self, tweet_element, index: int, username: str = '', include_engagement: bool = True) -> Optional[Dict[str, Any]]:
+        """Extract tweet data from a tweet element with improved error handling."""
         try:
             tweet_data = {
-                "type": "tweet",
-                "index": index,
-                "extraction_timestamp": datetime.now().isoformat()
+                'id': f'tweet_{index + 1}',
+                'text': '',
+                'author': username,
+                'url': f"https://x.com/{username}",
+                'extracted_from': 'hybrid_extraction_2025',
+                'extraction_attempt': 1,
+                'method': 'css_selector'
             }
-            
-            # 1. EXTRACT TWEET TEXT - Updated selectors for X/Twitter 2024
+
+            # 1. EXTRACT TEXT CONTENT - Enhanced with multiple fallback strategies
             text_found = False
             text_selectors = [
-                '[data-testid="tweetText"] span',  # Main tweet text
-                'div[lang] span',                  # Language-specific content
-                'div[data-testid="tweetText"]',    # Direct tweet text div
-                'span[dir="ltr"]',                 # Left-to-right text
-                'div[dir="ltr"] > span'            # Direct span children
+                # Modern Twitter/X selectors (2024-2025)
+                '[data-testid="tweetText"]',
+                '[data-testid="tweetText"] span',
+                'div[data-testid="tweetText"]',
+                'div[data-testid="tweetText"] span',
+
+                # Alternative modern patterns
+                'article[data-testid="tweet"] div[lang]',
+                'article[data-testid="tweet"] div[lang] span',
+                'article div[dir="ltr"]',
+                'article div[dir="ltr"] span',
+
+                # Fallback patterns
+                'div[lang] span',
+                'div[dir="auto"] span',
+                'span[dir="auto"]',
+                'div[lang]',
+                'div[dir="auto"]',
+
+                # Generic content patterns
+                'article[data-testid="tweet"] div:has-text("")',
+                'div[role="group"] div[lang]',
+                'div[role="group"] span',
+
+                # Additional modern patterns (2024-2025)
+                'article[data-testid="tweet"] [data-testid="tweetText"]',
+                'article div[style*="text"] span',
+                'div[data-testid*="tweet"] span[dir="auto"]',
+                '[role="article"] div[lang] span',
+                '[role="article"] div[dir] span',
+
+                # Cross-selector patterns
+                'article span[dir="auto"]:not([role])',
+                'div[data-testid*="cell"] div[lang] span',
+                'article div[tabindex="-1"] span',
+
+                # Broad fallback patterns
+                'article div span:not([role]):not([aria-label])',
+                'div[role="article"] span:not([aria-hidden="true"])'
             ]
-            
+
             for selector in text_selectors:
                 try:
                     text_elements = tweet_element.locator(selector)
                     count = await text_elements.count()
-                    
-                    full_text = ""
-                    for i in range(count):
-                        element = text_elements.nth(i)
-                        if await element.is_visible():
-                            span_text = await element.inner_text()
-                            if span_text and span_text.strip():
-                                full_text += span_text + " "
-                    
-                    full_text = full_text.strip()
-                    if full_text and len(full_text) > 5:  # Minimum meaningful content
-                        tweet_data['text'] = full_text[:500]  # Reasonable limit
-                        text_found = True
-                        break
+                    self.logger.info(f"🔍 TEXT DEBUG: Selector '{selector}' found {count} elements")
+
+                    if count > 0:
+                        full_text = ""
+                        for i in range(min(count, 10)):  # Limit to avoid spam
+                            element = text_elements.nth(i)
+                            try:
+                                # Add timeout protection for element operations
+                                is_visible = await asyncio.wait_for(element.is_visible(), timeout=2.0)
+                                element_text = await asyncio.wait_for(element.inner_text(), timeout=3.0)
+                                self.logger.info(f"🔍 TEXT DEBUG: Element {i} - visible: {is_visible}, text: '{element_text[:50]}...'")
+
+                                if is_visible and element_text and element_text.strip():
+                                    # Enhanced filtering logic
+                                    text_clean = element_text.strip()
+
+                                    # Skip clearly non-content elements
+                                    skip_patterns = [
+                                        'follow', 'following', 'followers', 'show this thread',
+                                        'quote tweet', 'reply', 'retweet', 'like', 'share',
+                                        'view', 'views', 'translate', 'show more', 'show less',
+                                        'promoted', 'sponsored', 'ad', 'advertisement',
+                                        'see fewer tweets like this', 'not interested',
+                                        'report tweet', 'embed tweet', 'copy link'
+                                    ]
+
+                                    # Skip if text is too short or matches skip patterns
+                                    if (len(text_clean) > 3 and
+                                        not text_clean.lower() in skip_patterns and
+                                        not any(pattern in text_clean.lower() for pattern in skip_patterns) and
+                                        not text_clean.isdigit() and  # Skip pure numbers
+                                        not all(c in '.,!?()[]{}' for c in text_clean) and  # Skip pure punctuation
+                                        any(c.isalpha() for c in text_clean)  # Must have letters
+                                    ):
+                                        # Check if this looks like actual tweet content
+                                        if self._is_likely_tweet_content(text_clean):
+                                            full_text += text_clean + " "
+                            except Exception as elem_e:
+                                self.logger.debug(f"🔍 TEXT DEBUG: Element {i} error: {elem_e}")
+                                continue
+
+                        full_text = full_text.strip()
+                        self.logger.info(f"🔍 TEXT DEBUG: Combined text from selector '{selector}': '{full_text[:100]}...'")
+
+                        if full_text and len(full_text) > 10:  # Minimum meaningful content
+                            tweet_data['text'] = full_text[:500]  # Reasonable limit
+                            text_found = True
+                            self.logger.info(f"✅ TEXT SUCCESS: Extracted {len(full_text)} chars from selector '{selector}'")
+                            break
                 except Exception as e:
+                    self.logger.info(f"⚠️ TEXT DEBUG: Selector '{selector}' failed: {e}")
                     continue
-            
-            # Fallback: extract from entire tweet element
+
+            # Fallback: extract from entire tweet element with enhanced filtering
             if not text_found:
                 try:
-                    all_text = await tweet_element.inner_text()
+                    self.logger.info("🔍 TEXT FALLBACK: Attempting extraction from entire tweet element")
+                    # Add timeout protection for full element text extraction
+                    all_text = await asyncio.wait_for(tweet_element.inner_text(), timeout=5.0)
+                    self.logger.info(f"🔍 TEXT FALLBACK: Raw element text: '{all_text[:200]}...'")
+
                     if all_text:
-                        # Filter out non-tweet content
+                        # Split into lines and filter
                         lines = [line.strip() for line in all_text.split('\n') if line.strip()]
-                        meaningful_lines = [
-                            line for line in lines 
-                            if len(line) > 8 and 
-                            not line.isdigit() and 
-                            not line.startswith('@') and
-                            'Follow' not in line and
-                            'Show this thread' not in line
-                        ]
+                        self.logger.info(f"🔍 TEXT FALLBACK: Found {len(lines)} lines")
+
+                        # Enhanced filtering for meaningful content
+                        meaningful_lines = []
+                        for line in lines:
+                            # Skip lines that are likely UI elements or metadata
+                            if (len(line) > 10 and  # Minimum length
+                                not line.isdigit() and  # Not just numbers
+                                not line.startswith('@') and  # Not mentions only
+                                not any(skip_phrase in line.lower() for skip_phrase in [
+                                    'follow', 'following', 'followers', 'show this thread',
+                                    'quote tweet', 'reply', 'retweet', 'like', 'share',
+                                    'view', 'views', 'ago', 'promoted', 'ad'
+                                ]) and
+                                # Must contain some alphabetic content
+                                any(c.isalpha() for c in line)
+                            ):
+                                meaningful_lines.append(line)
+
+                        self.logger.info(f"🔍 TEXT FALLBACK: Filtered to {len(meaningful_lines)} meaningful lines")
+
                         if meaningful_lines:
-                            tweet_data['text'] = meaningful_lines[0][:500]
+                            # Take the longest line as it's likely to be the tweet content
+                            best_line = max(meaningful_lines, key=len)
+                            tweet_data['text'] = best_line[:500]
                             text_found = True
-                except:
-                    pass
-            
+                            self.logger.info(f"✅ TEXT FALLBACK SUCCESS: Extracted '{best_line[:100]}...'")
+                        else:
+                            self.logger.warning("⚠️ TEXT FALLBACK: No meaningful lines found")
+                except Exception as fallback_e:
+                    self.logger.warning(f"⚠️ TEXT FALLBACK: Failed: {fallback_e}")
+
             # 2. EXTRACT ENGAGEMENT METRICS - Enhanced with multiple fallback strategies
             if include_engagement:
                 try:
                     # Enhanced engagement extraction with multiple selector strategies
                     engagement_selectors = {
                         'replies': [
+                            # Primary modern selectors
                             '[data-testid="reply"]',
-                            '[aria-label*="replies"]', 
+                            'button[data-testid="reply"]',
+                            'div[data-testid="reply"]',
+
+                            # Aria-label based selectors
+                            '[aria-label*="replies"]',
                             '[aria-label*="reply"]',
+                            '[aria-label*="Reply"]',
+
+                            # Role-based selectors
+                            'div[role="button"][aria-label*="reply"]',
+                            'button[role="button"][aria-label*="reply"]',
+
+                            # Text-based fallbacks
                             'div[role="button"]:has-text("Reply")',
-                            'button:has-text("Reply")'
+                            'button:has-text("Reply")',
+
+                            # Additional modern patterns
+                            'article[data-testid="tweet"] [data-testid="reply"]',
+                            'div[role="group"] button[aria-label*="reply"]'
                         ],
                         'retweets': [
+                            # Primary modern selectors
                             '[data-testid="retweet"]',
+                            'button[data-testid="retweet"]',
+                            'div[data-testid="retweet"]',
+
+                            # Aria-label based selectors
                             '[aria-label*="retweet"]',
-                            '[aria-label*="Repost"]', 
+                            '[aria-label*="Repost"]',
+                            '[aria-label*="repost"]',
+
+                            # Role-based selectors
+                            'div[role="button"][aria-label*="retweet"]',
+                            'button[role="button"][aria-label*="repost"]',
+
+                            # Text-based fallbacks
                             'div[role="button"]:has-text("Repost")',
-                            'button:has-text("Repost")'
+                            'button:has-text("Repost")',
+
+                            # Additional modern patterns
+                            'article[data-testid="tweet"] [data-testid="retweet"]',
+                            'div[role="group"] button[aria-label*="repost"]'
                         ],
                         'likes': [
+                            # Primary modern selectors
                             '[data-testid="like"]',
+                            'button[data-testid="like"]',
+                            'div[data-testid="like"]',
+
+                            # Aria-label based selectors
                             '[aria-label*="like"]',
                             '[aria-label*="Like"]',
+                            '[aria-label*="likes"]',
+
+                            # Role-based selectors
+                            'div[role="button"][aria-label*="like"]',
+                            'button[role="button"][aria-label*="like"]',
+
+                            # Text-based fallbacks
                             'div[role="button"]:has-text("Like")',
-                            'button:has-text("Like")'
+                            'button:has-text("Like")',
+
+                            # Additional modern patterns
+                            'article[data-testid="tweet"] [data-testid="like"]',
+                            'div[role="group"] button[aria-label*="like"]'
                         ]
                     }
                     
                     import re
                     
-                    # Extract replies
+                    # Extract replies with enhanced error handling
                     for selector in engagement_selectors['replies']:
                         try:
                             button = tweet_element.locator(selector).first
-                            if await button.count() > 0:
+                            count = await asyncio.wait_for(button.count(), timeout=2.0)
+                            self.logger.info(f"💬 REPLIES DEBUG: Selector '{selector}' found {count} elements")
+
+                            if count > 0:
                                 # Try aria-label first (more reliable)
-                                aria_label = await button.get_attribute('aria-label')
-                                if aria_label:
-                                    numbers = re.findall(r'(\d+(?:,\d+)*(?:\.\d+)?[KM]?)', aria_label)
-                                    if numbers:
-                                        tweet_data['replies'] = self._parse_engagement_number(numbers[0])
-                                        break
-                                
+                                try:
+                                    aria_label = await asyncio.wait_for(button.get_attribute('aria-label'), timeout=2.0)
+                                    self.logger.info(f"💬 REPLIES DEBUG: aria-label: '{aria_label}'")
+
+                                    if aria_label:
+                                        numbers = re.findall(r'(\d+(?:,\d+)*(?:\.\d+)?[KM]?)', aria_label)
+                                        if numbers:
+                                            replies_count = self._parse_engagement_number(numbers[0])
+                                            tweet_data['replies'] = replies_count
+                                            self.logger.info(f"✅ REPLIES SUCCESS: Extracted {replies_count} from aria-label")
+                                            break
+                                except (asyncio.TimeoutError, Exception) as aria_e:
+                                    self.logger.debug(f"💬 REPLIES DEBUG: aria-label error: {aria_e}")
+
                                 # Fallback to inner text
-                                button_text = await button.inner_text()
-                                if button_text:
-                                    numbers = re.findall(r'(\d+(?:,\d+)*(?:\.\d+)?[KM]?)', button_text)
-                                    if numbers:
-                                        tweet_data['replies'] = self._parse_engagement_number(numbers[0])
-                                        break
+                                try:
+                                    button_text = await asyncio.wait_for(button.inner_text(), timeout=2.0)
+                                    self.logger.info(f"💬 REPLIES DEBUG: inner text: '{button_text}'")
+
+                                    if button_text:
+                                        numbers = re.findall(r'(\d+(?:,\d+)*(?:\.\d+)?[KM]?)', button_text)
+                                        if numbers:
+                                            replies_count = self._parse_engagement_number(numbers[0])
+                                            tweet_data['replies'] = replies_count
+                                            self.logger.info(f"✅ REPLIES SUCCESS: Extracted {replies_count} from inner text")
+                                            break
+                                except (asyncio.TimeoutError, Exception) as text_e:
+                                    self.logger.debug(f"💬 REPLIES DEBUG: inner text error: {text_e}")
                         except Exception as e:
-                            self.logger.debug(f"Reply selector {selector} failed: {e}")
+                            self.logger.debug(f"💬 REPLIES DEBUG: Selector '{selector}' failed: {e}")
                             continue
                     
                     # Extract retweets
@@ -2924,12 +3086,31 @@ class TwitterScraper:
             # 3. EXTRACT TIMESTAMP/DATE - Enhanced with multiple fallback strategies
             try:
                 date_selectors = [
-                    'time[datetime]',           # Primary: time element with datetime attribute
-                    'time',                     # Fallback: any time element  
-                    'a[href*="/status/"]',      # Status link containing time
-                    '[data-testid="Time"]',     # Twitter testid for time
-                    'span:has-text("·")',       # Time separator span
-                    '[aria-label*="ago"]',      # Aria label with time
+                    # Primary modern selectors (2024-2025)
+                    'time[datetime]',                          # Primary: time element with datetime attribute
+                    'time[data-testid="Time"]',                # Modern Twitter time element
+                    '[data-testid="Time"] time',               # Time inside testid container
+                    'article[data-testid="tweet"] time',       # Time within tweet article
+
+                    # Status link patterns
+                    'a[href*="/status/"] time',                # Time inside status links
+                    'a[href*="/status/"][role="link"] time',   # Role-based status links with time
+                    'time a[href*="/status/"]',                # Links inside time elements
+
+                    # Fallback patterns
+                    'time',                                    # Any time element
+                    '[data-testid="Time"]',                    # Twitter testid for time
+                    'a[href*="/status/"]',                     # Status link containing time
+
+                    # Text-based time indicators
+                    'span[title]:has-text("ago")',             # Span with title containing "ago"
+                    '[aria-label*="ago"]',                     # Aria label with time
+                    'span:has-text("·")',                      # Time separator span
+
+                    # Alternative modern patterns
+                    'article div[dir="auto"]:has-text("ago")', # Auto-direction divs with time
+                    'div[role="group"] span:has-text("ago")',  # Group role spans with time
+                    '[role="link"][href*="/status/"]',         # Role-based status links
                 ]
                 
                 date_extracted = False
@@ -2938,67 +3119,88 @@ class TwitterScraper:
                 for selector in date_selectors:
                     try:
                         elements = tweet_element.locator(selector)
-                        count = await elements.count()
-                        
-                        for i in range(count):
+                        count = await asyncio.wait_for(elements.count(), timeout=2.0)
+                        self.logger.info(f"🕐 DATE DEBUG: Selector '{selector}' found {count} elements")
+
+                        for i in range(min(count, 5)):  # Limit attempts to avoid spam
                             element = elements.nth(i)
-                            
+
                             # Try datetime attribute first (most reliable)
-                            datetime_attr = await element.get_attribute('datetime')
-                            if datetime_attr:
-                                # Store both ISO timestamp and human-readable date
-                                tweet_data['timestamp'] = datetime_attr
-                                tweet_data['date'] = datetime_attr
-                                
-                                # Also store human-readable version
-                                try:
-                                    from datetime import datetime
-                                    dt = datetime.fromisoformat(datetime_attr.replace('Z', '+00:00'))
-                                    tweet_data['date_human'] = dt.strftime('%Y-%m-%d %H:%M')
-                                except:
-                                    tweet_data['date_human'] = datetime_attr
-                                
-                                date_extracted = True
-                                self.logger.debug(f"✅ Date extracted from datetime attribute: {datetime_attr}")
-                                break
-                            
+                            try:
+                                datetime_attr = await asyncio.wait_for(element.get_attribute('datetime'), timeout=2.0)
+                                self.logger.info(f"🕐 DATE DEBUG: Element {i} datetime attribute: '{datetime_attr}'")
+
+                                if datetime_attr:
+                                    # Store both ISO timestamp and human-readable date
+                                    tweet_data['timestamp'] = datetime_attr
+                                    tweet_data['date'] = datetime_attr
+
+                                    # Also store human-readable version
+                                    try:
+                                        from datetime import datetime
+                                        dt = datetime.fromisoformat(datetime_attr.replace('Z', '+00:00'))
+                                        tweet_data['date_human'] = dt.strftime('%Y-%m-%d %H:%M')
+                                    except:
+                                        tweet_data['date_human'] = datetime_attr
+
+                                    date_extracted = True
+                                    self.logger.info(f"✅ DATE SUCCESS: Extracted datetime attribute: {datetime_attr}")
+                                    break
+                            except (asyncio.TimeoutError, Exception) as attr_e:
+                                self.logger.debug(f"🕐 DATE DEBUG: datetime attribute error: {attr_e}")
+                                pass
+
                             # Try aria-label
-                            aria_label = await element.get_attribute('aria-label')
-                            if aria_label and ('ago' in aria_label or ':' in aria_label):
-                                iso_timestamp = self._convert_relative_to_iso(aria_label)
-                                if iso_timestamp:
-                                    tweet_data['timestamp'] = iso_timestamp
-                                    tweet_data['date'] = iso_timestamp
-                                    tweet_data['date_human'] = aria_label
-                                    date_extracted = True
-                                    self.logger.debug(f"✅ Date extracted from aria-label: {aria_label}")
-                                    break
-                                else:
-                                    tweet_data['date'] = aria_label
-                                    tweet_data['timestamp'] = aria_label
-                                    tweet_data['date_human'] = aria_label
-                                    date_extracted = True
-                                    break
-                            
-                            # Try element text
-                            element_text = await element.inner_text()
-                            if element_text:
-                                # Check if it looks like a time string
-                                if any(indicator in element_text.lower() for indicator in ['ago', 'h', 'm', 's', ':', 'am', 'pm']):
-                                    iso_timestamp = self._convert_relative_to_iso(element_text)
+                            try:
+                                aria_label = await asyncio.wait_for(element.get_attribute('aria-label'), timeout=2.0)
+                                self.logger.info(f"🕐 DATE DEBUG: Element {i} aria-label: '{aria_label}'")
+
+                                if aria_label and ('ago' in aria_label or ':' in aria_label):
+                                    iso_timestamp = self._convert_relative_to_iso(aria_label)
                                     if iso_timestamp:
                                         tweet_data['timestamp'] = iso_timestamp
                                         tweet_data['date'] = iso_timestamp
-                                        tweet_data['date_human'] = element_text
+                                        tweet_data['date_human'] = aria_label
                                         date_extracted = True
-                                        self.logger.debug(f"✅ Date extracted from element text: {element_text}")
+                                        self.logger.info(f"✅ DATE SUCCESS: Extracted from aria-label: {aria_label}")
                                         break
                                     else:
-                                        tweet_data['date'] = element_text
-                                        tweet_data['timestamp'] = element_text
-                                        tweet_data['date_human'] = element_text
+                                        tweet_data['date'] = aria_label
+                                        tweet_data['timestamp'] = aria_label
+                                        tweet_data['date_human'] = aria_label
                                         date_extracted = True
+                                        self.logger.info(f"✅ DATE SUCCESS: Raw aria-label: {aria_label}")
                                         break
+                            except (asyncio.TimeoutError, Exception) as aria_e:
+                                self.logger.debug(f"🕐 DATE DEBUG: aria-label error: {aria_e}")
+                                pass
+
+                            # Try element text
+                            try:
+                                element_text = await asyncio.wait_for(element.inner_text(), timeout=2.0)
+                                self.logger.info(f"🕐 DATE DEBUG: Element {i} inner text: '{element_text}'")
+
+                                if element_text:
+                                    # Check if it looks like a time string
+                                    if any(indicator in element_text.lower() for indicator in ['ago', 'h', 'm', 's', ':', 'am', 'pm']):
+                                        iso_timestamp = self._convert_relative_to_iso(element_text)
+                                        if iso_timestamp:
+                                            tweet_data['timestamp'] = iso_timestamp
+                                            tweet_data['date'] = iso_timestamp
+                                            tweet_data['date_human'] = element_text
+                                            date_extracted = True
+                                            self.logger.info(f"✅ DATE SUCCESS: Extracted from element text: {element_text}")
+                                            break
+                                        else:
+                                            tweet_data['date'] = element_text
+                                            tweet_data['timestamp'] = element_text
+                                            tweet_data['date_human'] = element_text
+                                            date_extracted = True
+                                            self.logger.info(f"✅ DATE SUCCESS: Raw element text: {element_text}")
+                                            break
+                            except (asyncio.TimeoutError, Exception) as text_e:
+                                self.logger.debug(f"🕐 DATE DEBUG: element text error: {text_e}")
+                                pass
                         
                         if date_extracted:
                             break
@@ -3045,36 +3247,69 @@ class TwitterScraper:
             
             # 4. EXTRACT TWEET URL/ID - Enhanced with multiple fallback strategies
             try:
-                # Strategy 1: Direct status link
+                # Strategy 1: Enhanced status link extraction with modern patterns
                 url_selectors = [
-                    'a[href*="/status/"]',           # Primary status link
-                    'time a[href*="/status/"]',      # Time element with status link
-                    '[data-testid="Time"] a',        # Time testid link
-                    'a[href*="/status/"]:not([aria-label])',  # Direct status links without aria-label
-                    'a[role="link"][href*="/status/"]'        # Role-based status links
+                    # Primary modern selectors (2024-2025)
+                    'time a[href*="/status/"]',                    # Time element with status link (most reliable)
+                    '[data-testid="Time"] a[href*="/status/"]',    # Time testid with status link
+                    'article[data-testid="tweet"] a[href*="/status/"]',  # Tweet article with status link
+
+                    # Direct status link patterns
+                    'a[href*="/status/"]',                         # Primary status link
+                    'a[role="link"][href*="/status/"]',            # Role-based status links
+
+                    # Specific attribute combinations
+                    'a[href*="/status/"]:not([aria-label])',       # Direct status links without aria-label
+                    'a[href*="/status/"][role="link"]',            # Status links with role
+                    'a[href*="/status/"][target="_blank"]',        # Status links with target
+
+                    # Alternative patterns
+                    'div[data-testid="tweet"] a[href*="/status/"]', # Tweet div with status link
+                    'article time a[href*="/status/"]',            # Article time status link
+                    '[role="article"] a[href*="/status/"]',        # Article role with status link
+
+                    # Fallback patterns
+                    'div[role="link"][href*="/status/"]',          # Div role links
+                    'span a[href*="/status/"]',                    # Span child status links
+                    '[data-testid*="Time"] a',                    # Time-related testids with links
                 ]
                 
                 url_extracted = False
                 for selector in url_selectors:
                     try:
                         status_link = tweet_element.locator(selector).first
-                        if await status_link.count() > 0:
-                            href = await status_link.get_attribute('href')
-                            if href:
-                                # Normalize URL
-                                full_url = f"https://x.com{href}" if href.startswith('/') else href
-                                tweet_data['url'] = full_url
-                                
-                                # Extract tweet ID from URL
-                                import re
-                                id_match = re.search(r'/status/(\d+)', href)
-                                if id_match:
-                                    tweet_data['tweet_id'] = id_match.group(1)
-                                    self.logger.debug(f"✅ Tweet URL/ID extracted: {id_match.group(1)}")
-                                    url_extracted = True
-                                    break
+                        count = await asyncio.wait_for(status_link.count(), timeout=2.0)
+                        self.logger.info(f"🔗 URL DEBUG: Selector '{selector}' found {count} elements")
+
+                        if count > 0:
+                            try:
+                                href = await asyncio.wait_for(status_link.get_attribute('href'), timeout=2.0)
+                                self.logger.info(f"🔗 URL DEBUG: Found href: '{href}'")
+
+                                if href and '/status/' in href:
+                                    # Normalize URL
+                                    full_url = f"https://x.com{href}" if href.startswith('/') else href
+                                    tweet_data['url'] = full_url
+
+                                    # Extract tweet ID from URL
+                                    import re
+                                    id_match = re.search(r'/status/(\d+)', href)
+                                    if id_match:
+                                        tweet_id = id_match.group(1)
+                                        tweet_data['tweet_id'] = tweet_id
+                                        tweet_data['id'] = f"tweet_{tweet_id}"  # Update ID to use actual tweet ID
+                                        self.logger.info(f"✅ URL SUCCESS: Extracted tweet ID {tweet_id}")
+                                        self.logger.info(f"✅ URL SUCCESS: Full URL: {full_url}")
+                                        url_extracted = True
+                                        break
+                                    else:
+                                        self.logger.warning(f"🔗 URL WARNING: No tweet ID found in href: {href}")
+                                else:
+                                    self.logger.debug(f"🔗 URL DEBUG: Invalid or missing href: {href}")
+                            except (asyncio.TimeoutError, Exception) as href_e:
+                                self.logger.debug(f"🔗 URL DEBUG: href extraction error: {href_e}")
                     except Exception as e:
-                        self.logger.debug(f"URL selector {selector} failed: {e}")
+                        self.logger.debug(f"🔗 URL DEBUG: Selector '{selector}' failed: {e}")
                         continue
                 
                 # Strategy 2: Fallback - extract from any href containing the username
@@ -3166,43 +3401,26 @@ class TwitterScraper:
                 self.logger.debug(f"Tweet type detection failed: {e}")
 
             # Only return tweet if we extracted meaningful data
-            if 'text' in tweet_data or 'likes' in tweet_data or 'date' in tweet_data:
+            has_text = 'text' in tweet_data and tweet_data['text']
+            has_likes = 'likes' in tweet_data and tweet_data['likes'] is not None
+            has_date = 'date' in tweet_data and tweet_data['date']
+
+            self.logger.info(f"🔍 FINAL CHECK: Element {index} - text: {has_text}, likes: {has_likes}, date: {has_date}")
+            self.logger.info(f"🔍 FINAL CHECK: Tweet data keys: {list(tweet_data.keys())}")
+
+            if has_text or has_likes or has_date:
+                self.logger.info(f"✅ EXTRACT SUCCESS: Element {index} returning valid tweet data")
                 return tweet_data
             else:
+                self.logger.warning(f"❌ EXTRACT REJECTED: Element {index} - no meaningful data extracted")
+                self.logger.warning(f"❌ EXTRACT REJECTED: tweet_data = {tweet_data}")
                 return None
-                
+
         except Exception as e:
-            self.logger.debug(f"Failed to extract tweet {index}: {e}")
+            self.logger.error(f"❌ Tweet extraction error for element {index}: {e}")
+            import traceback
+            self.logger.error(f"❌ Traceback: {traceback.format_exc()}")
             return None
-    
-    def _parse_engagement_number(self, number_str: str) -> int:
-        """Parse engagement number from string (e.g., '1.2K' -> 1200, '1,234' -> 1234)."""
-        try:
-            if not number_str:
-                return 0
-                
-            number_str = str(number_str).strip().upper()
-            
-            # Remove commas first
-            number_str = number_str.replace(',', '')
-            
-            # Handle K, M, B suffixes
-            if 'B' in number_str:
-                return int(float(number_str.replace('B', '')) * 1000000000)
-            elif 'M' in number_str:
-                return int(float(number_str.replace('M', '')) * 1000000)
-            elif 'K' in number_str:
-                return int(float(number_str.replace('K', '')) * 1000)
-            else:
-                # Handle plain numbers (remove any non-digit characters except decimal point)
-                import re
-                clean_number = re.sub(r'[^\d.]', '', number_str)
-                if clean_number:
-                    return int(float(clean_number))
-                return 0
-        except Exception as e:
-            self.logger.debug(f"Failed to parse engagement number '{number_str}': {e}")
-            return 0
     
     def _convert_relative_to_iso(self, relative_time: str) -> str:
         """Convert relative timestamp like '2h ago' to ISO timestamp."""
@@ -3309,7 +3527,7 @@ class TwitterScraper:
                     for i in range(count):
                         element = tweet_elements.nth(i)
                         if await element.is_visible():
-                            tweet_data = await self._extract_tweet_from_element(element, i, include_engagement=True)
+                            tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
                             if tweet_data and tweet_data.get('text'):
                                 tweet_data['extraction_level'] = "enhanced"
                                 tweets.append(tweet_data)
@@ -3346,7 +3564,7 @@ class TwitterScraper:
                         
                     element = tweet_elements.nth(i)
                     if await element.is_visible():
-                        tweet_data = await self._extract_tweet_from_element(element, i, include_engagement=True)
+                        tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
                         if tweet_data and tweet_data.get('text'):
                             # Check for duplicates
                             if not any(t.get('text') == tweet_data.get('text') for t in tweets):
@@ -3969,13 +4187,17 @@ class TwitterScraper:
                             for i, element in enumerate(elements[:max_posts]):
                                 try:
                                     # Use the enhanced tweet extraction method!
-                                    enhanced_tweet = await self._extract_tweet_from_element(element, i, include_engagement=True)
+                                    self.logger.info(f"🔍 DEBUG: Attempting enhanced extraction for element {i}")
+                                    enhanced_tweet = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
+                                    self.logger.info(f"🔍 DEBUG: Enhanced extraction result: {enhanced_tweet}")
                                     if enhanced_tweet and enhanced_tweet.get('text'):
                                         tweet_elements_found.append(enhanced_tweet)
                                         css_tweets_found = True
                                         self.logger.info(f"✅ Extracted enhanced tweet: '{enhanced_tweet['text'][:50]}...'")
                                         if len(tweet_elements_found) >= max_posts:
                                             break
+                                    else:
+                                        self.logger.warning(f"⚠️ Enhanced extraction returned empty result for element {i}")
                                 except Exception as e:
                                     self.logger.error(f"🚨 Enhanced extraction failed for element {i}: {e}")
                                     import traceback
@@ -4010,17 +4232,108 @@ class TwitterScraper:
                     posts.extend(tweet_elements_found)
                     tweets_found_this_round += len(tweet_elements_found)
                 
-                # Method 2: Enhanced div content parsing (fallback)
+                # Method 2: Enhanced div content parsing (fallback) with metadata extraction
                 if not css_tweets_found:
-                    self.logger.info("🔄 Falling back to enhanced div parsing...")
-                    div_texts = await self.page.locator('div').all_inner_texts()
-                    
-                    for div_text in div_texts:
-                        lines = div_text.split('\n')
-                        for line in lines:
-                            line = line.strip()
-                            if self._is_likely_tweet_content(line):
-                                tweet_candidates.append(line)
+                    self.logger.info("🔄 Falling back to enhanced div parsing with metadata extraction...")
+
+                    # Get all divs that might contain tweets
+                    tweet_divs = await self.page.locator('div[data-testid*="cell"], article, div[role="article"]').all()
+
+                    self.logger.info(f"🔄 DIV FALLBACK: Found {len(tweet_divs)} potential tweet containers")
+
+                    for i, div_element in enumerate(tweet_divs[:50]):  # Limit to avoid too much processing
+                        try:
+                            div_text = await asyncio.wait_for(div_element.inner_text(), timeout=3.0)
+                            if not div_text:
+                                continue
+
+                            # Split into lines and analyze structure
+                            lines = [line.strip() for line in div_text.split('\n') if line.strip()]
+
+                            # Look for tweet-like content
+                            tweet_content = None
+                            timestamp_text = None
+                            engagement_data = {}
+
+                            for line in lines:
+                                # Check if line is likely tweet content
+                                if self._is_likely_tweet_content(line):
+                                    tweet_content = line
+
+                                # Look for timestamp patterns
+                                if any(time_indicator in line.lower() for time_indicator in ['ago', 'h', 'm', 's', ':', 'am', 'pm']) and len(line) < 20:
+                                    timestamp_text = line
+
+                                # Look for engagement numbers
+                                import re
+                                numbers = re.findall(r'(\d+(?:,\d+)*(?:\.\d+)?[KM]?)', line)
+                                if numbers and len(line) < 50:
+                                    # Try to match common engagement patterns
+                                    if 'repl' in line.lower() or 'comment' in line.lower():
+                                        try:
+                                            engagement_data['replies'] = self._parse_engagement_number(numbers[0])
+                                        except:
+                                            pass
+                                    elif 'retweet' in line.lower() or 'repost' in line.lower():
+                                        try:
+                                            engagement_data['retweets'] = self._parse_engagement_number(numbers[0])
+                                        except:
+                                            pass
+                                    elif 'like' in line.lower() or 'heart' in line.lower():
+                                        try:
+                                            engagement_data['likes'] = self._parse_engagement_number(numbers[0])
+                                        except:
+                                            pass
+
+                            # If we found tweet content, create a structured tweet object
+                            if tweet_content:
+                                enhanced_tweet = {
+                                    'id': f'div_tweet_{i+1}',
+                                    'text': tweet_content[:500],
+                                    'author': username,
+                                    'url': f"https://x.com/{username}",
+                                    'extracted_from': 'enhanced_div_parsing_2025',
+                                    'extraction_attempt': scroll_attempts + 1,
+                                    'method': 'div_parsing_enhanced',
+                                    'timestamp': None,
+                                    'extraction_quality': 'medium'
+                                }
+
+                                # Add timestamp if found
+                                if timestamp_text:
+                                    enhanced_tweet['date'] = timestamp_text
+                                    enhanced_tweet['date_human'] = timestamp_text
+                                    # Try to convert to ISO if possible
+                                    iso_timestamp = self._convert_relative_to_iso(timestamp_text)
+                                    if iso_timestamp:
+                                        enhanced_tweet['timestamp'] = iso_timestamp
+
+                                # Add engagement data if found
+                                enhanced_tweet.update(engagement_data)
+
+                                # Add to results
+                                tweet_elements_found.append(enhanced_tweet)
+                                self.logger.info(f"✅ DIV FALLBACK: Enhanced tweet extracted: '{tweet_content[:50]}...'")
+
+                                if engagement_data:
+                                    engagement_str = ', '.join([f"{k}:{v}" for k, v in engagement_data.items()])
+                                    self.logger.info(f"✅ DIV FALLBACK: Engagement data: {engagement_str}")
+
+                        except Exception as div_e:
+                            self.logger.debug(f"🔄 DIV FALLBACK: Error processing div {i}: {div_e}")
+                            continue
+
+                    # Also do the simple text extraction as final fallback
+                    if not tweet_elements_found:
+                        self.logger.info("🔄 DIV FALLBACK: Using simple text extraction as final fallback")
+                        div_texts = await self.page.locator('div').all_inner_texts()
+
+                        for div_text in div_texts:
+                            lines = div_text.split('\n')
+                            for line in lines:
+                                line = line.strip()
+                                if self._is_likely_tweet_content(line):
+                                    tweet_candidates.append(line)
                 
                 self.logger.info(f"🔍 Found {len(tweet_candidates)} tweet candidates in attempt {scroll_attempts + 1}")
                 
@@ -4032,6 +4345,8 @@ class TwitterScraper:
                     if tweet_text not in seen_tweets and tweet_text not in [post.get('text') for post in posts]:
                         seen_tweets.add(tweet_text)
                         tweets_found_this_round = len([p for p in posts if p.get('extraction_attempt') == scroll_attempts + 1])
+
+                        # Enhanced tweet data with better metadata
                         tweet_data = {
                             'id': f'tweet_{len(posts)+1}',
                             'text': tweet_text,
@@ -4039,7 +4354,9 @@ class TwitterScraper:
                             'url': f'https://x.com/{username}',
                             'extracted_from': 'hybrid_extraction_2025',
                             'extraction_attempt': scroll_attempts + 1,
-                            'method': 'css_selector' if css_tweets_found else 'div_parsing'
+                            'method': 'css_selector' if css_tweets_found else 'div_parsing',
+                            'timestamp': datetime.now().isoformat(),  # Add current timestamp as extraction time
+                            'extraction_quality': 'medium'  # Quality indicator
                         }
                         
                         # Apply date filtering if enabled
@@ -4114,94 +4431,92 @@ class TwitterScraper:
         """Enhanced helper method to identify if a line is likely tweet content."""
         if not line or len(line) < 10 or len(line) > 500:
             return False
-            
+
+        line_lower = line.lower()
+
+        # CRITICAL: Skip promotional and advertising content
+        promotional_indicators = [
+            'get ready for epic', 'thrilling moments', 'nonstop', 'action',
+            'follow for daily', 'newsletter', 'tools & resources',
+            'ai investor', 'entrepreneur', 'creator',
+            'the media could not be played',
+            'wisdom', 'dose of'
+        ]
+
+        if any(promo in line_lower for promo in promotional_indicators):
+            return False
+
         # ENHANCED PROFILE DATA DETECTION - Skip profile contamination
         profile_indicators = [
-            # Location + website + join date patterns
-            'comjoined',  # "github.comJoined"
-            '.comjoined',  # ".org/Joined" etc
-            'cagithub',   # "CA" + "github" concatenation
-            'cayoutu',    # Location + website patterns
-            # Common profile data patterns
+            'comjoined', '.comjoined', 'cagithub', 'cayoutu',
             'followers', 'following', 'posts', 'joined',
-            # Combined profile elements
-            'san francisco', 'new york', 'los angeles',  # Common locations
-            'ca', 'ny', 'tx', 'usa'  # State/country abbreviations
+            'san francisco', 'new york', 'los angeles',
+            'ca', 'ny', 'tx', 'usa'
         ]
-        
-        line_lower = line.lower()
-        
-        # Skip lines that contain profile data indicators
+
         if any(indicator in line_lower for indicator in profile_indicators):
             return False
-            
-        # SPECIFIC PATTERN: Catch "Location, StateWebsite.comJoined Date" patterns
-        if ((',' in line and '.com' in line_lower and 'joined' in line_lower) or
-            ('.com' in line_lower and 'joined' in line_lower and len(line.split()) <= 4)):
-            return False
-            
-        # Skip obvious UI elements and navigation
-        if (line.startswith('To view') or
-            line.startswith('View keyboard') or
-            'keyboard shortcuts' in line or
-            line in ['Follow', 'Following', 'Followers', 'Posts', 'Replies', 'Media', 'Likes', 'Joined', 'Home', 'Search', 'Messages', 'Bookmarks', 'Lists', 'Profile', 'More', 'Settings', 'Notifications'] or
+
+        # Skip UI elements, navigation, and system messages
+        ui_elements = [
+            'follow', 'following', 'followers', 'posts', 'replies', 'media', 'likes',
+            'joined', 'home', 'search', 'messages', 'bookmarks', 'lists', 'profile',
+            'more', 'settings', 'notifications', 'repost', 'quote', 'bookmark',
+            'share', 'copy', 'show more', 'show less', 'show this thread',
+            'translate post', 'copy link', 'view keyboard', 'keyboard shortcuts'
+        ]
+
+        if (line.strip().lower() in ui_elements or
+            line.startswith('To view') or line.startswith('View keyboard') or
             line.isdigit() or
             all(c in '0123456789,. MKB' for c in line) or
             line.startswith('Joined ') or
-            line.endswith('.com') or
-            line.endswith('.org') or
-            line.endswith('.net') or
-            line.startswith('http://') or
-            line.startswith('https://') or
-            (len(line.split()) == 1 and ('h' in line or 'm' in line or 's' in line) and any(c.isdigit() for c in line)) or
-            (len(line.split()) == 1 and line in ['Repost', 'Quote', 'Bookmark', 'Share', 'Copy'])):
+            any(line.endswith(ext) for ext in ['.com', '.org', '.net', '.io']) or
+            line.startswith(('http://', 'https://')) or
+            (len(line.split()) == 1 and line.startswith('@'))):
             return False
-            
-        # ENHANCED: Skip concatenated profile data
-        # Look for patterns like "LocationWebsiteJoined Date"
-        if ('joined' in line_lower and 
+
+        # Skip concatenated profile data and dates
+        if ('joined' in line_lower and
             (any(year in line for year in ['2008', '2009', '2010', '2011', '2012', '2013', '2014', '2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025']) or
              any(month in line_lower for month in ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']))):
             return False
-        
-        # Skip URLs without spaces (likely profile links)
-        if ('.' in line and line.count(' ') == 0 and 
+
+        # Skip standalone URLs
+        if ('.' in line and line.count(' ') == 0 and
             any(tld in line_lower for tld in ['.com', '.org', '.net', '.io', '.co'])):
             return False
-        
+
         words = line.split()
-        if len(words) < 2:
+        if len(words) < 3:  # Increased minimum word count
             return False
-            
-        # Skip obvious UI action phrases
-        if line.lower().strip() in ['show more', 'show less', 'show this thread', 'translate post', 'copy link']:
-            return False
-            
-        # Skip if it's just a username
-        if len(words) == 1 and line.startswith('@'):
-            return False
-            
-        # Ensure it contains actual text content
+
+        # Must contain alphabetic content
         if not any(c.isalpha() for c in line):
             return False
-        
-        # ENHANCED Quality check: Must look like natural tweet content
+
+        # ENHANCED: Content must look like natural human communication
         has_sentence_structure = (
-            # Has punctuation indicating sentences
-            ('.' in line or '!' in line or '?' in line) or
-            # Long enough to be meaningful
-            len(words) > 5 or 
-            # Contains common English words indicating natural speech
-            any(word.lower() in ['i', 'we', 'they', 'this', 'that', 'will', 'can', 'should', 'would', 'the', 'and', 'or', 'but', 'so', 'at', 'in', 'on', 'for', 'with', 'by'] for word in words) or
-            # Contains verbs indicating action/statements
-            any(word.lower() in ['is', 'are', 'was', 'were', 'has', 'have', 'had', 'do', 'does', 'did', 'get', 'got', 'make', 'take', 'go', 'come', 'see', 'know', 'think', 'want', 'need'] for word in words)
+            # Has punctuation indicating complete thoughts
+            ('.' in line or '!' in line or '?' in line or ':' in line) or
+            # Has sufficient length and complexity
+            (len(words) >= 6 and len(line) >= 30) or
+            # Contains personal pronouns or common discourse markers
+            any(word.lower() in ['i', 'we', 'you', 'they', 'this', 'that', 'it', 'what', 'how', 'when', 'where', 'why'] for word in words) or
+            # Contains common verbs indicating statements/opinions
+            any(word.lower() in ['is', 'are', 'was', 'were', 'has', 'have', 'had', 'will', 'would', 'should', 'could', 'think', 'believe', 'know', 'feel'] for word in words)
         )
-        
-        # FINAL FILTER: Skip if it looks like concatenated metadata
-        if len(words) < 4 and not has_sentence_structure:
+
+        # STRICTER FILTER: Must have clear sentence structure
+        if not has_sentence_structure:
             return False
-        
-        return has_sentence_structure
+
+        # Additional quality checks
+        if (len(words) < 5 and not any(punct in line for punct in '.!?:')) or \
+           (line.count(' ') < 2):  # Must have at least 3 words with spaces
+            return False
+
+        return True
     
     async def _scrape_user_likes(self, username: str, max_likes: int) -> List[Dict[str, Any]]:
         """Scrape user's liked tweets."""
@@ -4211,6 +4526,19 @@ class TwitterScraper:
             likes_url = f"https://x.com/{username}/likes"
             await self.page.goto(likes_url, wait_until='domcontentloaded', timeout=30000)
             await self._human_delay(3, 5)
+
+            # Check if likes page is accessible (not restricted)
+            page_content = await self.page.content()
+            if any(restriction in page_content.lower() for restriction in [
+                'these likes are protected', 'not authorized', 'private account',
+                'blocked', 'suspended', 'account doesn\'t exist'
+            ]):
+                self.logger.warning(f"⚠️ Likes for @{username} are restricted or protected")
+                return [{
+                    'type': 'access_restricted',
+                    'message': f'Likes for @{username} are not publicly accessible',
+                    'reason': 'protected_or_restricted_account'
+                }]
             
             # Wait for basic page structure instead of specific elements
             await self.page.wait_for_selector('div', timeout=20000)
@@ -4220,12 +4548,15 @@ class TwitterScraper:
             
             date_threshold_reached = False
             while len(likes) < max_likes and scroll_attempts < max_scrolls and not date_threshold_reached:
-                # Use multiple selectors to find tweet content
+                # Enhanced selectors for modern Twitter/X layout
                 tweet_selectors = [
                     'article[data-testid="tweet"]',
                     'article[role="article"]',
                     'div[data-testid="cellInnerDiv"]',
-                    'div:has(time)'
+                    'div[data-testid*="cell"]',
+                    'div:has(time)',
+                    '[role="article"]',
+                    'div[role="article"]'
                 ]
                 
                 tweet_elements = []
@@ -4261,8 +4592,8 @@ class TwitterScraper:
                 for i, tweet_element in enumerate(tweet_elements):
                     if len(likes) >= max_likes:
                         break
-                    
-                    tweet_data = await self._extract_tweet_from_element(tweet_element, i, True)
+
+                    tweet_data = await self._extract_tweet_from_element(tweet_element, i, username, True)
                     if tweet_data and tweet_data not in likes:
                         # Apply date filtering if enabled
                         if self.enable_date_filtering:
@@ -4332,11 +4663,14 @@ class TwitterScraper:
             
             date_threshold_reached = False
             while len(mentions) < max_mentions and scroll_attempts < max_scrolls and not date_threshold_reached:
-                # Try multiple selectors for tweet elements
+                # Enhanced selectors for modern Twitter/X layout
                 tweet_selectors = [
                     'article[data-testid="tweet"]',
                     'article[role="article"]',
-                    'div[data-testid="cellInnerDiv"]'
+                    'div[data-testid="cellInnerDiv"]',
+                    'div[data-testid*="cell"]',
+                    '[role="article"]',
+                    'div[role="article"]'
                 ]
                 
                 tweet_elements = []
@@ -4355,8 +4689,8 @@ class TwitterScraper:
                 for i, tweet_element in enumerate(tweet_elements):
                     if len(mentions) >= max_mentions:
                         break
-                    
-                    tweet_data = await self._extract_tweet_from_element(tweet_element, i, True)
+
+                    tweet_data = await self._extract_tweet_from_element(tweet_element, i, username, True)
                     if tweet_data and tweet_data not in mentions:
                         # Apply date filtering if enabled
                         if self.enable_date_filtering:
@@ -5601,7 +5935,7 @@ class TwitterScraper:
                         break
 
                     try:
-                        tweet_data = await self._extract_tweet_from_element(tweet_element)
+                        tweet_data = await self._extract_tweet_from_element(tweet_element, 0, username)
                         if tweet_data:
                             tweet_data['interaction_type'] = 'like'
                             tweet_data['liked_by'] = username
@@ -5647,7 +5981,7 @@ class TwitterScraper:
                         break
 
                     try:
-                        tweet_data = await self._extract_tweet_from_element(tweet_element)
+                        tweet_data = await self._extract_tweet_from_element(tweet_element, 0, username)
                         if tweet_data and tweet_data.get('text') and f"@{username}" in tweet_data['text'].lower():
                             tweet_data['interaction_type'] = 'mention'
                             tweet_data['mentions_user'] = username
@@ -5699,7 +6033,7 @@ class TwitterScraper:
                         media_container = tweet_element.locator('[data-testid="tweetPhoto"], [data-testid="videoPlayer"], [data-testid="card.wrapper"]')
 
                         if await media_container.count() > 0:
-                            tweet_data = await self._extract_tweet_from_element(tweet_element)
+                            tweet_data = await self._extract_tweet_from_element(tweet_element, 0, username)
                             if tweet_data:
                                 media_info = await self._extract_media_from_tweet(tweet_element)
                                 tweet_data['media'] = media_info
