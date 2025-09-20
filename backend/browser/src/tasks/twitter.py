@@ -111,7 +111,7 @@ def calculate_extraction_success_rate(results: Union[List[Dict[str, Any]], bool,
         total_points += 40
         
         # Other data types (40 points possible)
-        for data_type, weight in [('likes', 10), ('mentions', 8), ('media', 8), ('followers', 7), ('following', 7)]:
+        for data_type, weight in [('likes', 10), ('mentions', 8), ('reposts', 9), ('media', 8), ('followers', 7), ('following', 7)]:
             if params.get(f'scrape_{data_type}', False):
                 data_list = result.get(data_type, [])
                 requested = params.get(f'max_{data_type}', 10)
@@ -320,9 +320,12 @@ class TwitterTask:
                 logger.info(f"👥 Followers Limit: {clean_params.get('max_followers', 200)}")
             if clean_params.get('scrape_following', False):
                 logger.info(f"➡️ Following Limit: {clean_params.get('max_following', 150)}")
-            if not any([clean_params.get('scrape_posts', True), clean_params.get('scrape_likes', False), 
+            if clean_params.get('scrape_reposts', False):
+                logger.info(f"🔄 Reposts Limit: {clean_params.get('max_reposts', 50)}")
+            if not any([clean_params.get('scrape_posts', True), clean_params.get('scrape_likes', False),
                        clean_params.get('scrape_mentions', False), clean_params.get('scrape_media', False),
-                       clean_params.get('scrape_followers', False), clean_params.get('scrape_following', False)]):
+                       clean_params.get('scrape_followers', False), clean_params.get('scrape_following', False),
+                       clean_params.get('scrape_reposts', False)]):
                 logger.info(f"🔢 Max Results: {clean_params.get('max_results', 10)}")
             
             # Initialize concurrency manager for session isolation
@@ -456,9 +459,28 @@ class TwitterTask:
 
                 # FIXED: Properly differentiate scrape levels
                 if scrape_level >= 4:
-                    # Level 4: Full comprehensive extraction
+                    # Level 4: Full comprehensive extraction - FORCE ENABLE ALL DATA TYPES
                     logger.info(f"📊 LEVEL 4: Comprehensive extraction with all data types")
-                    results = await scraper.scrape_user_comprehensive(clean_params)
+                    clean_params_level4 = clean_params.copy()
+                    # Force enable all extraction types for EVERYTHING mode
+                    clean_params_level4.update({
+                        'scrape_posts': True,
+                        'scrape_media': True,
+                        'scrape_likes': True,
+                        'scrape_mentions': True,
+                        'scrape_followers': True,
+                        'scrape_following': True,
+                        'scrape_reposts': True,
+                        'max_posts': max(clean_params.get('max_posts', 50), 50),  # Minimum 50 for Level 4
+                        'max_likes': max(clean_params.get('max_likes', 50), 20),
+                        'max_mentions': max(clean_params.get('max_mentions', 30), 15),
+                        'max_reposts': max(clean_params.get('max_reposts', 50), 20),
+                        'max_followers': max(clean_params.get('max_followers', 200), 100),
+                        'max_following': max(clean_params.get('max_following', 150), 75),
+                        'max_media': max(clean_params.get('max_media', 25), 15)
+                    })
+                    logger.info(f"🔥 LEVEL 4 EVERYTHING MODE: Forced comprehensive extraction")
+                    results = await scraper.scrape_user_comprehensive(clean_params_level4)
                     extraction_method = "level_4_comprehensive"
                 elif scrape_level >= 3:
                     # Level 3: Full profile + posts + some engagement data
@@ -470,7 +492,8 @@ class TwitterTask:
                         'scrape_likes': False,
                         'scrape_mentions': False,
                         'scrape_followers': False,
-                        'scrape_following': False
+                        'scrape_following': False,
+                        'scrape_reposts': False
                     })
                     results = await scraper.scrape_user_comprehensive(clean_params_level3)
                     extraction_method = "level_3_with_media"
@@ -485,6 +508,7 @@ class TwitterTask:
                         'scrape_mentions': False,
                         'scrape_followers': False,
                         'scrape_following': False,
+                        'scrape_reposts': False,
                         'max_posts': min(clean_params.get('max_posts', 10), 15)  # Limit posts for level 2
                     })
                     results = await scraper.scrape_user_comprehensive(clean_params_level2)
@@ -497,6 +521,7 @@ class TwitterTask:
                         'scrape_posts': True,
                         'scrape_media': False,
                         'scrape_likes': False,
+                        'scrape_reposts': False,
                         'scrape_mentions': False,
                         'scrape_followers': False,
                         'scrape_following': False,
@@ -519,6 +544,8 @@ class TwitterTask:
                     scrape_options.append(f"Followers({clean_params.get('max_followers', 200)})")
                 if clean_params.get('scrape_following'):
                     scrape_options.append(f"Following({clean_params.get('max_following', 150)})")
+                if clean_params.get('scrape_reposts'):
+                    scrape_options.append(f"Reposts({clean_params.get('max_reposts', 50)})")
 
                 logger.info(f"🎯 Scraped: {', '.join(scrape_options) if scrape_options else 'Posts only'}")
                 
@@ -669,7 +696,9 @@ class TwitterTask:
             "max_followers": min(params.get("max_followers", params.get("followers_count", 200)), 1000),
             "scrape_following": params.get("scrape_following", params.get("enable_following", False)),
             "max_following": min(params.get("max_following", params.get("following_count", 150)), 1000),
-            
+            "scrape_reposts": params.get("scrape_reposts", params.get("enable_reposts", False)),
+            "max_reposts": min(params.get("max_reposts", params.get("reposts_count", 50)), 200),
+
             # Batch processing parameters
             "batch_usernames": params.get("batch_usernames", []),
             "batch_hashtags": params.get("batch_hashtags", []),
@@ -824,7 +853,7 @@ class TwitterBatchProcessor:
         content_type = "text_only"
         if job.get('scrape_media', False):
             content_type = "media_rich"
-        elif job.get('scrape_likes', False) or job.get('scrape_mentions', False):
+        elif job.get('scrape_likes', False) or job.get('scrape_mentions', False) or job.get('scrape_reposts', False):
             content_type = "engagement_focused"
         
         # Time sensitivity classification
@@ -4191,6 +4220,7 @@ class TwitterScraper:
             "posts": [],
             "likes": [],
             "mentions": [],
+            "reposts": [],
             "media": [],
             "followers": [],
             "following": []
@@ -4340,7 +4370,14 @@ class TwitterScraper:
                 self.logger.info(f"@️⃣ Scraping mentions ({max_mentions})...")
                 mentions = await self._scrape_user_mentions(username, max_mentions)
                 results["mentions"] = mentions
-            
+
+            # 3.5. Scrape Reposts/Retweets
+            if params.get('scrape_reposts', False):
+                max_reposts = params.get('max_reposts', 50)  # Using validated parameters
+                self.logger.info(f"🔄 Scraping reposts ({max_reposts})...")
+                reposts = await self._scrape_user_reposts(username, max_reposts)
+                results["reposts"] = reposts
+
             # 4. Scrape Media
             if params.get('scrape_media', False):
                 max_media = params.get('max_media', 25)  # Using validated parameters
@@ -4964,7 +5001,125 @@ class TwitterScraper:
         except Exception as e:
             self.logger.error(f"❌ Likes scraping failed: {e}")
             return likes
-    
+
+    async def _scrape_user_reposts(self, username: str, max_reposts: int) -> List[Dict[str, Any]]:
+        """Scrape user's reposts/retweets."""
+        reposts = []
+        try:
+            # Navigate to user's profile with replies to find retweets
+            # Retweets are typically shown on the main profile page or in with_replies
+            profile_url = f"https://x.com/{username}/with_replies"
+            await self.page.goto(profile_url, wait_until='domcontentloaded', timeout=30000)
+            await self._human_delay(3, 5)
+
+            # Check if profile is accessible
+            page_content = await self.page.content()
+            if any(restriction in page_content.lower() for restriction in [
+                'account suspended', 'account doesn\'t exist', 'private account',
+                'blocked', 'not authorized'
+            ]):
+                self.logger.warning(f"⚠️ Profile @{username} is restricted or protected")
+                return [{
+                    'type': 'access_restricted',
+                    'message': f'Profile @{username} is not publicly accessible',
+                    'reason': 'protected_or_restricted_account'
+                }]
+
+            # Wait for basic page structure
+            await self.page.wait_for_selector('div', timeout=20000)
+
+            scroll_attempts = 0
+            max_scrolls = min(max_reposts // 3, 15)  # More scrolls as reposts may be sparse
+
+            date_threshold_reached = False
+            while len(reposts) < max_reposts and scroll_attempts < max_scrolls and not date_threshold_reached:
+                # Look for retweet indicators in tweet elements
+                tweet_selectors = [
+                    'article[data-testid="tweet"]',
+                    'article[role="article"]',
+                    'div[data-testid="cellInnerDiv"]'
+                ]
+
+                tweet_elements = []
+                for selector in tweet_selectors:
+                    try:
+                        elements = await self.page.locator(selector).all()
+                        if elements:
+                            tweet_elements = elements
+                            break
+                    except:
+                        continue
+
+                for i, tweet_element in enumerate(tweet_elements):
+                    if len(reposts) >= max_reposts:
+                        break
+
+                    try:
+                        # Check for retweet indicators
+                        element_text = await tweet_element.inner_text()
+
+                        # Look for retweet patterns
+                        retweet_indicators = [
+                            f"{username} reposted",
+                            f"@{username} reposted",
+                            "reposted",
+                            "Retweeted"
+                        ]
+
+                        is_repost = False
+                        for indicator in retweet_indicators:
+                            if indicator.lower() in element_text.lower():
+                                is_repost = True
+                                break
+
+                        # Also check for repost icon/button elements
+                        if not is_repost:
+                            try:
+                                repost_icons = await tweet_element.locator('[data-testid="retweet"], [aria-label*="repost"], [aria-label*="retweet"]').all()
+                                if repost_icons:
+                                    is_repost = True
+                            except:
+                                pass
+
+                        if is_repost:
+                            tweet_data = await self._extract_tweet_from_element(tweet_element, i, username, False)
+                            if tweet_data:
+                                # Mark as repost and add additional metadata
+                                tweet_data['type'] = 'repost'
+                                tweet_data['reposted_by'] = username
+                                tweet_data['extraction_method'] = 'repost_detection'
+
+                                # Apply date filtering if enabled
+                                if self.enable_date_filtering:
+                                    if self.is_tweet_within_date_range(tweet_data):
+                                        reposts.append(tweet_data)
+                                        self.logger.debug(f"🔄 ✅ Repost {len(reposts)} (within date range)")
+                                    else:
+                                        self.logger.debug(f"🔄 ⏭️ Skipped repost (outside date range)")
+
+                                    if self.should_stop_extraction(tweet_data):
+                                        self.logger.info(f"⏹️ Stopping reposts extraction - reached date threshold")
+                                        date_threshold_reached = True
+                                        break
+                                else:
+                                    reposts.append(tweet_data)
+
+                    except Exception as e:
+                        self.logger.debug(f"Error processing potential repost element: {e}")
+                        continue
+
+                if len(reposts) < max_reposts and not date_threshold_reached:
+                    await self.page.mouse.wheel(0, 800)
+                    await self._human_delay(2, 4)
+                    scroll_attempts += 1
+
+            self.logger.info(f"🔄 Extracted {len(reposts)} reposts")
+            return reposts[:max_reposts]
+
+        except Exception as e:
+            self.logger.error(f"❌ Reposts scraping failed: {e}")
+            return reposts
+
     async def _scrape_user_mentions(self, username: str, max_mentions: int) -> List[Dict[str, Any]]:
         """Scrape tweets that mention the user."""
         mentions = []
