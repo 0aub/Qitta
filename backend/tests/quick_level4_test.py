@@ -109,6 +109,18 @@ def test_level4():
                     print(f"   📝 Sample Method: {sample_post.get('extraction_method', 'N/A')}")
                     print(f"   📝 Sample Confidence: {sample_post.get('validation_confidence', 'N/A')}")
 
+                # Check for NEW comprehensive data types
+                print(f"\\n🔍 COMPREHENSIVE DATA CHECK:")
+                reposts = first_item.get('reposts', [])
+                followers = first_item.get('followers', [])
+                following = first_item.get('following', [])
+                media = first_item.get('media', [])
+
+                print(f"   Reposts: {len(reposts)} items {'✅' if len(reposts) > 0 else '❌'}")
+                print(f"   Followers: {len(followers)} items {'✅' if len(followers) > 0 else '❌'}")
+                print(f"   Following: {len(following)} items {'✅' if len(following) > 0 else '❌'}")
+                print(f"   Media: {len(media)} items {'✅' if len(media) > 0 else '❌'}")
+
             else:
                 print(f"   ❌ Unexpected data structure")
         else:
