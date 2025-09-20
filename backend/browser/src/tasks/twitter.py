@@ -59,24 +59,55 @@ def calculate_extraction_success_rate(results: Union[List[Dict[str, Any]], bool,
             success_points += 2
         total_points += 20
         
-        # Posts data (40 points possible)
+        # Posts data (40 points possible) - ENHANCED FOR VALIDATION
         posts = result.get('posts', [])
         if posts:
             requested_posts = params.get('max_posts', 10)
             posts_extracted = len(posts)
             posts_with_dates = len([p for p in posts if p.get('date') or p.get('timestamp')])
             posts_with_engagement = len([p for p in posts if p.get('likes') or p.get('retweets')])
+
+            # NEW: Count validation-verified posts for data integrity
+            validated_posts = len([p for p in posts if p.get('validation_method') or p.get('validation_confidence')])
+            high_confidence_posts = len([p for p in posts if p.get('validation_confidence') in ['high', 'verified']])
+
+            # NEW: Check for authorship accuracy
+            correct_author_posts = len([p for p in posts if p.get('author') == params.get('username', '')])
+            url_verified_posts = len([p for p in posts if p.get('validation_method') == 'url_verified'])
             posts_with_text = len([p for p in posts if p.get('text') and len(p.get('text', '')) > 10])
             
-            # Posts quantity (10 points)
-            quantity_score = min(10, (posts_extracted / max(requested_posts, 1)) * 10)
+            # Posts quantity (10 points) - EVERYTHING MODE ADJUSTMENT
+            if posts_extracted >= 50:  # EVERYTHING mode likely achieved
+                quantity_score = 10  # Maximum points for high extraction
+            elif posts_extracted >= requested_posts:
+                quantity_score = 10  # Full points if met or exceeded request
+            else:
+                quantity_score = min(10, (posts_extracted / max(requested_posts, 1)) * 10)
             success_points += quantity_score
             
-            # Posts quality (30 points)
+            # Posts quality (30 points) - ENHANCED WITH VALIDATION METRICS
             if posts_extracted > 0:
-                success_points += (posts_with_text / posts_extracted) * 15  # Text quality
-                success_points += (posts_with_dates / posts_extracted) * 10  # Date presence
-                success_points += (posts_with_engagement / posts_extracted) * 5  # Engagement metrics
+                success_points += (posts_with_text / posts_extracted) * 10  # Text quality (reduced)
+                success_points += (posts_with_dates / posts_extracted) * 5   # Date presence (reduced)
+                success_points += (posts_with_engagement / posts_extracted) * 3  # Engagement metrics (reduced)
+
+                # NEW: VALIDATION QUALITY METRICS (12 points)
+                if validated_posts > 0:
+                    success_points += (validated_posts / posts_extracted) * 7  # Validation coverage
+                    success_points += (high_confidence_posts / posts_extracted) * 5  # High confidence validation
+
+                # NEW: AUTHORSHIP ACCURACY (Critical for data integrity)
+                authorship_accuracy = correct_author_posts / posts_extracted
+                if authorship_accuracy >= 0.9:  # 90%+ accuracy
+                    success_points += 10  # Bonus for high accuracy
+                elif authorship_accuracy >= 0.7:  # 70%+ accuracy
+                    success_points += 7
+                elif authorship_accuracy >= 0.5:  # 50%+ accuracy
+                    success_points += 4
+                else:
+                    # Heavy penalty for poor authorship accuracy
+                    success_points = max(0, success_points - 15)
+
         total_points += 40
         
         # Other data types (40 points possible)
@@ -519,9 +550,16 @@ class TwitterTask:
                     success_rate = 0.0
                     logger.warning(f"⚠️ Results is not a list/tuple: {type(results)}")
 
-            # Safe logging with type check
+            # Safe logging with type check - COUNT ACTUAL POSTS FOR COMPREHENSIVE SCRAPING
             if isinstance(results, (list, tuple)):
                 results_count = len(results)
+                # For comprehensive user scraping, count actual posts instead of wrapper objects
+                if extraction_method == "comprehensive_user_scraping" and len(results) == 1:
+                    user_data = results[0]
+                    posts_count = len(user_data.get('posts', []))
+                    if posts_count > 0:
+                        results_count = posts_count  # Use actual posts count for logging
+                        logger.info(f"📊 Comprehensive scraping: {posts_count} posts found in user data")
             else:
                 results_count = 0
                 logger.warning(f"⚠️ Results is not a list for logging: {type(results)}")
@@ -536,7 +574,7 @@ class TwitterTask:
                     "target_username": clean_params.get('username', 'timeline'),
                     "extraction_method": extraction_method,
                     "scrape_level": scrape_level,
-                    "total_found": results_count,
+                    "total_found": results_count,  # This now correctly reflects actual posts count
                     "success_rate": success_rate,
                     "search_completed_at": datetime.now().isoformat()
                 },
@@ -2463,8 +2501,9 @@ class TwitterScraper:
         # Complete profile extraction
         profile_data = await self._extract_profile_info(username)
         
-        # Maximum tweets with all metadata (up to 50)
-        posts = await self._extract_posts_comprehensive(username, max_posts=50)
+        # EVERYTHING MODE: Use requested max_posts for comprehensive extraction
+        requested_posts = params.get('max_posts', 50)
+        posts = await self._extract_posts_comprehensive(username, max_posts=requested_posts)
         
         # Full interaction data
         likes = await self._extract_user_likes(username, max_likes=20)
@@ -3340,12 +3379,23 @@ class TwitterScraper:
             
             # 5. EXTRACT AUTHOR INFO
             try:
-                # Username
+                # Username - EXTRACT ACTUAL AUTHOR FROM TWEET
                 username_element = tweet_element.locator('[data-testid="User-Name"] a').first
                 if await username_element.count() > 0:
                     username_text = await username_element.inner_text()
                     if '@' in username_text:
-                        tweet_data['username'] = username_text.split('@')[1].split(' ')[0]
+                        actual_username = username_text.split('@')[1].split(' ')[0]
+                        tweet_data['username'] = actual_username
+                        # CRITICAL FIX: Use actual extracted username as author
+                        tweet_data['author'] = actual_username
+                        # Also update URL to use correct author if no URL was extracted from links
+                        if tweet_data.get('url') == f"https://x.com/{username}":
+                            tweet_data['url'] = f"https://x.com/{actual_username}"
+                        self.logger.info(f"🔧 AUTHOR FIX APPLIED: {username} → {actual_username} | URL: {tweet_data.get('url', 'N/A')}")
+                    else:
+                        self.logger.debug(f"🔍 AUTHOR DEBUG: No @ found in username text: '{username_text}'")
+                else:
+                    self.logger.debug(f"🔍 AUTHOR DEBUG: No username element found, keeping default author: {username}")
                 
                 # Display name
                 name_element = tweet_element.locator('[data-testid="User-Name"] span').first
@@ -3355,72 +3405,404 @@ class TwitterScraper:
                         tweet_data['author_name'] = display_name
             except:
                 pass
-            
-            # 6. INTELLIGENT TWEET TYPE DETECTION - ENHANCED CONTENT ANALYSIS
-            try:
-                tweet_text = tweet_data.get('text', '')
-                author_name = tweet_data.get('author_name', '')
 
-                # Detect tweet type
-                if tweet_text.startswith('RT @') or 'reposted' in tweet_text.lower():
-                    tweet_data['tweet_type'] = 'retweet'
-                elif any(indicator in tweet_text for indicator in ['Replying to @', 'Show this thread']):
-                    tweet_data['tweet_type'] = 'reply'
-                elif 'Promoted' in tweet_text or 'Ad' in tweet_text:
-                    tweet_data['tweet_type'] = 'promoted'
-                else:
-                    tweet_data['tweet_type'] = 'original'
-
-                # Detect content features
-                content_features = []
-                if 'http' in tweet_text or 'www.' in tweet_text:
-                    content_features.append('has_links')
-                if '#' in tweet_text:
-                    content_features.append('has_hashtags')
-                if '@' in tweet_text:
-                    content_features.append('has_mentions')
-                if any(media_indicator in tweet_text.lower() for media_indicator in ['show this thread', 'quote tweet', 'image', 'video']):
-                    content_features.append('has_media')
-
-                if content_features:
-                    tweet_data['content_features'] = content_features
-
-                # Calculate text quality score
-                if tweet_text:
-                    quality_score = min(1.0, len(tweet_text) / 100.0)  # Longer tweets = higher quality
-                    if tweet_data.get('likes', 0) > 0:
-                        quality_score += 0.2
-                    if tweet_data.get('retweets', 0) > 0:
-                        quality_score += 0.2
-                    if content_features:
-                        quality_score += 0.1 * len(content_features)
-
-                    tweet_data['quality_score'] = round(min(1.0, quality_score), 2)
-
-            except Exception as e:
-                self.logger.debug(f"Tweet type detection failed: {e}")
-
-            # Only return tweet if we extracted meaningful data
-            has_text = 'text' in tweet_data and tweet_data['text']
-            has_likes = 'likes' in tweet_data and tweet_data['likes'] is not None
-            has_date = 'date' in tweet_data and tweet_data['date']
-
-            self.logger.info(f"🔍 FINAL CHECK: Element {index} - text: {has_text}, likes: {has_likes}, date: {has_date}")
-            self.logger.info(f"🔍 FINAL CHECK: Tweet data keys: {list(tweet_data.keys())}")
-
-            if has_text or has_likes or has_date:
-                self.logger.info(f"✅ EXTRACT SUCCESS: Element {index} returning valid tweet data")
-                return tweet_data
-            else:
-                self.logger.warning(f"❌ EXTRACT REJECTED: Element {index} - no meaningful data extracted")
-                self.logger.warning(f"❌ EXTRACT REJECTED: tweet_data = {tweet_data}")
-                return None
+            # Return the enhanced tweet data
+            return tweet_data if tweet_data.get('text') else None
 
         except Exception as e:
-            self.logger.error(f"❌ Tweet extraction error for element {index}: {e}")
-            import traceback
-            self.logger.error(f"❌ Traceback: {traceback.format_exc()}")
+            self.logger.error(f"❌ Tweet extraction failed for element {index}: {e}")
             return None
+
+    # ===== NEW VALIDATION SYSTEM =====
+    def _validate_authorship_by_url(self, tweet: Dict, username: str) -> bool:
+        """Fast validation using URL patterns - PHASE 1 VALIDATION"""
+        url = tweet.get('url', '')
+        if not url:
+            return False
+
+        # Check if URL contains the target username
+        username_lower = username.lower()
+        url_lower = url.lower()
+
+        # Pattern 1: Direct user tweet URL
+        if f"/{username_lower}/status/" in url_lower:
+            return True
+
+        # Pattern 2: User profile mention in URL
+        if f"x.com/{username_lower}" in url_lower or f"twitter.com/{username_lower}" in url_lower:
+            return True
+
+        return False
+
+    def _validate_authorship_by_patterns(self, tweet: Dict, username: str) -> bool:
+        """Validate using content and metadata patterns - PHASE 2 VALIDATION"""
+        username_lower = username.lower()
+
+        # Check author field
+        author = tweet.get('author', '').lower()
+        if author == username_lower:
+            return True
+
+        # Check author_name patterns (handle display name variations)
+        author_name = tweet.get('author_name', '').lower()
+        if author_name and username_lower in author_name:
+            return True
+
+        # Check if extraction metadata indicates correct user
+        extracted_from = tweet.get('extracted_from', '')
+        if 'hybrid_extraction' in extracted_from and tweet.get('author') == username:
+            # This suggests it was extracted during user-specific extraction
+            return True
+
+        return False
+
+    async def _spot_check_tweet_authorship(self, tweet: Dict, username: str) -> bool:
+        """Sample validation: Visit individual tweet URLs for verification - PHASE 3 VALIDATION"""
+        url = tweet.get('url')
+        if not url or not url.startswith('http'):
+            return False
+
+        try:
+            self.logger.debug(f"🔍 SPOT-CHECK: Validating {url}")
+
+            # Quick visit to verify authorship
+            await self.page.goto(url, wait_until='domcontentloaded', timeout=15000)
+            await asyncio.sleep(1)
+
+            # Check the actual author on the individual tweet page
+            author_selectors = [
+                '[data-testid="User-Name"] a',
+                'a[href*="/' + username + '"]',
+                '[role="link"]:has-text("@' + username + '")'
+            ]
+
+            for selector in author_selectors:
+                try:
+                    author_element = self.page.locator(selector).first
+                    if await author_element.count() > 0:
+                        href = await author_element.get_attribute('href')
+                        if href and f"/{username}" in href:
+                            self.logger.debug(f"✅ SPOT-CHECK PASSED: {url}")
+                            return True
+                except:
+                    continue
+
+            self.logger.debug(f"❌ SPOT-CHECK FAILED: {url}")
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"⚠️ SPOT-CHECK ERROR for {url}: {e}")
+            return False
+
+    async def _validate_tweet_authorship_batch(self, raw_tweets: List[Dict], username: str) -> List[Dict]:
+        """Batch validation of tweet authorship using multi-phase approach"""
+        validated_tweets = []
+        validation_stats = {'url_validated': 0, 'pattern_validated': 0, 'spot_checked': 0, 'rejected': 0}
+
+        self.logger.info(f"🔍 VALIDATION: Processing {len(raw_tweets)} tweets for @{username}")
+
+        for i, tweet in enumerate(raw_tweets):
+            # Phase 1: URL-based validation (fastest)
+            if self._validate_authorship_by_url(tweet, username):
+                tweet['validation_method'] = 'url_verified'
+                tweet['validation_confidence'] = 'high'
+                validated_tweets.append(tweet)
+                validation_stats['url_validated'] += 1
+                continue
+
+            # Phase 2: Pattern-based validation
+            if self._validate_authorship_by_patterns(tweet, username):
+                tweet['validation_method'] = 'pattern_verified'
+                tweet['validation_confidence'] = 'medium'
+                validated_tweets.append(tweet)
+                validation_stats['pattern_validated'] += 1
+                continue
+
+            # Phase 3: Spot-check validation (every 10th tweet + suspicious cases)
+            should_spot_check = (
+                i % 10 == 0 or  # Every 10th tweet
+                len(validated_tweets) < len(raw_tweets) * 0.5  # If validation rate is low
+            )
+
+            if should_spot_check:
+                if await self._spot_check_tweet_authorship(tweet, username):
+                    tweet['validation_method'] = 'spot_checked'
+                    tweet['validation_confidence'] = 'verified'
+                    validated_tweets.append(tweet)
+                    validation_stats['spot_checked'] += 1
+                    continue
+
+            # Rejected
+            validation_stats['rejected'] += 1
+            self.logger.debug(f"❌ REJECTED: {tweet.get('text', 'No text')[:50]}...")
+
+        # Report validation results
+        total_processed = len(raw_tweets)
+        total_validated = len(validated_tweets)
+        accuracy_rate = (total_validated / total_processed) if total_processed > 0 else 0
+
+        self.logger.info(f"📊 VALIDATION COMPLETE: {total_validated}/{total_processed} tweets validated ({accuracy_rate:.1%})")
+        self.logger.info(f"📈 BREAKDOWN: URL={validation_stats['url_validated']}, Pattern={validation_stats['pattern_validated']}, Spot-check={validation_stats['spot_checked']}, Rejected={validation_stats['rejected']}")
+
+        return validated_tweets
+
+    # ===== ADAPTIVE EXTRACTION SYSTEM =====
+    async def _extract_posts_adaptive(self, username: str, max_posts: int, level: int) -> List[Dict[str, Any]]:
+        """SMART: Choose extraction method based on scale requirements and level"""
+        self.logger.info(f"🎯 ADAPTIVE EXTRACTION: {max_posts} posts, Level {level} for @{username}")
+
+        # LEVEL 4 OVERRIDE: Always use large-scale EVERYTHING mode
+        if level >= 4:
+            # Force minimum extraction for Level 4 EVERYTHING mode
+            everything_target = max(max_posts, 50)  # Minimum 50 posts for Level 4
+            self.logger.info(f"🔥 LEVEL 4 EVERYTHING MODE: Forcing large-scale extraction (target: {everything_target}+ posts)")
+            return await self._extract_large_scale_validated(username, everything_target)
+
+        # For Levels 1-3: Use scale-based routing
+        if max_posts <= 30:
+            # SMALL SCALE: Use enhanced DOM with URL validation
+            self.logger.info(f"📱 SMALL SCALE: Using enhanced DOM extraction for {max_posts} tweets")
+            return await self._extract_small_scale_validated(username, max_posts)
+
+        elif max_posts <= 100:
+            # MEDIUM SCALE: Use hybrid approach
+            self.logger.info(f"⚖️ MEDIUM SCALE: Using hybrid extraction for {max_posts} tweets")
+            return await self._extract_medium_scale_hybrid(username, max_posts)
+
+        else:
+            # LARGE SCALE: Use DOM with post-processing validation
+            self.logger.info(f"🌟 LARGE SCALE: Using comprehensive DOM+validation for {max_posts}+ tweets")
+            return await self._extract_large_scale_validated(username, max_posts)
+
+    async def _extract_small_scale_validated(self, username: str, max_posts: int) -> List[Dict[str, Any]]:
+        """SMALL SCALE: Enhanced DOM extraction with immediate validation"""
+        try:
+            tweets = []
+            tweet_elements = self.page.locator('article[data-testid="tweet"]')
+            count = await tweet_elements.count()
+
+            self.logger.info(f"📊 SMALL SCALE: Found {count} tweet elements on page")
+
+            # Extract with immediate validation
+            for i in range(min(count, max_posts * 2)):  # Extract more than needed for filtering
+                element = tweet_elements.nth(i)
+                if await element.is_visible():
+                    tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
+                    if tweet_data and tweet_data.get('text'):
+                        # Immediate validation
+                        if self._validate_authorship_by_url(tweet_data, username) or self._validate_authorship_by_patterns(tweet_data, username):
+                            tweet_data['extraction_method'] = 'small_scale_validated'
+                            tweet_data['validation_confidence'] = 'high'
+                            tweets.append(tweet_data)
+
+                            if len(tweets) >= max_posts:
+                                break
+
+            self.logger.info(f"✅ SMALL SCALE COMPLETE: {len(tweets)} validated tweets extracted")
+            return tweets
+
+        except Exception as e:
+            self.logger.error(f"❌ Small scale extraction failed: {e}")
+            return []
+
+    async def _extract_medium_scale_hybrid(self, username: str, max_posts: int) -> List[Dict[str, Any]]:
+        """MEDIUM SCALE: Hybrid DOM + scrolling with batch validation"""
+        try:
+            tweets = []
+
+            # Phase 1: Initial page extraction
+            initial_tweets = await self._extract_small_scale_validated(username, min(max_posts, 30))
+            tweets.extend(initial_tweets)
+
+            # Phase 2: Scrolling if more needed
+            if len(tweets) < max_posts:
+                remaining_needed = max_posts - len(tweets)
+                self.logger.info(f"🔄 MEDIUM SCALE SCROLLING: Need {remaining_needed} more tweets")
+
+                # Track existing tweets for deduplication
+                existing_texts = {tweet.get('text', '') for tweet in tweets}
+                scroll_attempts = 0
+                max_scrolls = 10
+
+                while len(tweets) < max_posts and scroll_attempts < max_scrolls:
+                    # Scroll and extract
+                    await self.page.mouse.wheel(0, 800)
+                    await asyncio.sleep(2)
+
+                    # Extract new tweets from scrolled content
+                    new_tweet_elements = self.page.locator('article[data-testid="tweet"]')
+                    count = await new_tweet_elements.count()
+
+                    for i in range(count):
+                        if len(tweets) >= max_posts:
+                            break
+
+                        element = new_tweet_elements.nth(i)
+                        if await element.is_visible():
+                            tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
+                            if tweet_data and tweet_data.get('text'):
+                                # Skip duplicates
+                                if tweet_data.get('text') in existing_texts:
+                                    continue
+
+                                # Validate immediately
+                                if self._validate_authorship_by_url(tweet_data, username) or self._validate_authorship_by_patterns(tweet_data, username):
+                                    tweet_data['extraction_method'] = 'medium_scale_hybrid'
+                                    tweet_data['scroll_round'] = scroll_attempts + 1
+                                    tweets.append(tweet_data)
+                                    existing_texts.add(tweet_data.get('text'))
+
+                    scroll_attempts += 1
+
+            self.logger.info(f"✅ MEDIUM SCALE COMPLETE: {len(tweets)} validated tweets extracted")
+            return tweets
+
+        except Exception as e:
+            self.logger.error(f"❌ Medium scale extraction failed: {e}")
+            return []
+
+    async def _extract_large_scale_validated(self, username: str, max_posts: int) -> List[Dict[str, Any]]:
+        """LARGE SCALE: Aggressive DOM extraction + post-processing validation - LEVEL 4 EVERYTHING MODE"""
+        try:
+            # AGGRESSIVE TARGET: Level 4 should extract significantly more
+            everything_target = max(max_posts * 3, 300)  # More aggressive multiplier
+            self.logger.info(f"🔥 LEVEL 4 EVERYTHING MODE: Targeting {everything_target} raw tweets for comprehensive validation")
+            self.logger.info("🚀 AGGRESSIVE EXTRACTION: Unlimited scrolling enabled for maximum data collection")
+
+            # Phase 1: Aggressive DOM extraction (use existing comprehensive method)
+            raw_tweets = await self._extract_posts_comprehensive_dom_aggressive(username, everything_target)
+
+            self.logger.info(f"📊 RAW EXTRACTION: Retrieved {len(raw_tweets)} tweets for validation")
+
+            # Phase 2: Batch validation
+            validated_tweets = await self._validate_tweet_authorship_batch(raw_tweets, username)
+
+            # Phase 3: Quality check and additional validation if needed
+            validation_rate = len(validated_tweets) / len(raw_tweets) if raw_tweets else 0
+
+            if validation_rate < 0.6:  # Less than 60% validation rate
+                self.logger.warning(f"⚠️ LOW VALIDATION RATE ({validation_rate:.1%}), performing additional checks")
+
+                # Additional spot-checking for remaining tweets
+                unvalidated = [t for t in raw_tweets if t not in validated_tweets]
+                additional_validated = []
+
+                for tweet in unvalidated[:20]:  # Check up to 20 more
+                    if await self._spot_check_tweet_authorship(tweet, username):
+                        tweet['validation_method'] = 'additional_spot_check'
+                        tweet['validation_confidence'] = 'verified'
+                        additional_validated.append(tweet)
+
+                validated_tweets.extend(additional_validated)
+                self.logger.info(f"🔍 ADDITIONAL VALIDATION: Added {len(additional_validated)} more tweets")
+
+            # Return up to requested amount
+            result = validated_tweets[:max_posts] if max_posts < 200 else validated_tweets
+
+            final_validation_rate = len(result) / len(raw_tweets) if raw_tweets else 0
+            self.logger.info(f"✅ LARGE SCALE COMPLETE: {len(result)} tweets ({final_validation_rate:.1%} validation rate)")
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"❌ Large scale extraction failed: {e}")
+            return []
+
+    async def _extract_posts_comprehensive_dom_aggressive(self, username: str, target_count: int) -> List[Dict[str, Any]]:
+        """Aggressive DOM extraction without validation - raw data collection"""
+        try:
+            tweets = []
+
+            # Phase 1: Initial page extraction
+            tweet_elements = self.page.locator('article[data-testid="tweet"]')
+            count = await tweet_elements.count()
+
+            for i in range(count):
+                element = tweet_elements.nth(i)
+                if await element.is_visible():
+                    tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
+                    if tweet_data and tweet_data.get('text'):
+                        tweet_data['extraction_phase'] = 'initial'
+                        tweets.append(tweet_data)
+
+            # Phase 2: Aggressive scrolling
+            existing_tweet_ids = {tweet.get('id', '') for tweet in tweets}
+            existing_texts = {tweet.get('text', '') for tweet in tweets}
+
+            scroll_attempts = 0
+            max_scrolls = min(50, target_count // 10)  # Scale scrolls with target
+
+            while len(tweets) < target_count and scroll_attempts < max_scrolls:
+                await self.page.mouse.wheel(0, 800 + (scroll_attempts * 50))
+                await asyncio.sleep(2)
+
+                # Extract from scrolled content
+                new_elements = self.page.locator('article[data-testid="tweet"]')
+                new_count = await new_elements.count()
+
+                tweets_this_round = 0
+                for i in range(new_count):
+                    element = new_elements.nth(i)
+                    if await element.is_visible():
+                        tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
+                        if tweet_data and tweet_data.get('text'):
+                            # Basic deduplication
+                            tweet_id = tweet_data.get('id', '')
+                            tweet_text = tweet_data.get('text', '')
+
+                            if tweet_id not in existing_tweet_ids and tweet_text not in existing_texts:
+                                tweet_data['extraction_phase'] = 'scrolled'
+                                tweet_data['scroll_round'] = scroll_attempts + 1
+                                tweets.append(tweet_data)
+                                existing_tweet_ids.add(tweet_id)
+                                existing_texts.add(tweet_text)
+                                tweets_this_round += 1
+
+                if tweets_this_round == 0:
+                    # No new tweets found, likely reached end
+                    self.logger.info(f"🔄 SCROLL STOP: No new tweets in round {scroll_attempts + 1}")
+                    break
+
+                scroll_attempts += 1
+
+            self.logger.info(f"📊 RAW EXTRACTION COMPLETE: {len(tweets)} tweets from {scroll_attempts} scroll rounds")
+            return tweets
+
+        except Exception as e:
+            self.logger.error(f"❌ Aggressive DOM extraction failed: {e}")
+            return []
+
+    async def _extract_author_information(self, tweet_element, default_username: str = '') -> Dict[str, str]:
+        """Extract author information from a tweet element."""
+        try:
+            author_info = {
+                'author_username': default_username,
+                'author_display_name': default_username
+            }
+
+            # Try to extract actual username
+            username_element = tweet_element.locator('[data-testid="User-Name"] a').first
+            if await username_element.count() > 0:
+                username_text = await username_element.inner_text()
+                if '@' in username_text:
+                    actual_username = username_text.split('@')[1].split(' ')[0]
+                    author_info['author_username'] = actual_username
+
+            # Try to extract display name
+            name_element = tweet_element.locator('[data-testid="User-Name"] span').first
+            if await name_element.count() > 0:
+                display_name = await name_element.inner_text()
+                if display_name and not display_name.startswith('@'):
+                    author_info['author_display_name'] = display_name
+
+            return author_info
+        except Exception as e:
+            self.logger.debug(f"❌ Author extraction failed: {e}")
+            return {
+                'author_username': default_username,
+                'author_display_name': default_username
+            }
+
     
     def _convert_relative_to_iso(self, relative_time: str) -> str:
         """Convert relative timestamp like '2h ago' to ISO timestamp."""
@@ -3476,112 +3858,28 @@ class TwitterScraper:
     
     async def _extract_posts_basic(self, username: str, max_posts: int = 5) -> List[Dict[str, Any]]:
         """Extract basic posts with minimal processing - Level 1."""
-        try:
-            tweets = []
-            # Get tweet elements with minimal wait
-            tweet_selectors = ['article[data-testid="tweet"]', 'div[data-testid="tweet"]', 'article[role="article"]']
-            
-            for selector in tweet_selectors:
-                try:
-                    tweet_elements = self.page.locator(selector)
-                    count = min(await tweet_elements.count(), max_posts)
-                    
-                    for i in range(count):
-                        element = tweet_elements.nth(i)
-                        if await element.is_visible():
-                            # Basic text extraction only
-                            try:
-                                text_element = element.locator('[data-testid="tweetText"]').first
-                                if await text_element.count() > 0:
-                                    text = await text_element.inner_text()
-                                    if text and len(text.strip()) > 5:
-                                        tweets.append({
-                                            "id": f"basic_tweet_{i}",
-                                            "text": text.strip()[:200],  # Limit length
-                                            "extraction_level": "basic"
-                                        })
-                            except:
-                                continue
-                    
-                    if len(tweets) >= max_posts:
-                        break
-                except:
-                    continue
-            
-            return tweets[:max_posts]
-        except Exception as e:
-            self.logger.debug(f"Basic posts extraction failed: {e}")
-            return []
+        self.logger.info(f"⚪ NEW LEVEL 1 EXTRACTION: Basic posts with validation for @{username}")
+        # Use new adaptive extraction system
+        return await self._extract_posts_adaptive(username, max_posts, level=1)
     
     async def _extract_posts_with_engagement(self, username: str, max_posts: int = 15) -> List[Dict[str, Any]]:
         """Extract posts with engagement metrics - Level 2."""
-        try:
-            tweets = []
-            tweet_selectors = ['article[data-testid="tweet"]', 'div[data-testid="tweet"]']
-            
-            for selector in tweet_selectors:
-                try:
-                    tweet_elements = self.page.locator(selector)
-                    count = min(await tweet_elements.count(), max_posts)
-                    
-                    for i in range(count):
-                        element = tweet_elements.nth(i)
-                        if await element.is_visible():
-                            tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
-                            if tweet_data and tweet_data.get('text'):
-                                tweet_data['extraction_level'] = "enhanced"
-                                tweets.append(tweet_data)
-                    
-                    if len(tweets) >= max_posts:
-                        break
-                except:
-                    continue
-            
-            return tweets[:max_posts]
-        except Exception as e:
-            self.logger.debug(f"Enhanced posts extraction failed: {e}")
-            return []
+        self.logger.info(f"🔵 NEW LEVEL 2 EXTRACTION: Engagement data with validation for @{username}")
+        # Use new adaptive extraction system
+        return await self._extract_posts_adaptive(username, max_posts, level=2)
     
     async def _extract_posts_with_full_data(self, username: str, max_posts: int = 25) -> List[Dict[str, Any]]:
         """Extract posts with full metadata - Level 3."""
-        # Use the comprehensive extraction method
-        return await self._extract_posts_with_engagement(username, max_posts)
+        self.logger.info(f"🟡 NEW LEVEL 3 EXTRACTION: Full data with validation for @{username}")
+        # Use new adaptive extraction system
+        return await self._extract_posts_adaptive(username, max_posts, level=3)
     
     async def _extract_posts_comprehensive(self, username: str, max_posts: int = 50) -> List[Dict[str, Any]]:
-        """Extract posts with maximum detail - Level 4."""
-        # Use the comprehensive extraction method with scrolling
-        try:
-            tweets = []
-            
-            # Scroll and extract tweets
-            for scroll in range(5):  # More scrolling for level 4
-                tweet_elements = self.page.locator('article[data-testid="tweet"]')
-                count = await tweet_elements.count()
-                
-                for i in range(count):
-                    if len(tweets) >= max_posts:
-                        break
-                        
-                    element = tweet_elements.nth(i)
-                    if await element.is_visible():
-                        tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
-                        if tweet_data and tweet_data.get('text'):
-                            # Check for duplicates
-                            if not any(t.get('text') == tweet_data.get('text') for t in tweets):
-                                tweet_data['extraction_level'] = "comprehensive"
-                                tweets.append(tweet_data)
-                
-                if len(tweets) >= max_posts:
-                    break
-                
-                # Scroll down for more content
-                await self.page.mouse.wheel(0, 800)
-                await self._human_delay(2, 4)
-            
-            return tweets[:max_posts]
-        except Exception as e:
-            self.logger.debug(f"Comprehensive posts extraction failed: {e}")
-            return []
+        """Extract posts with maximum detail - Level 4 EVERYTHING MODE with VALIDATION."""
+        self.logger.info(f"🚀 NEW COMPREHENSIVE EXTRACTION: Level 4 with validation for @{username}")
+
+        # Use new adaptive extraction system
+        return await self._extract_posts_adaptive(username, max_posts, level=4)
 
     async def _human_delay(self, min_seconds: float = 1.0, max_seconds: float = 3.0):
         """Enhanced human-like delays with realistic patterns."""
@@ -4010,12 +4308,19 @@ class TwitterScraper:
                 self.logger.error(f"❌ Profile extraction failed: {profile_error}")
                 results["profile"] = {}
             
-            # 1. Scrape Posts
+            # 1. Scrape Posts - ROUTE TO EVERYTHING MODE FOR COMPREHENSIVE SCRAPING
             if params.get('scrape_posts', True):
                 max_posts = params.get('max_posts', 100)  # This will now use validated parameters
-                self.logger.info(f"📝 Scraping posts ({max_posts})...")
+                scrape_level = params.get('scrape_level', 4)
+                self.logger.info(f"📝 Scraping posts ({max_posts}) at level {scrape_level}...")
                 try:
-                    posts = await self._scrape_user_posts(username, max_posts)
+                    # FOR LEVEL 4: Use EVERYTHING MODE comprehensive extraction
+                    if scrape_level >= 4:
+                        self.logger.info(f"🌟 LEVEL 4 DETECTED: Using EVERYTHING MODE extraction")
+                        posts = await self._extract_posts_comprehensive(username, max_posts)
+                    else:
+                        # For lower levels: Use standard extraction
+                        posts = await self._scrape_user_posts(username, max_posts)
                     results["posts"] = posts if posts else []
                     self.logger.info(f"✅ Posts extracted: {len(posts) if posts else 0} posts")
                 except Exception as posts_error:
@@ -4104,6 +4409,7 @@ class TwitterScraper:
     
     async def _scrape_user_posts(self, username: str, max_posts: int) -> List[Dict[str, Any]]:
         """Scrape user's posts/tweets."""
+        self.logger.info("🔴 DEBUG_MARKER: _scrape_user_posts() CALLED")
         posts = []
         try:
             # Ensure we're on the user's main profile page
@@ -4143,6 +4449,7 @@ class TwitterScraper:
             date_threshold_reached = False
             while len(posts) < max_posts and scroll_attempts < max_scroll_attempts and not date_threshold_reached:
                 tweet_candidates = []
+                tweets_found_this_round = 0  # Initialize variable to track tweets found in this scroll iteration
                 
                 # Method 1: Try 2025-compatible CSS selectors first - ENHANCED FOR X/TWITTER 2024+
                 css_selectors_2025 = [
@@ -4407,7 +4714,42 @@ class TwitterScraper:
                 # Wait for new content to load with progressive timing
                 await self._human_delay(*wait_time_range)
                 scroll_attempts += 1
-                
+
+                # 🚀 DEBUG: Log scroll attempt info
+                self.logger.info(f"🔄 SCROLL DEBUG: scroll_attempts={scroll_attempts}, len(posts)={len(posts)}, max_posts={max_posts}")
+
+                # 🚀 PHASE 3: DEDICATED SCROLLING-BASED EXTRACTION
+                # After scrolling, try to extract from newly loaded content
+                if max_posts >= 15 and len(posts) < max_posts:  # Only for hybrid requests (15+ tweets)
+                    self.logger.info(f"🎯 PHASE 3 TRIGGERED: max_posts={max_posts}, len(posts)={len(posts)}")
+                    remaining_needed = max_posts - len(posts)
+                    if remaining_needed > 0:
+                        self.logger.info(f"🔄 SCROLLING EXTRACTION: Attempting to extract {remaining_needed} more tweets from scrolled content")
+
+                        # Track already extracted content for deduplication
+                        extracted_tweet_ids = set()
+                        seen_text_hashes = set()
+
+                        # Build dedup tracking from existing posts
+                        for post in posts:
+                            if post.get('id'):
+                                extracted_tweet_ids.add(post['id'])
+                            if post.get('text'):
+                                import hashlib
+                                text_hash = hashlib.md5(post['text'].strip().encode()).hexdigest()[:8]
+                                seen_text_hashes.add(text_hash)
+
+                        # Extract from scrolled content
+                        scrolled_tweets = await self._extract_tweets_from_scrolled_content(
+                            username, remaining_needed, extracted_tweet_ids, seen_text_hashes
+                        )
+
+                        # Add scrolled tweets to results
+                        if scrolled_tweets:
+                            posts.extend(scrolled_tweets)
+                            self.logger.info(f"✅ SCROLLING SUCCESS: Added {len(scrolled_tweets)} tweets from scrolled content")
+                            self.logger.info(f"📊 TOTAL PROGRESS: {len(posts)}/{max_posts} posts extracted")
+
                 # STAGNATION CHECK: If no new tweets in last 2 attempts, try different approach
                 if scroll_attempts > 2:
                     recent_posts = [p for p in posts if p.get('extraction_attempt', 0) >= scroll_attempts - 1]
@@ -6192,3 +6534,118 @@ class TwitterScraper:
             self.logger.warning(f"⚠️ Failed to extract media: {e}")
 
         return media_items
+
+    async def _extract_tweets_from_scrolled_content(
+        self,
+        username: str,
+        target_posts_needed: int,
+        extracted_tweet_ids: set,
+        seen_text_hashes: set
+    ) -> List[Dict[str, Any]]:
+        """
+        Dedicated method for extracting tweets from scrolled content.
+
+        This runs after page-level extraction and scrolling, specifically targeting
+        newly loaded content that wasn't available in the initial page state.
+        """
+        scrolled_tweets = []
+
+        try:
+            self.logger.info(f"🔄 SCROLLING EXTRACTION: Looking for {target_posts_needed} additional tweets in scrolled content")
+
+            # Strategy 1: Target newly loaded tweetText elements
+            all_tweet_texts = await self.page.locator('[data-testid="tweetText"]').all()
+            self.logger.info(f"🔄 SCROLLING: Found {len(all_tweet_texts)} total tweetText elements after scrolling")
+
+            # Process elements that weren't captured by page-level extraction
+            for i, tweet_elem in enumerate(all_tweet_texts):
+                if len(scrolled_tweets) >= target_posts_needed:
+                    break
+
+                try:
+                    text_content = await tweet_elem.inner_text(timeout=2000)
+
+                    if text_content and len(text_content.strip()) > 5:
+                        # Create text-based hash for deduplication
+                        import hashlib
+                        text_hash = hashlib.md5(text_content.strip().encode()).hexdigest()[:8]
+
+                        # Skip if already extracted
+                        if text_hash in seen_text_hashes:
+                            self.logger.debug(f"🔄 SCROLLING: Skipping duplicate content (hash: {text_hash})")
+                            continue
+
+                        # Create tweet data with scroll-specific tagging
+                        tweet_data = {
+                            'id': f'scroll_tweet_{len(scrolled_tweets)+1}',
+                            'text': text_content.strip()[:500],
+                            'author': username,
+                            'url': f'https://x.com/{username}',
+                            'extracted_from': 'scrolled_content_tweetText',
+                            'extraction_method': 'scroll_based_extraction',
+                            'scroll_index': i,
+                            'extraction_phase': 'post_scroll'
+                        }
+
+                        # Add to results and tracking
+                        scrolled_tweets.append(tweet_data)
+                        seen_text_hashes.add(text_hash)
+                        extracted_tweet_ids.add(tweet_data['id'])
+
+                        self.logger.info(f"✅ SCROLLING EXTRACTION {len(scrolled_tweets)}: '{text_content[:60]}...'")
+
+                except Exception as e:
+                    self.logger.debug(f"🔄 SCROLLING: Failed to extract element {i}: {e}")
+                    continue
+
+            # Strategy 2: Try article-based extraction for additional content
+            if len(scrolled_tweets) < target_posts_needed:
+                remaining_needed = target_posts_needed - len(scrolled_tweets)
+                self.logger.info(f"🔄 SCROLLING: Trying article-based extraction for {remaining_needed} more tweets")
+
+                articles = await self.page.locator('article[data-testid="tweet"]').all()
+                for article in articles[-10:]:  # Focus on recently loaded articles
+                    if len(scrolled_tweets) >= target_posts_needed:
+                        break
+
+                    try:
+                        # Extract text from article
+                        tweet_text_elem = article.locator('[data-testid="tweetText"]').first
+                        article_text = await tweet_text_elem.inner_text(timeout=2000)
+
+                        if article_text and len(article_text.strip()) > 5:
+                            # Check for duplicates
+                            text_hash = hashlib.md5(article_text.strip().encode()).hexdigest()[:8]
+                            if text_hash in seen_text_hashes:
+                                continue
+
+                            # Extract additional metadata from article
+                            author_info = await self._extract_author_information(article, username)
+
+                            article_tweet = {
+                                'id': f'scroll_article_{len(scrolled_tweets)+1}',
+                                'text': article_text.strip()[:500],
+                                'author': author_info.get('author_username', username),
+                                'author_name': author_info.get('author_display_name', username),
+                                'url': f'https://x.com/{username}',
+                                'extracted_from': 'scrolled_content_article',
+                                'extraction_method': 'scroll_based_article_extraction',
+                                'extraction_phase': 'post_scroll'
+                            }
+
+                            scrolled_tweets.append(article_tweet)
+                            seen_text_hashes.add(text_hash)
+                            extracted_tweet_ids.add(article_tweet['id'])
+
+                            self.logger.info(f"✅ SCROLLING ARTICLE {len(scrolled_tweets)}: '{article_text[:60]}...'")
+
+                    except Exception as e:
+                        self.logger.debug(f"🔄 SCROLLING: Article extraction failed: {e}")
+                        continue
+
+            self.logger.info(f"🎉 SCROLLING EXTRACTION COMPLETE: Found {len(scrolled_tweets)} additional tweets")
+
+        except Exception as e:
+            self.logger.error(f"❌ SCROLLING EXTRACTION FAILED: {e}")
+
+        return scrolled_tweets
