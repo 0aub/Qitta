@@ -37,13 +37,31 @@ from .runtime import BrowserRuntime
 from .exploration import PageExplorer
 
 # Import reliable infrastructure
-from .jobs import JobStore, JobManager, JobRecord, SubmitRequest
-from .workers import WorkerPool
-from .tasks import task_registry, normalise_task
-from .reliability import MetricsCollector, AlertManager, HealthMonitor, AlertSeverity
+from .reliable_jobs import ReliableJobStore, JobManager, ReliableJobRecord
+from .reliable_workers import ReliableWorkerPool
+from .task_adapter import reliable_task_registry
+
 
 # ----------------------------------------------------------------------------
-# Logging (kept in main as requested)
+# Enhanced Models
+# ----------------------------------------------------------------------------
+
+class EnhancedSubmitRequest(BaseModel):
+    """Enhanced job submission with reliability features."""
+
+    proxy: Optional[str] = None
+    user_agent: Optional[str] = None
+    headless: Optional[bool] = None
+    timeout_seconds: int = 300  # 5 minutes default
+    priority: int = 0  # Higher numbers = higher priority
+    max_retries: int = 3
+
+    class Config:
+        extra = "allow"
+
+
+# ----------------------------------------------------------------------------
+# Logging (enhanced for reliability)
 # ----------------------------------------------------------------------------
 
 def init_service_logger() -> logging.Logger:
@@ -99,31 +117,6 @@ JOB_DURATION = Histogram(
 )
 
 # ----------------------------------------------------------------------------
-# Pydantic models for exploration API
-# ----------------------------------------------------------------------------
-
-class PageStructureRequest(BaseModel):
-    url: str
-    wait_timeout: int = 10000
-
-class SelectorTestRequest(BaseModel):
-    url: str
-    selectors: List[str]
-    extract_text: bool = True
-    extract_attributes: bool = False
-    wait_timeout: int = 10000
-
-class DataExtractionRequest(BaseModel):
-    url: str
-    extraction_config: Dict[str, Any]
-    wait_timeout: int = 10000
-
-class BookingExploreRequest(BaseModel):
-    location: str = "Dubai"
-    check_in: str = "2025-12-01"
-    check_out: str = "2025-12-03"
-
-# ----------------------------------------------------------------------------
 # App + global runtime (reliable infrastructure)
 # ----------------------------------------------------------------------------
 
@@ -132,11 +125,8 @@ app = FastAPI(title="Reliable Browser Automation Service", version="2.0.0")
 # Global components
 job_manager: JobManager | None = None
 browser_runtime: BrowserRuntime | None = None
-worker_pool: WorkerPool | None = None
+worker_pool: ReliableWorkerPool | None = None
 page_explorer: PageExplorer | None = None
-metrics_collector: MetricsCollector | None = None
-alert_manager: AlertManager | None = None
-health_monitor: HealthMonitor | None = None
 
 
 @app.middleware("http")
@@ -178,7 +168,7 @@ async def healthz() -> Dict[str, str]:
 
     return {
         "status": "ok" if all_healthy else "degraded",
-        "components": str(components)
+        "components": components
     }
 
 
@@ -193,27 +183,13 @@ async def metrics():
 
 @app.get("/stats")
 async def get_stats():
-    """Get comprehensive system statistics with enhanced monitoring."""
+    """Get comprehensive system statistics."""
     if not job_manager or not worker_pool:
         raise HTTPException(status_code=503, detail="Service not fully initialized")
 
     try:
         job_stats = await job_manager.get_stats()
         worker_stats = worker_pool.get_stats()
-
-        # Calculate enhanced metrics
-        uptime_seconds = (
-            datetime.datetime.utcnow() - startup_time
-        ).total_seconds() if 'startup_time' in globals() else 0
-
-        # Health score calculation
-        health_score = 100.0
-        if health_monitor:
-            health_score = health_monitor.calculate_health_score(
-                worker_stats.get('workers', []),
-                job_stats,
-                {}  # Error stats would come from error handler
-            )
 
         return {
             "timestamp": datetime.datetime.utcnow().isoformat(),
@@ -222,14 +198,9 @@ async def get_stats():
             "service": {
                 "version": "2.0.0",
                 "mode": "reliable",
-                "uptime_seconds": uptime_seconds,
-                "health_score": health_score
-            },
-            "alerts": alert_manager.get_alert_summary() if alert_manager else {},
-            "monitoring": {
-                "enhanced_error_handling": True,
-                "circuit_breakers_enabled": True,
-                "health_monitoring": True
+                "uptime_seconds": (
+                    datetime.datetime.utcnow() - startup_time
+                ).total_seconds() if 'startup_time' in globals() else 0
             }
         }
     except Exception as e:
@@ -238,7 +209,7 @@ async def get_stats():
 
 
 @app.post("/jobs/{task_name}")
-async def submit_job(task_name: str, body: SubmitRequest, request: Request):
+async def submit_job(task_name: str, body: EnhancedSubmitRequest, request: Request):
     """Submit a job with enhanced reliability features."""
     global job_manager
 
@@ -249,8 +220,8 @@ async def submit_job(task_name: str, body: SubmitRequest, request: Request):
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     # Validate the task
-    task_name = normalise_task(task_name)
-    if task_name not in task_registry:
+    task_name = normalize_task_name(task_name)
+    if task_name not in reliable_task_registry:
         raise HTTPException(status_code=404, detail=f"Unknown task '{task_name}'")
 
     if not job_manager:
@@ -352,17 +323,39 @@ async def cancel_job(job_id: str):
 
 
 # ----------------------------------------------------------------------------
-# Page Exploration API Endpoints
+# Page Exploration API (maintained for compatibility)
 # ----------------------------------------------------------------------------
+
+class PageStructureRequest(BaseModel):
+    url: str
+    wait_timeout: int = 10000
+
+class SelectorTestRequest(BaseModel):
+    url: str
+    selectors: List[str]
+    extract_text: bool = True
+    extract_attributes: bool = False
+    wait_timeout: int = 10000
+
+class DataExtractionRequest(BaseModel):
+    url: str
+    extraction_config: Dict[str, Any]
+    wait_timeout: int = 10000
+
+class BookingExploreRequest(BaseModel):
+    location: str = "Dubai"
+    check_in: str = "2025-12-01"
+    check_out: str = "2025-12-03"
+
 
 @app.post("/explore/page-structure")
 async def explore_page_structure(request: PageStructureRequest):
     """Analyze the basic DOM structure and elements of a webpage."""
     global page_explorer
-    
+
     if not page_explorer:
         raise HTTPException(status_code=503, detail="Page explorer not initialized")
-    
+
     try:
         result = await page_explorer.analyze_page_structure(
             url=request.url,
@@ -378,10 +371,10 @@ async def explore_page_structure(request: PageStructureRequest):
 async def explore_selectors(request: SelectorTestRequest):
     """Test multiple selectors against a webpage and return what they find."""
     global page_explorer
-    
+
     if not page_explorer:
         raise HTTPException(status_code=503, detail="Page explorer not initialized")
-    
+
     try:
         result = await page_explorer.test_selectors(
             url=request.url,
@@ -400,10 +393,10 @@ async def explore_selectors(request: SelectorTestRequest):
 async def explore_data_extraction(request: DataExtractionRequest):
     """Debug data extraction with detailed logging and validation."""
     global page_explorer
-    
+
     if not page_explorer:
         raise HTTPException(status_code=503, detail="Page explorer not initialized")
-    
+
     try:
         result = await page_explorer.extract_data_debug(
             url=request.url,
@@ -420,10 +413,10 @@ async def explore_data_extraction(request: DataExtractionRequest):
 async def explore_booking_hotel(request: BookingExploreRequest):
     """Booking.com specific exploration to understand current page structure."""
     global page_explorer
-    
+
     if not page_explorer:
         raise HTTPException(status_code=503, detail="Page explorer not initialized")
-    
+
     try:
         result = await page_explorer.explore_booking_hotel(
             location=request.location,
@@ -437,21 +430,17 @@ async def explore_booking_hotel(request: BookingExploreRequest):
 
 
 # ----------------------------------------------------------------------------
-# Session Management Endpoints
+# Session Management (maintained for compatibility)
 # ----------------------------------------------------------------------------
 
 @app.post("/capture/twitter")
 async def capture_twitter_session():
-    """
-    Capture Twitter session by opening browser for user login.
-    
-    Returns session information and saves cookies to shared storage.
-    """
+    """Capture Twitter session by opening browser for user login."""
     global browser_runtime
-    
+
     if not browser_runtime:
         raise HTTPException(status_code=503, detail="Browser runtime not initialized")
-    
+
     try:
         from .session_capture import session_capture
         result = await session_capture.capture_session(browser_runtime.browser)
@@ -485,333 +474,38 @@ async def delete_session(filename: str):
 
 
 # ----------------------------------------------------------------------------
-# Enhanced Monitoring Endpoints (Phase 2.2)
+# Utility Functions
 # ----------------------------------------------------------------------------
 
-@app.get("/monitoring/alerts")
-async def get_alerts():
-    """Get active alerts and alert summary."""
-    if not alert_manager:
-        raise HTTPException(status_code=503, detail="Alert manager not initialized")
-
-    return {
-        "active_alerts": [alert.__dict__ for alert in alert_manager.get_active_alerts()],
-        "summary": alert_manager.get_alert_summary()
-    }
-
-@app.get("/monitoring/health")
-async def get_health_details():
-    """Get detailed health information."""
-    if not health_monitor:
-        raise HTTPException(status_code=503, detail="Health monitor not initialized")
-
-    try:
-        health_checks = await health_monitor.run_health_checks()
-
-        return {
-            "overall_score": health_monitor.last_health_score,
-            "health_checks": health_checks,
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        service_logger.error(f"Error getting health details: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving health details")
-
-@app.get("/monitoring/performance")
-async def get_performance_metrics():
-    """Get performance trend analysis."""
-    if not metrics_collector:
-        raise HTTPException(status_code=503, detail="Metrics collector not initialized")
-
-    # This would integrate with performance monitor
-    return {
-        "message": "Performance monitoring active",
-        "features": [
-            "Real-time throughput tracking",
-            "Response time monitoring",
-            "Resource usage analysis",
-            "Trend detection"
-        ]
-    }
-
-@app.post("/monitoring/test-alert")
-async def test_alert():
-    """Test alert system (for development)."""
-    if not alert_manager:
-        raise HTTPException(status_code=503, detail="Alert manager not initialized")
-
-    # Trigger a test alert
-    test_metrics = {"test_metric": 999}
-    alert_manager.check_alerts(test_metrics)
-
-    return {"message": "Test alert triggered if rules are configured"}
-
-@app.get("/monitoring/resources")
-async def get_resource_metrics():
-    """Get detailed resource utilization metrics."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    try:
-        # Get worker pool stats which now include resource optimization
-        worker_stats = worker_pool.get_stats()
-
-        return {
-            "timestamp": datetime.datetime.utcnow().isoformat(),
-            "resource_optimization": worker_stats.get("resource_optimization", {}),
-            "service_throttling": worker_stats.get("service_throttling", {}),
-            "scaling_status": {
-                "enabled": worker_stats.get("scaling_enabled", False),
-                "active": worker_stats.get("optimization_active", False),
-                "current_workers": worker_stats.get("worker_count", 0),
-                "max_workers": worker_stats.get("max_workers", 0)
-            }
-        }
-    except Exception as e:
-        service_logger.error(f"Error getting resource metrics: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving resource metrics")
-
-@app.post("/monitoring/scale")
-async def manual_scaling(action: str):
-    """Manual scaling control (for testing/emergencies)."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    if action not in ["up", "down"]:
-        raise HTTPException(status_code=400, detail="Action must be 'up' or 'down'")
-
-    try:
-        if action == "up":
-            await worker_pool._scale_up()
-            return {"message": "Scaling up worker pool"}
-        else:
-            await worker_pool._scale_down()
-            return {"message": "Scaling down worker pool"}
-    except Exception as e:
-        service_logger.error(f"Error in manual scaling: {e}")
-        raise HTTPException(status_code=500, detail=f"Scaling failed: {str(e)}")
+def normalize_task_name(name: str) -> str:
+    """Normalize task name with fallback variants."""
+    variants = [name, name.replace("_", "-"), name.replace("-", "_")]
+    for variant in variants:
+        if variant in reliable_task_registry:
+            return variant
+    return name
 
 
 # ----------------------------------------------------------------------------
-# Phase 2.4: Dead Letter Queue Endpoints
-# ----------------------------------------------------------------------------
-
-@app.get("/dlq/jobs")
-async def get_dead_letter_jobs(start: int = 0, count: int = 10):
-    """Get jobs from the dead letter queue."""
-    if not job_manager:
-        raise HTTPException(status_code=503, detail="Job manager not initialized")
-
-    try:
-        dlq_jobs = await job_manager.job_store.get_dead_letter_jobs(start, count)
-        return {
-            "dead_letter_jobs": dlq_jobs,
-            "start": start,
-            "count": len(dlq_jobs),
-            "requested_count": count
-        }
-    except Exception as e:
-        service_logger.error(f"Error retrieving dead letter jobs: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving dead letter jobs")
-
-@app.post("/dlq/replay/{job_id}")
-async def replay_dead_letter_job(job_id: str, reset_retries: bool = True):
-    """Replay a job from the dead letter queue."""
-    if not job_manager:
-        raise HTTPException(status_code=503, detail="Job manager not initialized")
-
-    try:
-        success = await job_manager.job_store.replay_dead_letter_job(job_id, reset_retries)
-        if success:
-            return {"message": f"Job {job_id} replayed successfully", "reset_retries": reset_retries}
-        else:
-            raise HTTPException(status_code=404, detail=f"Job {job_id} not found in dead letter queue")
-    except Exception as e:
-        service_logger.error(f"Error replaying dead letter job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error replaying job: {str(e)}")
-
-@app.get("/dlq/stats")
-async def get_dead_letter_stats():
-    """Get dead letter queue statistics."""
-    if not job_manager:
-        raise HTTPException(status_code=503, detail="Job manager not initialized")
-
-    try:
-        stats = await job_manager.job_store.get_dlq_stats()
-        return {"dead_letter_statistics": stats}
-    except Exception as e:
-        service_logger.error(f"Error retrieving dead letter stats: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving dead letter statistics")
-
-
-# ----------------------------------------------------------------------------
-# Phase 2.5: Circuit Breaker Endpoints
-# ----------------------------------------------------------------------------
-
-@app.get("/circuit-breakers")
-async def get_circuit_breakers():
-    """Get status of all circuit breakers."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    try:
-        metrics = worker_pool.circuit_breaker_manager.get_all_metrics()
-        summary = worker_pool.circuit_breaker_manager.get_summary()
-
-        return {
-            "circuit_breakers": metrics,
-            "summary": summary
-        }
-    except Exception as e:
-        service_logger.error(f"Error retrieving circuit breaker status: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving circuit breaker status")
-
-@app.post("/circuit-breakers/{breaker_name}/reset")
-async def reset_circuit_breaker(breaker_name: str):
-    """Reset a specific circuit breaker."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    try:
-        success = await worker_pool.circuit_breaker_manager.reset_breaker(breaker_name)
-        if success:
-            return {"message": f"Circuit breaker '{breaker_name}' reset successfully"}
-        else:
-            raise HTTPException(status_code=404, detail=f"Circuit breaker '{breaker_name}' not found")
-    except Exception as e:
-        service_logger.error(f"Error resetting circuit breaker {breaker_name}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error resetting circuit breaker: {str(e)}")
-
-@app.post("/circuit-breakers/reset-all")
-async def reset_all_circuit_breakers():
-    """Reset all circuit breakers."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    try:
-        await worker_pool.circuit_breaker_manager.reset_all_breakers()
-        return {"message": "All circuit breakers reset successfully"}
-    except Exception as e:
-        service_logger.error(f"Error resetting all circuit breakers: {e}")
-        raise HTTPException(status_code=500, detail="Error resetting circuit breakers")
-
-
-# ----------------------------------------------------------------------------
-# Phase 2.6: Fallback and Degradation Endpoints
-# ----------------------------------------------------------------------------
-@app.get("/fallback/health")
-async def get_fallback_health():
-    """Get fallback manager health summary."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    try:
-        health_summary = worker_pool.fallback_manager.get_health_summary()
-        return {
-            "fallback_health": health_summary,
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        service_logger.error(f"Error retrieving fallback health: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving fallback health")
-
-
-@app.get("/fallback/metrics")
-async def get_fallback_metrics():
-    """Get fallback execution metrics."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    try:
-        metrics = worker_pool.fallback_manager.get_fallback_metrics()
-        return {
-            "fallback_metrics": metrics,
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        service_logger.error(f"Error retrieving fallback metrics: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving fallback metrics")
-
-
-@app.get("/fallback/service-level")
-async def get_service_level():
-    """Get current service level and degradation status."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    try:
-        service_level = worker_pool.fallback_manager.service_level
-        health_summary = worker_pool.fallback_manager.get_health_summary()
-
-        return {
-            "current_service_level": service_level.value,
-            "service_availability": health_summary.get("overall_availability", 0),
-            "healthy_services": health_summary.get("healthy_services", 0),
-            "total_services": health_summary.get("total_services", 0),
-            "degradation_events": health_summary.get("recent_degradation_events", []),
-            "timestamp": datetime.datetime.utcnow().isoformat()
-        }
-    except Exception as e:
-        service_logger.error(f"Error retrieving service level: {e}")
-        raise HTTPException(status_code=500, detail="Error retrieving service level")
-
-
-@app.post("/fallback/cache/{service_name}")
-async def update_service_cache(service_name: str, cache_data: dict):
-    """Update cache for a specific service."""
-    if not worker_pool:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized")
-
-    try:
-        worker_pool.fallback_manager.update_cache(service_name, cache_data)
-        return {"message": f"Cache updated for service '{service_name}'"}
-    except Exception as e:
-        service_logger.error(f"Error updating cache for {service_name}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error updating cache: {str(e)}")
-
-
-# ----------------------------------------------------------------------------
-# Startup and shutdown (kept in main)
+# Reliable Startup and Shutdown
 # ----------------------------------------------------------------------------
 
 startup_time: datetime.datetime
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Initialize the reliable browser automation service with enhanced monitoring."""
+    """Initialize the reliable browser automation service."""
     global job_manager, browser_runtime, worker_pool, page_explorer, startup_time
-    global metrics_collector, alert_manager, health_monitor
 
     startup_time = datetime.datetime.utcnow()
-    service_logger.info("Starting reliable browser automation service (Phase 2 enhancements)...")
+    service_logger.info("Starting reliable browser automation service (Phase 1 improvements)...")
 
     try:
-        # Enhanced monitoring infrastructure (Phase 2.2)
-        metrics_collector = MetricsCollector()
-        alert_manager = AlertManager(service_logger)
-        service_logger.info("✅ Enhanced monitoring system initialized")
-
-        # Configure alert rules
-        alert_manager.add_alert_rule(
-            name="high_queue_size",
-            metric_name="queue_size",
-            threshold=20,
-            severity=AlertSeverity.MEDIUM,
-            condition="gt"
-        )
-        alert_manager.add_alert_rule(
-            name="low_health_score",
-            metric_name="health_score",
-            threshold=70,
-            severity=AlertSeverity.HIGH,
-            condition="lt"
-        )
-
         # Redis configuration
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
         # Job management
-        job_store = JobStore(redis_url=redis_url, logger=service_logger)
+        job_store = ReliableJobStore(redis_url=redis_url, logger=service_logger)
         job_manager = JobManager(job_store, logger=service_logger)
         await job_manager.start()
         service_logger.info("✅ Reliable job manager started")
@@ -826,24 +520,11 @@ async def on_startup() -> None:
         page_explorer = PageExplorer(browser_runtime.browser, service_logger)
         service_logger.info("✅ Page exploration API initialized")
 
-        # Health monitoring with checks
-        health_monitor = HealthMonitor(metrics_collector, alert_manager)
-
-        # Add health checks
-        health_monitor.add_health_check(
-            "redis_connection",
-            lambda: job_store.redis_client is not None
-        )
-        health_monitor.add_health_check(
-            "browser_connection",
-            lambda: browser_runtime.browser.is_connected()
-        )
-
         # Reliable worker pool
-        worker_pool = WorkerPool(
+        worker_pool = ReliableWorkerPool(
             job_store=job_store,
             browser=browser_runtime.browser,
-            task_registry=task_registry,
+            task_registry=reliable_task_registry,
             data_root=DATA_ROOT,
             logger=service_logger,
             max_workers=MAX_CONCURRENT_JOBS
@@ -851,11 +532,10 @@ async def on_startup() -> None:
         await worker_pool.start()
         service_logger.info(f"✅ Reliable worker pool started with {MAX_CONCURRENT_JOBS} workers")
 
-        service_logger.info("🚀 Enhanced reliable browser automation service ready!")
-        service_logger.info("📊 Phase 2 features: Enhanced error handling, monitoring, alerting")
+        service_logger.info("🚀 Reliable browser automation service ready!")
 
     except Exception as e:
-        service_logger.error(f"Failed to start enhanced service: {e}")
+        service_logger.error(f"Failed to start reliable service: {e}")
         raise
 
 
@@ -878,3 +558,5 @@ async def on_shutdown() -> None:
     if browser_runtime:
         await browser_runtime.stop()
         service_logger.info("✅ Browser runtime stopped")
+
+    service_logger.info("🔻 Reliable browser automation service shutdown complete")

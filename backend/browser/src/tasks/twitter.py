@@ -214,9 +214,9 @@ class TwitterDateUtils:
     @staticmethod
     def is_within_date_range(tweet_timestamp: str, start_dt: datetime, end_dt: datetime) -> bool:
         """Check if tweet timestamp is within the specified date range."""
-        if not tweet_timestamp or not start_dt:
+        if not tweet_timestamp or not start_dt or not end_dt:
             return True
-            
+
         try:
             # Parse Twitter timestamp (usually ISO format)
             if 'T' in tweet_timestamp:
@@ -224,12 +224,12 @@ class TwitterDateUtils:
             else:
                 # Handle relative timestamps like "2h", "1d ago"
                 return TwitterDateUtils._parse_relative_timestamp(tweet_timestamp, start_dt, end_dt)
-                
-            # Remove timezone info for comparison
-            tweet_dt = tweet_dt.replace(tzinfo=None)
-            start_dt = start_dt.replace(tzinfo=None)
-            end_dt = end_dt.replace(tzinfo=None)
-            
+
+            # Remove timezone info for comparison - ensure all datetimes are timezone-naive
+            tweet_dt = tweet_dt.replace(tzinfo=None) if tweet_dt.tzinfo else tweet_dt
+            start_dt = start_dt.replace(tzinfo=None) if start_dt.tzinfo else start_dt
+            end_dt = end_dt.replace(tzinfo=None) if end_dt.tzinfo else end_dt
+
             return start_dt <= tweet_dt <= end_dt
             
         except Exception:
@@ -300,9 +300,14 @@ class TwitterTask:
                                            clean_params.get("level", 
                                                            clean_params.get("scrape_level", 1)))
             
-            # Get target username - Check all possible parameter names  
-            target_username = clean_params.get("target_username",
-                                             clean_params.get("username", "timeline"))
+            # 🔧 PHASE A FIX: Proper routing priority for search vs user scraping
+            # CRITICAL FIX: Don't derive target_username for search operations
+            target_username = None
+
+            # Only determine target_username for non-search operations to avoid routing conflicts
+            if not (clean_params.get('hashtag') or clean_params.get('search_query') or clean_params.get('query')):
+                target_username = clean_params.get("target_username",
+                                                 clean_params.get("username", "timeline"))
             
             logger.info(f"🐦 TWITTER SCRAPER v1.0 - STARTING")
             logger.info(f"👤 Target: {target_username}")
@@ -346,8 +351,10 @@ class TwitterTask:
                 logger.info("🔐 Using credential-based authentication...")
                 await scraper.authenticate()
             
-            # Add the corrected parameters to clean_params
-            clean_params['target_username'] = target_username
+            # Add the corrected parameters to clean_params (FIXED ROUTING)
+            # Only set target_username for user scraping, not search operations
+            if target_username is not None:
+                clean_params['target_username'] = target_username
             clean_params['scrape_level'] = scrape_level
             
             # Determine scraping type based on parameters
@@ -384,7 +391,27 @@ class TwitterTask:
                 logger.info(f"📊 Max Tweets: {clean_params.get('max_tweets', 50)}")
                 results = await scraper.scrape_hashtag(clean_params)
                 extraction_method = "hashtag_scraping"
-                
+
+            elif clean_params.get('search_query') or clean_params.get('query'):
+                # Phase 2.2: Search query scraping mode
+                search_query = clean_params.get('search_query', clean_params.get('query'))
+                logger.info(f"🔍 SEARCH QUERY MODE: '{search_query}'")
+                logger.info(f"📊 Max Tweets: {clean_params.get('max_tweets', 50)}")
+                logger.info(f"🎯 Result Type: {clean_params.get('result_type', 'recent')}")
+                results = await scraper.scrape_search_query(clean_params)
+                extraction_method = "search_query_scraping"
+
+            elif clean_params.get('monitor_mode') or clean_params.get('monitor_target'):
+                # Phase 3.1: Real-time monitoring mode
+                monitor_target = clean_params.get('monitor_target', '')
+                monitor_type = clean_params.get('monitor_type', 'user')
+                logger.info(f"🔄 REAL-TIME MONITORING MODE: {monitor_type}")
+                logger.info(f"🎯 Target: '{monitor_target}'")
+                logger.info(f"⏱️ Interval: {clean_params.get('monitoring_interval', 300)}s")
+                logger.info(f"🔄 Max cycles: {clean_params.get('max_iterations', 10)}")
+                results = await scraper.monitor_real_time(clean_params)
+                extraction_method = "real_time_monitoring"
+
             elif clean_params.get('batch_usernames'):
                 # 🚀 BATCH PROCESSING MODE - Multiple usernames
                 batch_usernames = clean_params['batch_usernames']
@@ -459,29 +486,52 @@ class TwitterTask:
 
                 # FIXED: Properly differentiate scrape levels
                 if scrape_level >= 4:
-                    # Level 4: Full comprehensive extraction - FORCE ENABLE ALL DATA TYPES
-                    logger.info(f"📊 LEVEL 4: Comprehensive extraction with all data types")
+                    # Level 4: Enhanced extraction - RESPECT USER PARAMETERS
+                    logger.info(f"📊 LEVEL 4: Enhanced extraction respecting user parameters")
                     clean_params_level4 = clean_params.copy()
-                    # Force enable all extraction types for EVERYTHING mode
-                    clean_params_level4.update({
-                        'scrape_posts': True,
-                        'scrape_media': True,
-                        'scrape_likes': True,
-                        'scrape_mentions': True,
-                        'scrape_followers': True,
-                        'scrape_following': True,
-                        'scrape_reposts': True,
-                        'max_posts': max(clean_params.get('max_posts', 50), 50),  # Minimum 50 for Level 4
-                        'max_likes': max(clean_params.get('max_likes', 50), 20),
-                        'max_mentions': max(clean_params.get('max_mentions', 30), 15),
-                        'max_reposts': max(clean_params.get('max_reposts', 50), 20),
-                        'max_followers': max(clean_params.get('max_followers', 200), 100),
-                        'max_following': max(clean_params.get('max_following', 150), 75),
-                        'max_media': max(clean_params.get('max_media', 25), 15)
-                    })
-                    logger.info(f"🔥 LEVEL 4 EVERYTHING MODE: Forced comprehensive extraction")
+
+                    # ONLY enhance what user explicitly requested or what's enabled by default
+                    # DO NOT force enable what user explicitly disabled
+                    if clean_params.get('scrape_posts', True):
+                        clean_params_level4['scrape_posts'] = True
+                        requested_posts = clean_params.get('max_posts', 30)
+
+                        # TRUE LARGE SCALE EXTRACTION: Support unlimited mode
+                        if requested_posts >= 500 or str(requested_posts).lower() in ['all', 'unlimited', 'everything']:
+                            clean_params_level4['max_posts'] = 99999  # Unlimited mode
+                            clean_params_level4['unlimited_mode'] = True
+                            logger.info(f"🌟 UNLIMITED MODE ACTIVATED: Extracting ALL available posts")
+                        else:
+                            clean_params_level4['max_posts'] = max(requested_posts, 30)  # Enhanced minimum for Level 4
+
+                    if clean_params.get('scrape_media', False):
+                        clean_params_level4['scrape_media'] = True
+                        clean_params_level4['max_media'] = max(clean_params.get('max_media', 25), 15)
+
+                    if clean_params.get('scrape_likes', False):
+                        clean_params_level4['scrape_likes'] = True
+                        clean_params_level4['max_likes'] = max(clean_params.get('max_likes', 50), 20)
+
+                    if clean_params.get('scrape_mentions', False):
+                        clean_params_level4['scrape_mentions'] = True
+                        clean_params_level4['max_mentions'] = max(clean_params.get('max_mentions', 30), 15)
+
+                    if clean_params.get('scrape_reposts', False):
+                        clean_params_level4['scrape_reposts'] = True
+                        clean_params_level4['max_reposts'] = max(clean_params.get('max_reposts', 50), 20)
+
+                    # RESPECT user's explicit choices for followers/following
+                    if clean_params.get('scrape_followers', False):
+                        clean_params_level4['scrape_followers'] = True
+                        clean_params_level4['max_followers'] = max(clean_params.get('max_followers', 200), 100)
+
+                    if clean_params.get('scrape_following', False):
+                        clean_params_level4['scrape_following'] = True
+                        clean_params_level4['max_following'] = max(clean_params.get('max_following', 150), 75)
+
+                    logger.info(f"✅ LEVEL 4 ENHANCED MODE: Respecting user parameter choices")
                     results = await scraper.scrape_user_comprehensive(clean_params_level4)
-                    extraction_method = "level_4_comprehensive"
+                    extraction_method = "level_4_enhanced"
                 elif scrape_level >= 3:
                     # Level 3: Full profile + posts + some engagement data
                     logger.info(f"📊 LEVEL 3: Full profile with enhanced data")
@@ -605,17 +655,26 @@ class TwitterTask:
                     "success_rate": success_rate,
                     "search_completed_at": datetime.now().isoformat()
                 },
-                "data": safe_results
+                "data": safe_results,
+                # PHASE 4.2: Performance and Anti-Detection Metrics
+                "performance_metrics": scraper._get_performance_metrics() if 'scraper' in locals() else {}
             }
             
-            # Save results to JSON file if job_output_dir is provided
+            # PHASE 4.1: ENHANCED EXPORT FORMAT EXTENSIONS
             if job_output_dir:
                 try:
-                    output_file = os.path.join(job_output_dir, "twitter_data.json")
+                    export_formats = clean_params.get('export_formats', ['json'])
+                    if isinstance(export_formats, str):
+                        export_formats = [export_formats]
+
                     os.makedirs(job_output_dir, exist_ok=True)
-                    with open(output_file, 'w', encoding='utf-8') as f:
-                        json.dump(result, f, indent=2, ensure_ascii=False)
-                    logger.info(f"💾 Saved data to {output_file}")
+
+                    # Export in multiple formats
+                    exported_files = await TwitterTask._export_results_multi_format(
+                        result, job_output_dir, export_formats, logger
+                    )
+
+                    logger.info(f"💾 Phase 4.1: Exported data in {len(export_formats)} formats: {exported_files}")
                 except Exception as e:
                     logger.error(f"❌ Failed to save output: {e}")
             
@@ -1797,12 +1856,41 @@ class TwitterScraper:
         self.enable_date_filtering = False
         self.stop_at_date_threshold = True
         self.authenticated = False
-        
+
         # Load credentials from environment
         self.email = os.getenv('X_EMAIL', '')
-        self.username = os.getenv('X_USERNAME', '')  
+        self.username = os.getenv('X_USERNAME', '')
         self.password = os.getenv('X_PASS', '')
-        
+
+        # ENHANCED: Authentication resilience features
+        self.auth_attempts = 0
+        self.max_auth_attempts = 3
+        self.session_health_score = 100
+        self.last_auth_check = None
+        self.auth_failures = []
+        self.rate_limit_detected = False
+        self.blocked_detected = False
+
+        # ENHANCED: Backup authentication methods
+        self.backup_credentials = self._load_backup_credentials()
+        self.current_credential_set = 0
+
+        # ENHANCED: Session persistence and recovery
+        self.session_file = f"/sessions/twitter_session_{hash(self.username)}.json"
+        self.session_backup_file = f"/sessions/twitter_session_backup_{hash(self.username)}.json"
+
+        # PHASE 4.2: Performance and Anti-Detection Optimizations
+        self.performance_mode = True
+        self.anti_detection_enabled = True
+        self.request_cache = {}
+        self.timing_variance = 0.5  # Human-like timing variation
+        self.extraction_stats = {
+            'requests_made': 0,
+            'cache_hits': 0,
+            'extraction_time': 0,
+            'anti_detection_actions': 0
+        }
+
         # Only require credentials if not using session
         # (session loading will bypass credential authentication)
         if not all([self.email, self.username, self.password]):
@@ -1859,11 +1947,11 @@ class TwitterScraper:
             
         try:
             # If we encounter a tweet older than our start date, stop extraction
-            if 'T' in timestamp:
+            if 'T' in timestamp and self.date_filter_start is not None:
                 tweet_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00').replace('+00:00', ''))
                 tweet_dt = tweet_dt.replace(tzinfo=None)
                 start_dt = self.date_filter_start.replace(tzinfo=None)
-                
+
                 if tweet_dt < start_dt:
                     self.logger.info(f"⏹️ Stopping extraction - reached date threshold (tweet: {timestamp})")
                     return True
@@ -3146,10 +3234,12 @@ class TwitterScraper:
                     if 'views' in tweet_data: engagement_found.append(f"views:{tweet_data['views']}")
                     
                     if engagement_found:
-                        self.logger.debug(f"✅ Engagement extracted: {', '.join(engagement_found)}")
-                    
+                        self.logger.info(f"✅ ENGAGEMENT SUCCESS: {', '.join(engagement_found)}")
+                    else:
+                        self.logger.info(f"❌ ENGAGEMENT: No metrics found for tweet")
+
                 except Exception as e:
-                    self.logger.debug(f"⚠️ Engagement extraction failed: {e}")
+                    self.logger.info(f"⚠️ ENGAGEMENT ERROR: {e}")
             
             # 3. EXTRACT TIMESTAMP/DATE - Enhanced with multiple fallback strategies
             try:
@@ -3435,6 +3525,42 @@ class TwitterScraper:
             except:
                 pass
 
+            # 7. EXTRACT EMBEDDED MEDIA - Phase 1.1 Enhancement
+            try:
+                media_items = await self._extract_media_from_tweet(tweet_element)
+                if media_items:
+                    tweet_data['media'] = media_items
+                    tweet_data['has_media'] = True
+                    self.logger.debug(f"📷 MEDIA: Extracted {len(media_items)} media items from tweet")
+                else:
+                    tweet_data['media'] = []
+                    tweet_data['has_media'] = False
+            except Exception as e:
+                self.logger.debug(f"⚠️ Media extraction failed: {e}")
+                tweet_data['media'] = []
+                tweet_data['has_media'] = False
+
+            # 8. THREAD DETECTION AND RECONSTRUCTION - Phase 1.3 Enhancement
+            try:
+                if tweet_data.get('text'):  # Only process if we have valid tweet text
+                    tweet_data = await self._detect_and_extract_thread_info(tweet_element, tweet_data)
+                    self.logger.debug(f"🧵 THREAD: Added thread info to tweet")
+            except Exception as e:
+                self.logger.debug(f"⚠️ Thread detection failed: {e}")
+                # Add empty thread info on failure
+                tweet_data['thread_info'] = {'is_thread': False, 'error': str(e)}
+
+            # 9. CONTENT CLASSIFICATION - Phase 3.2 Enhancement
+            try:
+                if tweet_data.get('text'):  # Only process if we have valid tweet text
+                    classification = self.classify_content(tweet_data)
+                    tweet_data['classification'] = classification
+                    self.logger.debug(f"🏷️ CLASSIFICATION: Added content analysis to tweet")
+            except Exception as e:
+                self.logger.debug(f"⚠️ Content classification failed: {e}")
+                # Add empty classification on failure
+                tweet_data['classification'] = {'error': str(e)}
+
             # Return the enhanced tweet data
             return tweet_data if tweet_data.get('text') else None
 
@@ -3580,12 +3706,20 @@ class TwitterScraper:
         """SMART: Choose extraction method based on scale requirements and level"""
         self.logger.info(f"🎯 ADAPTIVE EXTRACTION: {max_posts} posts, Level {level} for @{username}")
 
-        # LEVEL 4 OVERRIDE: Always use large-scale EVERYTHING mode
+        # PHASE C: OPTIMIZED LEVEL 4 ROUTING - Smart scale selection
         if level >= 4:
-            # Force minimum extraction for Level 4 EVERYTHING mode
-            everything_target = max(max_posts, 50)  # Minimum 50 posts for Level 4
-            self.logger.info(f"🔥 LEVEL 4 EVERYTHING MODE: Forcing large-scale extraction (target: {everything_target}+ posts)")
-            return await self._extract_large_scale_validated(username, everything_target)
+            if max_posts <= 20:
+                # PHASE C: Small requests still use validated small-scale for reliability
+                self.logger.info(f"🎯 LEVEL 4 SMALL SCALE: Using enhanced small-scale for {max_posts} posts (reliability over power)")
+                return await self._extract_small_scale_validated(username, max_posts)
+            elif max_posts <= 50:
+                # PHASE C: Medium requests use hybrid approach
+                self.logger.info(f"⚖️ LEVEL 4 MEDIUM SCALE: Using hybrid approach for {max_posts} posts")
+                return await self._extract_medium_scale_hybrid(username, max_posts)
+            else:
+                # PHASE C: Only truly large requests go to large-scale
+                self.logger.info(f"🔥 LEVEL 4 LARGE SCALE: Using comprehensive extraction for {max_posts}+ posts")
+                return await self._extract_large_scale_validated(username, max_posts)
 
         # For Levels 1-3: Use scale-based routing
         if max_posts <= 30:
@@ -3604,13 +3738,99 @@ class TwitterScraper:
             return await self._extract_large_scale_validated(username, max_posts)
 
     async def _extract_small_scale_validated(self, username: str, max_posts: int) -> List[Dict[str, Any]]:
-        """SMALL SCALE: Enhanced DOM extraction with immediate validation"""
+        """SMALL SCALE: Enhanced DOM extraction with immediate validation - Phase C Optimized"""
         try:
             tweets = []
-            tweet_elements = self.page.locator('article[data-testid="tweet"]')
-            count = await tweet_elements.count()
 
-            self.logger.info(f"📊 SMALL SCALE: Found {count} tweet elements on page")
+            # PHASE C: ENSURE PROPER NAVIGATION
+            user_url = f"https://x.com/{username.replace('@', '')}"
+            self.logger.info(f"🎯 NAVIGATING to user profile: {user_url}")
+
+            try:
+                await self.page.goto(user_url, wait_until='domcontentloaded', timeout=30000)
+                await asyncio.sleep(3)  # Wait for content to load
+
+                page_title = await self.page.title()
+                self.logger.info(f"📄 Page loaded: {page_title}")
+            except Exception as nav_error:
+                self.logger.error(f"❌ Navigation failed: {nav_error}")
+                return []
+
+            # EMERGENCY DOM DEBUG: Comprehensive selector testing
+            tweet_selectors = [
+                # Original selectors
+                'article[data-testid="tweet"]',
+                'div[data-testid="tweet"]',
+                'article[role="article"]',
+                'div[data-testid="cellInnerDiv"] article',
+                'main[role="main"] article',
+
+                # Emergency backup selectors
+                'article',
+                'div[data-testid="cellInnerDiv"]',
+                '[data-testid="primaryColumn"] article',
+                'section article',
+                'div[dir="ltr"]',
+                '[data-testid="tweetText"]',
+                'div[lang]'
+            ]
+
+            tweet_elements = None
+            count = 0
+            selector_results = {}
+
+            # EMERGENCY DEBUG: Test ALL selectors and log results
+            self.logger.info(f"🚨 EMERGENCY DOM DEBUG: Testing {len(tweet_selectors)} selectors")
+
+            for selector in tweet_selectors:
+                try:
+                    elements = self.page.locator(selector)
+                    selector_count = await elements.count()
+                    selector_results[selector] = selector_count
+                    self.logger.info(f"🔍 SELECTOR TEST '{selector}': {selector_count} elements")
+
+                    if selector_count > count:
+                        tweet_elements = elements
+                        count = selector_count
+                        self.logger.info(f"✅ NEW BEST SELECTOR: '{selector}' with {selector_count} elements")
+
+                    # If we find elements, try to extract sample text
+                    if selector_count > 0:
+                        try:
+                            first_element = elements.first
+                            sample_text = await first_element.inner_text()
+                            self.logger.info(f"📝 SAMPLE TEXT from '{selector}': '{sample_text[:100]}...'")
+                        except Exception as e:
+                            self.logger.info(f"⚠️ TEXT EXTRACTION FAILED for '{selector}': {e}")
+
+                except Exception as e:
+                    selector_results[selector] = f"ERROR: {e}"
+                    self.logger.error(f"❌ SELECTOR ERROR '{selector}': {e}")
+
+            # EMERGENCY DEBUG: Log page state
+            try:
+                current_url = self.page.url
+                page_title = await self.page.title()
+                self.logger.info(f"🌐 CURRENT URL: {current_url}")
+                self.logger.info(f"📄 PAGE TITLE: {page_title}")
+
+                # Check for login/authentication issues
+                if 'login' in page_title.lower() or 'sign' in page_title.lower():
+                    self.logger.error(f"🚨 AUTHENTICATION REQUIRED: Page redirected to login")
+
+            except Exception as e:
+                self.logger.error(f"❌ PAGE STATE CHECK FAILED: {e}")
+
+            # Final summary
+            working_selectors = [sel for sel, cnt in selector_results.items() if isinstance(cnt, int) and cnt > 0]
+            self.logger.info(f"📊 SELECTOR SUMMARY: {len(working_selectors)}/{len(tweet_selectors)} selectors found elements")
+            self.logger.info(f"📊 BEST RESULT: {count} elements found")
+
+            if count == 0:
+                self.logger.error(f"🚨 CRITICAL: NO TWEET ELEMENTS FOUND WITH ANY SELECTOR")
+                self.logger.error(f"🔍 SELECTOR RESULTS: {selector_results}")
+            else:
+                self.logger.info(f"✅ SUCCESS: Using selector with {count} elements")
 
             # Extract with immediate validation
             for i in range(min(count, max_posts * 2)):  # Extract more than needed for filtering
@@ -3626,6 +3846,13 @@ class TwitterScraper:
 
                             if len(tweets) >= max_posts:
                                 break
+
+            # Thread Reconstruction - Phase 1.3 Enhancement
+            try:
+                if len(tweets) > 0:
+                    tweets = await self._reconstruct_thread_sequence(tweets, username)
+            except Exception as e:
+                self.logger.warning(f"⚠️ Thread reconstruction failed: {e}")
 
             self.logger.info(f"✅ SMALL SCALE COMPLETE: {len(tweets)} validated tweets extracted")
             return tweets
@@ -3683,6 +3910,13 @@ class TwitterScraper:
 
                     scroll_attempts += 1
 
+            # Thread Reconstruction - Phase 1.3 Enhancement
+            try:
+                if len(tweets) > 0:
+                    tweets = await self._reconstruct_thread_sequence(tweets, username)
+            except Exception as e:
+                self.logger.warning(f"⚠️ Thread reconstruction failed: {e}")
+
             self.logger.info(f"✅ MEDIUM SCALE COMPLETE: {len(tweets)} validated tweets extracted")
             return tweets
 
@@ -3693,13 +3927,21 @@ class TwitterScraper:
     async def _extract_large_scale_validated(self, username: str, max_posts: int) -> List[Dict[str, Any]]:
         """LARGE SCALE: Aggressive DOM extraction + post-processing validation - LEVEL 4 EVERYTHING MODE"""
         try:
-            # AGGRESSIVE TARGET: Level 4 should extract significantly more
-            everything_target = max(max_posts * 3, 300)  # More aggressive multiplier
-            self.logger.info(f"🔥 LEVEL 4 EVERYTHING MODE: Targeting {everything_target} raw tweets for comprehensive validation")
-            self.logger.info("🚀 AGGRESSIVE EXTRACTION: Unlimited scrolling enabled for maximum data collection")
+            # Check for unlimited mode
+            unlimited_mode = max_posts >= 99999
 
-            # Phase 1: Aggressive DOM extraction (use existing comprehensive method)
-            raw_tweets = await self._extract_posts_comprehensive_dom_aggressive(username, everything_target)
+            if unlimited_mode:
+                self.logger.info(f"🌟 UNLIMITED MODE: Extracting ALL available posts for @{username}")
+                self.logger.info("🚀 NO LIMITS: Scrolling until no more content found")
+                everything_target = 999999  # Effectively unlimited
+            else:
+                # AGGRESSIVE TARGET: Level 4 should extract significantly more
+                everything_target = max(max_posts * 3, 300)  # More aggressive multiplier
+                self.logger.info(f"🔥 LEVEL 4 EVERYTHING MODE: Targeting {everything_target} raw tweets for comprehensive validation")
+                self.logger.info("🚀 AGGRESSIVE EXTRACTION: Enhanced scrolling enabled for maximum data collection")
+
+            # Phase 1: TRUE LARGE SCALE extraction (new optimized method)
+            raw_tweets = await self._extract_posts_true_large_scale(username, everything_target)
 
             self.logger.info(f"📊 RAW EXTRACTION: Retrieved {len(raw_tweets)} tweets for validation")
 
@@ -3725,8 +3967,22 @@ class TwitterScraper:
                 validated_tweets.extend(additional_validated)
                 self.logger.info(f"🔍 ADDITIONAL VALIDATION: Added {len(additional_validated)} more tweets")
 
-            # Return up to requested amount
-            result = validated_tweets[:max_posts] if max_posts < 200 else validated_tweets
+            # Return appropriate amount based on mode
+            if unlimited_mode:
+                result = validated_tweets  # Return ALL validated tweets in unlimited mode
+                self.logger.info(f"🌟 UNLIMITED MODE RESULT: Returning ALL {len(result)} validated tweets")
+            else:
+                result = validated_tweets[:max_posts] if max_posts < 200 else validated_tweets
+
+            # Phase 4: Thread Reconstruction - Phase 1.3 Enhancement
+            try:
+                if len(result) > 0:
+                    self.logger.info(f"🧵 THREAD RECONSTRUCTION: Processing {len(result)} tweets for thread analysis")
+                    result = await self._reconstruct_thread_sequence(result, username)
+                    self.logger.info(f"🧵 THREAD RECONSTRUCTION: Completed thread analysis")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Thread reconstruction failed: {e}")
+                # Continue with original results if thread reconstruction fails
 
             final_validation_rate = len(result) / len(raw_tweets) if raw_tweets else 0
             self.logger.info(f"✅ LARGE SCALE COMPLETE: {len(result)} tweets ({final_validation_rate:.1%} validation rate)")
@@ -3736,6 +3992,575 @@ class TwitterScraper:
         except Exception as e:
             self.logger.error(f"❌ Large scale extraction failed: {e}")
             return []
+
+    async def _extract_posts_true_large_scale(self, username: str, target_count: int) -> List[Dict[str, Any]]:
+        """TRUE LARGE-SCALE EXTRACTION: Intelligent scrolling with end-detection and memory management"""
+        try:
+            tweets = []
+            unlimited_mode = target_count >= 99999
+
+            # Advanced state tracking for large scale
+            extraction_state = {
+                'seen_tweet_ids': set(),
+                'seen_texts': set(),
+                'consecutive_empty_scrolls': 0,
+                'last_tweet_count': 0,
+                'memory_cleanup_counter': 0,
+                'scroll_performance': [],
+                'end_of_feed_indicators': 0,
+                'duplicate_batches': 0,
+                'extraction_efficiency': []
+            }
+
+            self.logger.info(f"🚀 TRUE LARGE SCALE: Target={target_count}, Unlimited={unlimited_mode}")
+
+            # Phase 1: Initial extraction with optimization
+            await self._wait_for_timeline_load()
+            initial_tweets = await self._extract_initial_batch_optimized(username, extraction_state)
+            tweets.extend(initial_tweets)
+
+            if unlimited_mode:
+                self.logger.info(f"🌟 UNLIMITED MODE: Scrolling until absolute end of feed")
+                max_scrolls = 3000  # Very high limit
+                empty_threshold = 15  # Allow more empty scrolls
+            else:
+                # Intelligent scroll calculation
+                tweets_per_scroll = max(len(initial_tweets) // 2, 3)
+                estimated_scrolls = (target_count // tweets_per_scroll) + 20
+                max_scrolls = min(estimated_scrolls, 1000)
+                empty_threshold = 8
+                self.logger.info(f"🎯 CALCULATED SCROLLS: {max_scrolls} (estimated {tweets_per_scroll} tweets per scroll)")
+
+            # Phase 2: Intelligent progressive scrolling with end detection
+            scroll_attempt = 0
+            last_progress_log = 0
+
+            while scroll_attempt < max_scrolls:
+                # Memory management every 50 scrolls
+                if extraction_state['memory_cleanup_counter'] % 50 == 0:
+                    await self._cleanup_browser_memory()
+
+                # Perform scroll with performance tracking
+                scroll_start = time.time()
+                tweets_before = len(tweets)
+
+                success = await self._perform_intelligent_scroll(scroll_attempt, extraction_state)
+                if not success:
+                    self.logger.warning(f"⚠️ Scroll failed at attempt {scroll_attempt}")
+                    extraction_state['consecutive_empty_scrolls'] += 1
+                else:
+                    # Extract new tweets from current view
+                    new_tweets = await self._extract_new_tweets_batch(username, extraction_state)
+
+                    # Add unique tweets
+                    added_count = 0
+                    for tweet in new_tweets:
+                        tweet_id = tweet.get('id', '')
+                        tweet_text = tweet.get('text', '')
+
+                        if tweet_id and tweet_id not in extraction_state['seen_tweet_ids']:
+                            extraction_state['seen_tweet_ids'].add(tweet_id)
+                            extraction_state['seen_texts'].add(tweet_text)
+                            tweet['extraction_scroll'] = scroll_attempt
+                            tweets.append(tweet)
+                            added_count += 1
+
+                    # Performance tracking
+                    scroll_time = time.time() - scroll_start
+                    extraction_state['scroll_performance'].append({
+                        'scroll': scroll_attempt,
+                        'time': scroll_time,
+                        'tweets_added': added_count,
+                        'total_tweets': len(tweets)
+                    })
+
+                    # Progress logging every 20 scrolls or significant progress
+                    if scroll_attempt - last_progress_log >= 20 or len(tweets) - last_progress_log >= 50:
+                        avg_time = sum(p['time'] for p in extraction_state['scroll_performance'][-10:]) / min(10, len(extraction_state['scroll_performance']))
+                        self.logger.info(f"📊 PROGRESS: Scroll {scroll_attempt}/{max_scrolls}, {len(tweets)} tweets (+{added_count}), {avg_time:.1f}s/scroll")
+                        last_progress_log = len(tweets)
+
+                    # Reset empty counter if we got tweets
+                    if added_count > 0:
+                        extraction_state['consecutive_empty_scrolls'] = 0
+                    else:
+                        extraction_state['consecutive_empty_scrolls'] += 1
+
+                # End-of-feed detection
+                if await self._detect_end_of_feed(extraction_state, tweets):
+                    self.logger.info(f"🏁 END OF FEED DETECTED: Stopping at scroll {scroll_attempt}")
+                    break
+
+                # Empty scroll threshold
+                if extraction_state['consecutive_empty_scrolls'] >= empty_threshold:
+                    self.logger.info(f"🛑 EMPTY THRESHOLD: {empty_threshold} consecutive empty scrolls, stopping")
+                    break
+
+                # Target reached (non-unlimited mode)
+                if not unlimited_mode and len(tweets) >= target_count:
+                    self.logger.info(f"🎯 TARGET REACHED: {len(tweets)}/{target_count} tweets extracted")
+                    break
+
+                scroll_attempt += 1
+                extraction_state['memory_cleanup_counter'] += 1
+
+                # Adaptive delay based on performance
+                delay = self._calculate_adaptive_delay(extraction_state)
+                await asyncio.sleep(delay)
+
+            # Performance summary
+            total_time = sum(p['time'] for p in extraction_state['scroll_performance'])
+            avg_tweets_per_scroll = len(tweets) / max(scroll_attempt, 1)
+
+            self.logger.info(f"✅ TRUE LARGE SCALE COMPLETE:")
+            self.logger.info(f"   📊 Results: {len(tweets)} tweets in {scroll_attempt} scrolls")
+            self.logger.info(f"   ⚡ Performance: {avg_tweets_per_scroll:.1f} tweets/scroll, {total_time:.1f}s total")
+            self.logger.info(f"   🧹 Memory cleanups: {extraction_state['memory_cleanup_counter'] // 50}")
+
+            return tweets[:target_count] if not unlimited_mode else tweets
+
+        except Exception as e:
+            self.logger.error(f"❌ True large scale extraction failed: {e}")
+            return []
+
+    async def _wait_for_timeline_load(self):
+        """Wait for Twitter timeline to properly load"""
+        try:
+            await self.page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
+            await asyncio.sleep(2)  # Allow additional content to load
+        except Exception as e:
+            self.logger.warning(f"⚠️ Timeline load wait failed: {e}")
+
+    async def _extract_initial_batch_optimized(self, username: str, extraction_state: dict) -> List[Dict[str, Any]]:
+        """Extract initial batch of tweets with optimization"""
+        try:
+            tweets = []
+            tweet_elements = self.page.locator('article[data-testid="tweet"]')
+            count = await tweet_elements.count()
+
+            for i in range(count):
+                element = tweet_elements.nth(i)
+                if await element.is_visible():
+                    tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
+                    if tweet_data and tweet_data.get('text'):
+                        tweet_id = tweet_data.get('id', f"initial_{i}")
+                        tweet_text = tweet_data.get('text', '')
+
+                        if tweet_id not in extraction_state['seen_tweet_ids']:
+                            extraction_state['seen_tweet_ids'].add(tweet_id)
+                            extraction_state['seen_texts'].add(tweet_text)
+                            tweet_data['extraction_phase'] = 'initial'
+                            tweets.append(tweet_data)
+
+            self.logger.info(f"📦 INITIAL BATCH: {len(tweets)} tweets extracted")
+            return tweets
+
+        except Exception as e:
+            self.logger.error(f"❌ Initial batch extraction failed: {e}")
+            return []
+
+    async def _perform_intelligent_scroll(self, scroll_attempt: int, extraction_state: dict) -> bool:
+        """Perform intelligent scroll with adaptive behavior"""
+        try:
+            # Adaptive scroll distance based on performance
+            if len(extraction_state['scroll_performance']) > 5:
+                recent_efficiency = [p['tweets_added'] for p in extraction_state['scroll_performance'][-5:]]
+                avg_efficiency = sum(recent_efficiency) / len(recent_efficiency)
+
+                if avg_efficiency < 1:  # Low efficiency, scroll more
+                    scroll_distance = 1200
+                elif avg_efficiency > 5:  # High efficiency, scroll less
+                    scroll_distance = 600
+                else:
+                    scroll_distance = 800
+            else:
+                scroll_distance = 800
+
+            # Perform scroll with mouse wheel for naturalness
+            await self.page.mouse.wheel(0, scroll_distance)
+
+            # Adaptive wait based on scroll attempt
+            if scroll_attempt < 10:
+                wait_time = 3.0  # Slower at start
+            elif scroll_attempt < 50:
+                wait_time = 2.0  # Medium speed
+            else:
+                wait_time = 1.5  # Faster for large scale
+
+            await asyncio.sleep(wait_time)
+            return True
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Scroll attempt {scroll_attempt} failed: {e}")
+            return False
+
+    async def _extract_new_tweets_batch(self, username: str, extraction_state: dict) -> List[Dict[str, Any]]:
+        """Extract new tweets from current viewport"""
+        try:
+            tweets = []
+            tweet_elements = self.page.locator('article[data-testid="tweet"]')
+            count = await tweet_elements.count()
+
+            # Only check visible tweets to avoid processing entire DOM
+            for i in range(min(count, 20)):  # Limit to recent tweets in viewport
+                try:
+                    element = tweet_elements.nth(i)
+                    if await element.is_visible():
+                        tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
+                        if tweet_data and tweet_data.get('text'):
+                            tweets.append(tweet_data)
+                except Exception:
+                    continue  # Skip problematic elements
+
+            return tweets
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ New tweets batch extraction failed: {e}")
+            return []
+
+    async def _detect_end_of_feed(self, extraction_state: dict, tweets: List[Dict[str, Any]]) -> bool:
+        """Detect if we've reached the end of the Twitter feed"""
+        try:
+            # Multiple end-of-feed indicators
+            indicators = 0
+
+            # 1. Too many consecutive empty scrolls
+            if extraction_state['consecutive_empty_scrolls'] >= 10:
+                indicators += 1
+
+            # 2. No new tweets in last several batches
+            if len(extraction_state['scroll_performance']) >= 20:
+                recent_adds = [p['tweets_added'] for p in extraction_state['scroll_performance'][-20:]]
+                if sum(recent_adds) == 0:
+                    indicators += 1
+
+            # 3. Check for "Show more tweets" or similar end indicators
+            try:
+                end_selectors = [
+                    'text="Show more tweets"',
+                    'text="Something went wrong"',
+                    'text="You\'re all caught up"',
+                    '[data-testid="emptyState"]'
+                ]
+
+                for selector in end_selectors:
+                    if await self.page.locator(selector).count() > 0:
+                        indicators += 1
+                        break
+            except:
+                pass
+
+            # 4. Duplicate content detection
+            if len(tweets) > 100:
+                recent_texts = [t.get('text', '') for t in tweets[-50:]]
+                older_texts = [t.get('text', '') for t in tweets[-100:-50]]
+                overlap = len(set(recent_texts) & set(older_texts))
+                if overlap > 25:  # More than 50% overlap
+                    indicators += 1
+
+            extraction_state['end_of_feed_indicators'] = indicators
+            return indicators >= 2  # Require multiple indicators
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ End-of-feed detection failed: {e}")
+            return False
+
+    async def _cleanup_browser_memory(self):
+        """Clean up browser memory during large extractions"""
+        try:
+            # Force garbage collection on page
+            await self.page.evaluate("window.gc && window.gc()")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass  # Not critical if it fails
+
+    def _calculate_adaptive_delay(self, extraction_state: dict) -> float:
+        """Calculate adaptive delay based on extraction performance"""
+        try:
+            if len(extraction_state['scroll_performance']) < 3:
+                return 2.0  # Default delay
+
+            # Calculate recent performance
+            recent_times = [p['time'] for p in extraction_state['scroll_performance'][-5:]]
+            avg_time = sum(recent_times) / len(recent_times)
+
+            # Adaptive delay: faster if extraction is slow, slower if extraction is fast
+            if avg_time > 3.0:
+                return 1.0  # Speed up if extractions are slow
+            elif avg_time < 1.0:
+                return 2.5  # Slow down if extractions are too fast
+            else:
+                return 1.5  # Balanced delay
+
+        except Exception:
+            return 2.0  # Safe default
+
+    def _load_backup_credentials(self) -> List[Dict[str, str]]:
+        """Load backup authentication credentials for resilience"""
+        try:
+            backup_creds = []
+
+            # Primary credentials
+            if self.email and self.username and self.password:
+                backup_creds.append({
+                    'email': self.email,
+                    'username': self.username,
+                    'password': self.password,
+                    'type': 'primary'
+                })
+
+            # Secondary credentials from environment
+            for i in range(2, 5):  # Support up to 3 backup accounts
+                backup_email = os.getenv(f'X_EMAIL_{i}', '')
+                backup_username = os.getenv(f'X_USERNAME_{i}', '')
+                backup_password = os.getenv(f'X_PASS_{i}', '')
+
+                if backup_email and backup_username and backup_password:
+                    backup_creds.append({
+                        'email': backup_email,
+                        'username': backup_username,
+                        'password': backup_password,
+                        'type': f'backup_{i}'
+                    })
+
+            self.logger.info(f"🔑 BACKUP CREDENTIALS: {len(backup_creds)} credential sets available")
+            return backup_creds
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to load backup credentials: {e}")
+            return []
+
+    async def _check_session_health(self) -> bool:
+        """Check if current session is healthy and authenticated"""
+        try:
+            if not self.page:
+                return False
+
+            # Quick authentication check
+            current_url = self.page.url
+            if 'login' in current_url or 'account/access' in current_url:
+                self.logger.warning("⚠️ SESSION HEALTH: Redirected to login page")
+                self.session_health_score -= 20
+                return False
+
+            # Check for rate limiting indicators
+            try:
+                rate_limit_indicators = [
+                    'text="Rate limit exceeded"',
+                    'text="Try again later"',
+                    'text="Something went wrong"',
+                    '[data-testid="error"]'
+                ]
+
+                for indicator in rate_limit_indicators:
+                    if await self.page.locator(indicator).count() > 0:
+                        self.logger.warning(f"⚠️ SESSION HEALTH: Rate limit detected")
+                        self.rate_limit_detected = True
+                        self.session_health_score -= 30
+                        return False
+            except:
+                pass
+
+            # Check for blocking indicators
+            try:
+                blocking_indicators = [
+                    'text="Your account is suspended"',
+                    'text="This account has been locked"',
+                    'text="Unusual activity"'
+                ]
+
+                for indicator in blocking_indicators:
+                    if await self.page.locator(indicator).count() > 0:
+                        self.logger.error(f"❌ SESSION HEALTH: Account blocked/suspended")
+                        self.blocked_detected = True
+                        self.session_health_score = 0
+                        return False
+            except:
+                pass
+
+            # Positive indicators
+            try:
+                if await self.page.locator('[data-testid="tweet"]').count() > 0:
+                    self.session_health_score = min(100, self.session_health_score + 5)
+                    return True
+            except:
+                pass
+
+            return self.session_health_score > 50
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Session health check failed: {e}")
+            self.session_health_score -= 10
+            return False
+
+    async def _attempt_session_recovery(self) -> bool:
+        """Attempt to recover from authentication/session issues"""
+        try:
+            self.logger.info("🔄 ATTEMPTING SESSION RECOVERY...")
+
+            # Method 1: Try refreshing the page
+            if self.session_health_score > 30:
+                try:
+                    await self.page.reload(wait_until='domcontentloaded', timeout=15000)
+                    await asyncio.sleep(3)
+
+                    if await self._check_session_health():
+                        self.logger.info("✅ SESSION RECOVERY: Page refresh successful")
+                        return True
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Page refresh failed: {e}")
+
+            # Method 2: Navigate to home page
+            try:
+                await self.page.goto('https://x.com/home', wait_until='domcontentloaded', timeout=15000)
+                await asyncio.sleep(3)
+
+                if await self._check_session_health():
+                    self.logger.info("✅ SESSION RECOVERY: Home navigation successful")
+                    return True
+            except Exception as e:
+                self.logger.warning(f"⚠️ Home navigation failed: {e}")
+
+            # Method 3: Try backup credentials if available
+            if len(self.backup_credentials) > 1 and self.current_credential_set < len(self.backup_credentials) - 1:
+                self.current_credential_set += 1
+                new_creds = self.backup_credentials[self.current_credential_set]
+
+                self.logger.info(f"🔑 TRYING BACKUP CREDENTIALS: {new_creds['type']}")
+
+                self.email = new_creds['email']
+                self.username = new_creds['username']
+                self.password = new_creds['password']
+
+                # Attempt re-authentication
+                try:
+                    if await self._perform_authentication():
+                        self.logger.info("✅ SESSION RECOVERY: Backup credentials successful")
+                        return True
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Backup credentials failed: {e}")
+
+            self.logger.error("❌ SESSION RECOVERY: All recovery methods failed")
+            return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Session recovery attempt failed: {e}")
+            return False
+
+    async def _perform_authentication(self) -> bool:
+        """Enhanced authentication with resilience features"""
+        try:
+            if self.auth_attempts >= self.max_auth_attempts:
+                self.logger.error(f"❌ AUTH: Max attempts ({self.max_auth_attempts}) exceeded")
+                return False
+
+            self.auth_attempts += 1
+            self.logger.info(f"🔐 AUTH ATTEMPT {self.auth_attempts}/{self.max_auth_attempts}")
+
+            # Check if we need credentials
+            if not self.email or not self.username or not self.password:
+                self.logger.error("❌ AUTH: Missing credentials")
+                return False
+
+            # Try to navigate to login page
+            await self.page.goto(self.LOGIN_URL, wait_until='domcontentloaded', timeout=30000)
+            await asyncio.sleep(3)
+
+            # Enhanced login process with better selectors
+            try:
+                # Email input
+                email_selector = 'input[name="text"], input[autocomplete="username"]'
+                await self.page.wait_for_selector(email_selector, timeout=10000)
+                await self.page.fill(email_selector, self.email)
+                await asyncio.sleep(1)
+
+                # Next button
+                next_selectors = ['[role="button"]:has-text("Next")', 'button:has-text("Next")']
+                for selector in next_selectors:
+                    try:
+                        if await self.page.locator(selector).count() > 0:
+                            await self.page.click(selector)
+                            break
+                    except:
+                        continue
+
+                await asyncio.sleep(2)
+
+                # Username if required
+                try:
+                    username_selector = 'input[data-testid="ocfEnterTextTextInput"]'
+                    if await self.page.locator(username_selector).count() > 0:
+                        await self.page.fill(username_selector, self.username)
+                        await self.page.click('[role="button"]:has-text("Next")')
+                        await asyncio.sleep(2)
+                except:
+                    pass
+
+                # Password
+                password_selector = 'input[name="password"], input[type="password"]'
+                await self.page.wait_for_selector(password_selector, timeout=10000)
+                await self.page.fill(password_selector, self.password)
+                await asyncio.sleep(1)
+
+                # Login button
+                login_selectors = ['[role="button"]:has-text("Log in")', 'button:has-text("Log in")']
+                for selector in login_selectors:
+                    try:
+                        if await self.page.locator(selector).count() > 0:
+                            await self.page.click(selector)
+                            break
+                    except:
+                        continue
+
+                await asyncio.sleep(5)
+
+                # Check authentication success
+                if 'home' in self.page.url or 'x.com' in self.page.url and 'login' not in self.page.url:
+                    self.authenticated = True
+                    self.session_health_score = 100
+                    self.last_auth_check = time.time()
+                    self.logger.info("✅ AUTH: Authentication successful")
+                    return True
+                else:
+                    self.logger.warning(f"⚠️ AUTH: Authentication may have failed. Current URL: {self.page.url}")
+                    return False
+
+            except Exception as login_e:
+                self.logger.error(f"❌ AUTH: Login process failed: {login_e}")
+                self.auth_failures.append(str(login_e))
+                return False
+
+        except Exception as e:
+            self.logger.error(f"❌ AUTH: Authentication failed: {e}")
+            self.auth_failures.append(str(e))
+            return False
+
+    async def _ensure_authenticated_session(self) -> bool:
+        """Ensure we have a healthy, authenticated session before proceeding"""
+        try:
+            # Check if we need to authenticate
+            if not self.authenticated or not await self._check_session_health():
+                self.logger.info("🔐 AUTHENTICATION REQUIRED")
+
+                # Try session recovery first
+                if self.session_health_score > 0:
+                    if await self._attempt_session_recovery():
+                        return True
+
+                # Full authentication
+                if await self._perform_authentication():
+                    return True
+                else:
+                    self.logger.error("❌ AUTHENTICATION: All authentication methods failed")
+                    return False
+
+            # Session is healthy
+            self.last_auth_check = time.time()
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Authentication check failed: {e}")
+            return False
 
     async def _extract_posts_comprehensive_dom_aggressive(self, username: str, target_count: int) -> List[Dict[str, Any]]:
         """Aggressive DOM extraction without validation - raw data collection"""
@@ -3759,9 +4584,15 @@ class TwitterScraper:
             existing_texts = {tweet.get('text', '') for tweet in tweets}
 
             scroll_attempts = 0
-            max_scrolls = min(50, target_count // 10)  # Scale scrolls with target
+            # Enhanced scrolling for unlimited mode
+            if target_count >= 999999:  # Unlimited mode
+                max_scrolls = 1000  # Very high limit for unlimited mode
+                self.logger.info(f"🌟 UNLIMITED SCROLLING: Up to {max_scrolls} scroll attempts")
+            else:
+                max_scrolls = min(50, target_count // 10)  # Scale scrolls with target
 
-            while len(tweets) < target_count and scroll_attempts < max_scrolls:
+            consecutive_no_new = 0  # Track consecutive rounds with no new tweets
+            while len(tweets) < target_count and scroll_attempts < max_scrolls and consecutive_no_new < 5:
                 await self.page.mouse.wheel(0, 800 + (scroll_attempts * 50))
                 await asyncio.sleep(2)
 
@@ -3788,9 +4619,18 @@ class TwitterScraper:
                                 tweets_this_round += 1
 
                 if tweets_this_round == 0:
-                    # No new tweets found, likely reached end
-                    self.logger.info(f"🔄 SCROLL STOP: No new tweets in round {scroll_attempts + 1}")
-                    break
+                    consecutive_no_new += 1
+                    self.logger.info(f"🔄 SCROLL ATTEMPT {scroll_attempts + 1}: No new tweets (consecutive: {consecutive_no_new}/5)")
+                    if target_count >= 999999:  # Unlimited mode - be more patient
+                        if consecutive_no_new >= 5:
+                            self.logger.info(f"🏁 UNLIMITED MODE END: Reached end of available content after {scroll_attempts + 1} scrolls")
+                            break
+                    else:
+                        # Regular mode - stop faster
+                        break
+                else:
+                    consecutive_no_new = 0  # Reset counter on successful round
+                    self.logger.info(f"🔄 SCROLL ROUND {scroll_attempts + 1}: Found {tweets_this_round} new tweets (total: {len(tweets)})")
 
                 scroll_attempts += 1
 
@@ -3999,28 +4839,225 @@ class TwitterScraper:
         # Allow other resources (CSS, JS, images, etc.)
         await route.continue_()
 
+    # ===== PHASE 4.2: PERFORMANCE AND ANTI-DETECTION OPTIMIZATIONS =====
+
+    async def _optimized_element_wait(self, selector: str, timeout: int = 10000) -> bool:
+        """Phase 4.2: Optimized element waiting with performance caching."""
+        cache_key = f"wait_{selector}_{timeout}"
+
+        if cache_key in self.request_cache:
+            self.extraction_stats['cache_hits'] += 1
+            return self.request_cache[cache_key]
+
+        try:
+            await self.page.wait_for_selector(selector, timeout=timeout)
+            result = True
+        except:
+            result = False
+
+        # Cache successful selectors for future use
+        if result:
+            self.request_cache[cache_key] = result
+
+        self.extraction_stats['requests_made'] += 1
+        return result
+
+    async def _stealth_scroll(self, distance: int = 800, duration: float = 2.0):
+        """Phase 4.2: Human-like scrolling with anti-detection measures."""
+        import random
+
+        if self.anti_detection_enabled:
+            # Vary scroll distance and timing
+            actual_distance = distance + random.randint(-100, 100)
+            actual_duration = duration + random.uniform(-0.5, 0.5)
+
+            # Simulate human scroll patterns
+            scroll_steps = random.randint(3, 8)
+            step_distance = actual_distance // scroll_steps
+
+            for _ in range(scroll_steps):
+                await self.page.mouse.wheel(0, step_distance)
+                await asyncio.sleep(actual_duration / scroll_steps)
+
+            self.extraction_stats['anti_detection_actions'] += 1
+        else:
+            # Standard scroll
+            await self.page.mouse.wheel(0, distance)
+            await asyncio.sleep(duration)
+
+    async def _random_mouse_movement(self):
+        """Phase 4.2: Random mouse movements to simulate human behavior."""
+        import random
+
+        if self.anti_detection_enabled and random.random() < 0.3:
+            try:
+                # Get viewport size
+                viewport = await self.page.viewport_size()
+                if viewport:
+                    x = random.randint(100, viewport['width'] - 100)
+                    y = random.randint(100, viewport['height'] - 100)
+
+                    # Smooth mouse movement
+                    await self.page.mouse.move(x, y)
+                    await asyncio.sleep(random.uniform(0.1, 0.3))
+
+                    self.extraction_stats['anti_detection_actions'] += 1
+            except:
+                pass
+
+    async def _intelligent_delay(self, base_delay: float = 1.0, context: str = "default"):
+        """Phase 4.2: Context-aware intelligent delays."""
+        import random
+
+        # Adjust delay based on context
+        context_multipliers = {
+            "navigation": 1.5,
+            "extraction": 0.8,
+            "scroll": 1.2,
+            "click": 1.0,
+            "default": 1.0
+        }
+
+        multiplier = context_multipliers.get(context, 1.0)
+        adjusted_delay = base_delay * multiplier
+
+        # Add human-like variance
+        if self.timing_variance > 0:
+            variance = random.uniform(-self.timing_variance, self.timing_variance)
+            adjusted_delay *= (1 + variance)
+
+        # Minimum delay for anti-detection
+        adjusted_delay = max(adjusted_delay, 0.2)
+
+        await asyncio.sleep(adjusted_delay)
+
+    async def _performance_optimized_extraction(self, selectors: List[str], element) -> Dict[str, Any]:
+        """Phase 4.2: Performance-optimized element data extraction."""
+        start_time = time.time()
+        results = {}
+
+        if self.performance_mode:
+            # Batch multiple selector queries for efficiency
+            tasks = []
+            for selector in selectors:
+                tasks.append(self._extract_single_selector_data(element, selector))
+
+            # Execute in parallel
+            selector_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for i, result in enumerate(selector_results):
+                if not isinstance(result, Exception) and result:
+                    results[selectors[i]] = result
+        else:
+            # Sequential extraction (fallback)
+            for selector in selectors:
+                try:
+                    result = await self._extract_single_selector_data(element, selector)
+                    if result:
+                        results[selector] = result
+                except Exception as e:
+                    self.logger.debug(f"Selector {selector} failed: {e}")
+
+        extraction_time = time.time() - start_time
+        self.extraction_stats['extraction_time'] += extraction_time
+
+        return results
+
+    async def _extract_single_selector_data(self, element, selector: str) -> Optional[str]:
+        """Helper method for extracting data from a single selector."""
+        try:
+            sub_element = element.locator(selector).first
+            if await sub_element.count() > 0:
+                return await sub_element.inner_text(timeout=2000)
+        except:
+            pass
+        return None
+
+    def _get_performance_metrics(self) -> Dict[str, Any]:
+        """Phase 4.2: Get comprehensive performance metrics."""
+        total_requests = self.extraction_stats['requests_made']
+        cache_hit_rate = (self.extraction_stats['cache_hits'] / max(total_requests, 1)) * 100
+
+        return {
+            "total_requests": total_requests,
+            "cache_hits": self.extraction_stats['cache_hits'],
+            "cache_hit_rate": f"{cache_hit_rate:.1f}%",
+            "total_extraction_time": f"{self.extraction_stats['extraction_time']:.2f}s",
+            "avg_extraction_time": f"{self.extraction_stats['extraction_time'] / max(total_requests, 1):.3f}s",
+            "anti_detection_actions": self.extraction_stats['anti_detection_actions'],
+            "performance_mode": self.performance_mode,
+            "anti_detection_enabled": self.anti_detection_enabled
+        }
+
+    async def _apply_browser_stealth(self):
+        """Phase 4.2: Apply advanced browser stealth measures."""
+        if not self.anti_detection_enabled:
+            return
+
+        try:
+            # Remove webdriver indicators
+            await self.page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                });
+
+                // Remove automation indicators
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+                // Modify user agent
+                Object.defineProperty(navigator, 'userAgent', {
+                    get: () => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                });
+
+                // Mock plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                });
+
+                // Mock languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                });
+            """)
+
+            self.logger.debug("🕵️ Applied browser stealth measures")
+            self.extraction_stats['anti_detection_actions'] += 1
+
+        except Exception as e:
+            self.logger.debug(f"⚠️ Stealth application failed: {e}")
+
     async def scrape_hashtag(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Comprehensive hashtag scraping."""
+        """
+        Phase 2.1: Enhanced Hashtag Scraping with Phase 1 Integration.
+
+        Comprehensive hashtag scraping that leverages Phase 1 enhancements:
+        - Media extraction in posts
+        - Engagement metrics (likes, retweets, replies, views)
+        - Thread detection and reconstruction
+        """
         hashtag = params.get('hashtag', '').replace('#', '')
         max_tweets = params.get('max_tweets', 50)
         include_media = params.get('include_media', True)
         date_filter = params.get('date_filter', 'recent')
-        
-        self.logger.info(f"🏷️ Starting hashtag scraping for #{hashtag}")
-        self.logger.info(f"📊 Target: {max_tweets} tweets | Media: {include_media} | Filter: {date_filter}")
-        
+        scrape_level = params.get('scrape_level', 4)  # Use Level 4 for full enhancement
+
+        self.logger.info(f"🏷️ Phase 2.1: ENHANCED HASHTAG SCRAPING for #{hashtag}")
+        self.logger.info(f"📊 Target: {max_tweets} tweets | Media: {include_media} | Filter: {date_filter} | Level: {scrape_level}")
+
         try:
             # Construct hashtag search URL
             hashtag_url = f"https://x.com/search?q=%23{hashtag}&src=hashtag_click"
-            
+
             # Add filter parameters
             if date_filter == 'recent':
                 hashtag_url += "&f=live"
             elif date_filter == 'popular':
                 hashtag_url += "&f=top"
-                
+
             self.logger.info(f"🌐 Navigating to hashtag: {hashtag_url}")
-            
+
             # Navigate with enhanced stealth
             await self._simulate_human_interaction()
             await self.page.goto(hashtag_url, wait_until='domcontentloaded', timeout=60000)
@@ -4109,100 +5146,930 @@ class TwitterScraper:
             await self.page.mouse.wheel(0, -300)
             await self._human_delay(1, 2)
             
+            # Phase 2.1: Use Phase 1 Enhanced Tweet Extraction for Hashtag Content
+            self.logger.info("🏷️ Phase 2.1: Using enhanced tweet extraction with media, engagement, and threads...")
+
             tweets = []
+            extracted_tweet_ids = set()
+            seen_text_hashes = set()
             scroll_attempts = 0
-            max_scrolls = min(max_tweets // 5, 20)  # Scroll strategy
-            
-            self.logger.info("🏷️ Using div-based hashtag tweet extraction...")
-            
+            # 🔧 PHASE A FIX: Ensure at least 1 scroll attempt for any request
+            max_scrolls = max(min(max_tweets // 5, 15), 1)  # Always allow at least 1 scroll
+
+            # 🔧 PHASE A DEBUG: Log loop conditions
+            self.logger.info(f"🔧 LOOP DEBUG: tweets={len(tweets)}, max_tweets={max_tweets}, scroll_attempts={scroll_attempts}, max_scrolls={max_scrolls}")
+            self.logger.info(f"🔧 LOOP CONDITION: {len(tweets)} < {max_tweets} = {len(tweets) < max_tweets}, {scroll_attempts} < {max_scrolls} = {scroll_attempts < max_scrolls}")
+
             while len(tweets) < max_tweets and scroll_attempts < max_scrolls:
-                # 🚀 Extract tweets using div content parsing (same as profile tweets)
-                div_texts = await self.page.locator('div').all_inner_texts()
-                tweet_candidates = []
-                
-                for div_text in div_texts:
-                    lines = div_text.split('\n')
-                    for line in lines:
-                        line = line.strip()
-                        # ENHANCED & MORE PERMISSIVE hashtag tweet identification
-                        if (len(line) > 20 and len(line) < 500 and  # More permissive length range
-                            not line.startswith('To view') and
-                            not line.startswith('View keyboard') and
-                            not 'keyboard shortcuts' in line and
-                            not line.startswith('http://') and  # Skip full URLs
-                            not line.startswith('https://') and
-                            not line.endswith('.com') and  # Skip domains
-                            not line.endswith('.org') and
-                            not line.endswith('.net') and
-                            not line in ['Follow', 'Following', 'Followers', 'Posts', 'Replies', 'Media', 'Likes', 'Joined', 'Home', 'Search', 'Messages', 'Bookmarks', 'Lists', 'Profile', 'More', 'Latest', 'Top', 'People', 'Photos', 'Videos', 'Tweet', 'Retweet', 'Quote Tweet'] and
-                            not line.endswith(' posts') and
-                            not line.endswith(' Following') and
-                            not line.endswith(' Followers') and
-                            not line.endswith(' likes') and
-                            not line.endswith('Show this thread') and
-                            not line.endswith('Translate post') and
-                            not line.endswith('Copy link') and
-                            not line.endswith('Show more') and
-                            not line.isdigit() and  # Skip pure numbers
-                            not (line.startswith('@') and len(line.split()) == 1) and  # Skip standalone usernames
-                            not all(c in '0123456789,. MKBh' for c in line) and  # Skip stats/counts
-                            not line.startswith('Joined ') and  # Skip join dates
-                            not (line.endswith('ago') and len(line.split()) <= 3) and  # Skip short timestamps
-                            not (len(line.split()) == 1 and line.endswith('ago')) and  # Skip single word timestamps
-                            line not in [f'#{hashtag}', f'#{hashtag.lower()}', f'#{hashtag.upper()}'] and  # Skip hashtag labels
-                            not (line.lower().startswith('search') and 'results' in line.lower())):  # Skip search results text
-                            
-                            # Enhanced hashtag tweet validation
-                            words = line.split()
-                            if (len(words) >= 3 and  # At least 3 words
-                                not any(skip_word in line.lower() for skip_word in [
-                                    'show more', 'show less', 'translate', 'quote tweet', 'repost', 'like',
-                                    'reply', 'view', 'follow', 'unfollow', 'block', 'mute', 'report',
-                                    'search results', 'trending', 'for you', 'following'
-                                ]) and
-                                any(c.isalpha() for c in line)):  # Contains letters
-                                tweet_candidates.append(line)
-                
-                self.logger.info(f"🔍 Found {len(tweet_candidates)} hashtag tweet candidates in attempt {scroll_attempts + 1}")
-                
-                # Remove duplicates and convert to tweet objects
-                seen_tweets = set()
-                for tweet_text in tweet_candidates:
+                self.logger.info(f"🔄 Hashtag extraction round {scroll_attempts + 1}/{max_scrolls}")
+
+                # 🔧 PHASE A FIX: Enhanced tweet element detection with multiple selectors
+                tweet_selectors = [
+                    'article[data-testid="tweet"]',
+                    'div[data-testid="tweet"]',
+                    'article[role="article"]',
+                    'div[data-testid="cellInnerDiv"] article',
+                    'main[role="main"] article'
+                ]
+
+                tweet_elements = []
+                for selector in tweet_selectors:
+                    try:
+                        elements = await self.page.locator(selector).all()
+                        if elements:
+                            tweet_elements.extend(elements)
+                            self.logger.info(f"🎯 Found {len(elements)} elements using selector: {selector}")
+                            break
+                    except Exception as e:
+                        self.logger.debug(f"Selector '{selector}' failed: {e}")
+                        continue
+
+                self.logger.info(f"🎯 Total tweet elements found in hashtag search: {len(tweet_elements)}")
+
+                # Extract tweets using our Phase 1 enhanced method
+                for i, element in enumerate(tweet_elements):
                     if len(tweets) >= max_tweets:
                         break
-                    if tweet_text not in seen_tweets and tweet_text not in [tweet.get('text') for tweet in tweets]:
-                        seen_tweets.add(tweet_text)
-                        tweet_data = {
-                            'id': f'hashtag_tweet_{len(tweets)+1}',
-                            'text': tweet_text,
-                            'hashtag': f'#{hashtag}',
-                            'url': hashtag_url,
-                            'extracted_from': 'div_hashtag_parsing',
-                            'extraction_attempt': scroll_attempts + 1
-                        }
-                        tweets.append(tweet_data)
-                        self.logger.info(f"🏷️ Extracted hashtag tweet {len(tweets)}/{max_tweets}: '{tweet_text[:80]}...'")
-                
-                # Scroll for more tweets
+
+                    try:
+                        if await element.is_visible():
+                            # Use our comprehensive tweet extraction method with all Phase 1 enhancements
+                            tweet_data = await self._extract_tweet_from_element(element, i, f"hashtag_{hashtag}", include_engagement=True)
+
+                            if tweet_data and tweet_data.get('text'):
+                                # Add hashtag-specific metadata
+                                tweet_data['hashtag'] = f'#{hashtag}'
+                                tweet_data['extraction_context'] = 'hashtag_search'
+                                tweet_data['search_url'] = hashtag_url
+                                tweet_data['date_filter'] = date_filter
+                                tweet_data['extraction_method'] = 'phase2_hashtag_enhanced'
+
+                                # Check for duplicates using text hash
+                                import hashlib
+                                text_hash = hashlib.md5(tweet_data['text'].encode()).hexdigest()
+
+                                if (text_hash not in seen_text_hashes and
+                                    tweet_data.get('tweet_id') not in extracted_tweet_ids):
+
+                                    seen_text_hashes.add(text_hash)
+                                    if tweet_data.get('tweet_id'):
+                                        extracted_tweet_ids.add(tweet_data['tweet_id'])
+
+                                    tweets.append(tweet_data)
+                                    self.logger.info(f"🏷️ Phase 2.1: Extracted enhanced hashtag tweet {len(tweets)}/{max_tweets}")
+                                    self.logger.info(f"   📝 Text: {tweet_data['text'][:80]}...")
+
+                                    # Log Phase 1 enhancements found
+                                    enhancements = []
+                                    if tweet_data.get('has_media'):
+                                        enhancements.append(f"media:{len(tweet_data.get('media', []))}")
+                                    if tweet_data.get('likes') is not None:
+                                        enhancements.append(f"likes:{tweet_data['likes']}")
+                                    if tweet_data.get('thread_info', {}).get('is_thread'):
+                                        enhancements.append("thread:true")
+
+                                    if enhancements:
+                                        self.logger.info(f"   ✨ Phase 1 enhancements: {', '.join(enhancements)}")
+
+                    except Exception as e:
+                        self.logger.debug(f"🏷️ Error extracting hashtag tweet {i}: {e}")
+
+                # Scroll for more content
                 if len(tweets) < max_tweets:
-                    self.logger.info(f"📜 Scrolling for more tweets... ({len(tweets)}/{max_tweets})")
+                    self.logger.info(f"📜 Scrolling for more hashtag content... ({len(tweets)}/{max_tweets})")
                     await self.page.mouse.wheel(0, 800)
                     await self._human_delay(2, 4)
                     scroll_attempts += 1
+                else:
+                    break
+
+            # Phase 2.1: Apply Thread Reconstruction to Hashtag Results
+            if len(tweets) > 0:
+                self.logger.info(f"🧵 Phase 2.1: Applying thread reconstruction to hashtag results...")
+                try:
+                    tweets = await self._reconstruct_thread_sequence(tweets, f"hashtag_{hashtag}")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Thread reconstruction failed for hashtag: {e}")
             
             self.logger.info(f"🏁 Hashtag scraping completed: {len(tweets)} tweets extracted")
             
-            return [{
-                "type": "hashtag_tweets",
+            # Phase 2.1: Enhanced result structure with comprehensive metadata
+            result = {
+                "type": "comprehensive_hashtag",
                 "hashtag": f"#{hashtag}",
-                "filter": date_filter,
-                "tweets": tweets,
-                "total_found": len(tweets)
-            }]
-            
+                "search_parameters": {
+                    "hashtag": hashtag,
+                    "max_tweets": max_tweets,
+                    "date_filter": date_filter,
+                    "scrape_level": scrape_level,
+                    "include_media": include_media
+                },
+                "posts": tweets,
+                "extraction_stats": {
+                    "total_posts": len(tweets),
+                    "scroll_attempts": scroll_attempts,
+                    "extraction_method": "phase2_hashtag_enhanced",
+                    "with_media": len([t for t in tweets if t.get('has_media')]),
+                    "with_engagement": len([t for t in tweets if any(t.get(m) is not None for m in ['likes', 'retweets', 'replies'])]),
+                    "with_threads": len([t for t in tweets if t.get('thread_info', {}).get('is_thread')])
+                }
+            }
+
+            self.logger.info(f"📊 Phase 2.1 Results: {result['extraction_stats']['total_posts']} posts, {result['extraction_stats']['with_media']} with media, {result['extraction_stats']['with_engagement']} with engagement, {result['extraction_stats']['with_threads']} in threads")
+
+            return [result]
+
         except Exception as e:
             self.logger.error(f"❌ Hashtag scraping failed: {e}")
+            import traceback
+            self.logger.error(f"❌ Hashtag scraping traceback: {traceback.format_exc()}")
             return []
+
+    async def scrape_search_query(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Phase 2.2: Advanced Search Query Scraping.
+
+        Comprehensive search-based content discovery that supports:
+        - Keyword searches
+        - Hashtag searches (#AI, #crypto)
+        - User mention searches (@username)
+        - Complex queries ("AI startup" OR "machine learning")
+        - Date filtering and result types
+        """
+        search_query = params.get('search_query', params.get('query', ''))
+        max_tweets = params.get('max_tweets', 50)
+        result_type = params.get('result_type', 'recent')  # recent, popular, mixed
+        date_filter = params.get('date_filter', None)  # last_day, last_week, etc.
+        scrape_level = params.get('scrape_level', 4)
+        include_media = params.get('include_media', True)
+
+        self.logger.info(f"🔍 Phase 2.2: ADVANCED SEARCH QUERY SCRAPING")
+        self.logger.info(f"📝 Query: '{search_query}'")
+        self.logger.info(f"📊 Target: {max_tweets} tweets | Type: {result_type} | Level: {scrape_level}")
+
+        try:
+            # FIXED: Construct search URL with proper encoding and X.com format
+            import urllib.parse
+
+            # Validate search query
+            if not search_query or search_query.strip() == '':
+                self.logger.error("❌ Empty search query provided")
+                return []
+
+            search_query = search_query.strip()
+            self.logger.info(f"🔍 Processing search query: '{search_query}'")
+
+            # FIXED: Use proper URL encoding (quote instead of quote_plus)
+            encoded_query = urllib.parse.quote(search_query, safe='')
+
+            # FIXED: Use correct X.com search URL format
+            search_url = f"https://x.com/search?q={encoded_query}&src=typed_query"
+
+            # FIXED: Add proper result type filter using X.com parameters
+            if result_type == 'recent' or result_type == 'live':
+                search_url += "&f=live"  # Recent/live tweets
+                self.logger.info("📊 Filter: Recent/Live tweets")
+            elif result_type == 'popular' or result_type == 'top':
+                search_url += "&f=top"   # Popular tweets
+                self.logger.info("📊 Filter: Popular tweets")
+            else:
+                self.logger.info("📊 Filter: Mixed results (default)")
+
+            # FIXED: Date filtering using proper X.com format
+            if date_filter:
+                from datetime import datetime, timedelta
+                if date_filter == 'last_day':
+                    until_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+                    search_url += f"&until={until_date}"
+                    self.logger.info(f"📅 Date filter: Until {until_date}")
+                elif date_filter == 'last_week':
+                    until_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+                    search_url += f"&until={until_date}"
+                    self.logger.info(f"📅 Date filter: Until {until_date}")
+                elif date_filter == 'last_month':
+                    until_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+                    search_url += f"&until={until_date}"
+                    self.logger.info(f"📅 Date filter: Until {until_date}")
+
+            self.logger.info(f"🌐 Search URL: {search_url}")
+
+            # FIXED: Enhanced navigation with better error handling
+            try:
+                self.logger.info(f"🌐 Navigating to: {search_url}")
+                await self._simulate_human_interaction()
+
+                # Navigate with improved timeout and error handling
+                response = await self.page.goto(search_url, wait_until='networkidle', timeout=30000)
+
+                if response and response.status >= 400:
+                    self.logger.error(f"❌ HTTP {response.status} error for search URL")
+                    return []
+
+                await self._human_delay(3, 6)
+                await self._simulate_human_interaction()
+
+                # Verify we're on a search page
+                page_url = self.page.url
+                if 'search' not in page_url:
+                    self.logger.error(f"❌ Not on search page. Current URL: {page_url}")
+                    return []
+
+                self.logger.info(f"✅ Successfully navigated to search page")
+
+            except Exception as nav_error:
+                self.logger.error(f"❌ Navigation failed: {nav_error}")
+                return []
+
+            # Enhanced content loading detection
+            self.logger.info("⏳ Phase 2.2: Loading search results...")
+
+            # Wait for search results to load
+            await self._human_delay(3, 5)
+
+            # Check if we're on the search results page
+            try:
+                page_title = await self.page.title()
+                self.logger.info(f"📄 Page title: {page_title}")
+
+                # Look for search result indicators
+                search_indicators = [
+                    'div[data-testid="primaryColumn"]',
+                    'section[aria-label*="Search"]',
+                    'article[data-testid="tweet"]'
+                ]
+
+                content_found = False
+                for indicator in search_indicators:
+                    elements = await self.page.locator(indicator).count()
+                    if elements > 0:
+                        self.logger.info(f"✅ Search content detected: {elements} {indicator} elements")
+                        content_found = True
+                        break
+
+                if not content_found:
+                    self.logger.warning("⚠️ Search content detection unclear, proceeding...")
+
+            except Exception as e:
+                self.logger.debug(f"Search page validation error: {e}")
+
+            # FIXED: Enhanced search results extraction
+            self.logger.info("🔍 SEARCH EXTRACTION: Using optimized tweet extraction for search results...")
+
+            # Wait for search results to load properly
+            try:
+                await self.page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
+                await self._human_delay(2, 4)
+            except Exception as e:
+                self.logger.warning(f"⚠️ Search results loading timeout: {e}")
+
+            tweets = []
+            extracted_tweet_ids = set()
+            seen_text_hashes = set()
+            scroll_attempts = 0
+            max_scrolls = min(max(max_tweets // 5, 10), 30)  # More aggressive scrolling
+
+            self.logger.info(f"🎯 SEARCH TARGET: {max_tweets} tweets, max {max_scrolls} scrolls")
+
+            while len(tweets) < max_tweets and scroll_attempts < max_scrolls:
+                self.logger.info(f"🔄 Search round {scroll_attempts + 1}/{max_scrolls} - {len(tweets)} tweets found")
+
+                # FIXED: Enhanced tweet element detection with multiple selectors
+                tweet_selectors = [
+                    'article[data-testid="tweet"]',
+                    'div[data-testid="tweet"]',
+                    'article[role="article"]'
+                ]
+
+                tweet_elements = []
+                for selector in tweet_selectors:
+                    try:
+                        elements = await self.page.locator(selector).all()
+                        if elements:
+                            tweet_elements.extend(elements)
+                            break
+                    except:
+                        continue
+
+                self.logger.info(f"📊 Found {len(tweet_elements)} tweet elements in current view")
+
+                # Extract tweets using our Phase 1 enhanced method
+                for i, element in enumerate(tweet_elements):
+                    if len(tweets) >= max_tweets:
+                        break
+
+                    try:
+                        if await element.is_visible():
+                            # Use comprehensive tweet extraction with all Phase 1 enhancements
+                            tweet_data = await self._extract_tweet_from_element(element, i, f"search_{encoded_query}", include_engagement=True)
+
+                            if tweet_data and tweet_data.get('text'):
+                                # Add search-specific metadata
+                                tweet_data['search_query'] = search_query
+                                tweet_data['search_context'] = 'query_search'
+                                tweet_data['search_url'] = search_url
+                                tweet_data['result_type'] = result_type
+                                tweet_data['extraction_method'] = 'phase2_search_enhanced'
+
+                                # Enhanced relevance scoring
+                                relevance_score = self._calculate_search_relevance(tweet_data['text'], search_query)
+                                tweet_data['relevance_score'] = relevance_score
+
+                                # Check for duplicates
+                                import hashlib
+                                text_hash = hashlib.md5(tweet_data['text'].encode()).hexdigest()
+
+                                if (text_hash not in seen_text_hashes and
+                                    tweet_data.get('tweet_id') not in extracted_tweet_ids):
+
+                                    seen_text_hashes.add(text_hash)
+                                    if tweet_data.get('tweet_id'):
+                                        extracted_tweet_ids.add(tweet_data['tweet_id'])
+
+                                    tweets.append(tweet_data)
+                                    self.logger.info(f"🔍 Phase 2.2: Extracted search result {len(tweets)}/{max_tweets}")
+                                    self.logger.info(f"   📝 Text: {tweet_data['text'][:80]}...")
+                                    self.logger.info(f"   🎯 Relevance: {relevance_score:.2f}")
+
+                                    # Log Phase 1 enhancements
+                                    enhancements = []
+                                    if tweet_data.get('has_media'):
+                                        enhancements.append(f"media:{len(tweet_data.get('media', []))}")
+                                    if tweet_data.get('likes') is not None:
+                                        enhancements.append(f"likes:{tweet_data['likes']}")
+                                    if tweet_data.get('thread_info', {}).get('is_thread'):
+                                        enhancements.append("thread:true")
+
+                                    if enhancements:
+                                        self.logger.info(f"   ✨ Phase 1 data: {', '.join(enhancements)}")
+
+                    except Exception as e:
+                        self.logger.debug(f"🔍 Error extracting search result {i}: {e}")
+
+                # Scroll for more content
+                if len(tweets) < max_tweets:
+                    self.logger.info(f"📜 Scrolling for more search results... ({len(tweets)}/{max_tweets})")
+                    await self.page.mouse.wheel(0, 800)
+                    await self._human_delay(2, 4)
+                    scroll_attempts += 1
+                else:
+                    break
+
+            # Phase 2.2: Apply Thread Reconstruction and Relevance Sorting
+            if len(tweets) > 0:
+                self.logger.info(f"🧵 Phase 2.2: Applying thread reconstruction...")
+                try:
+                    tweets = await self._reconstruct_thread_sequence(tweets, f"search_{encoded_query}")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Thread reconstruction failed for search: {e}")
+
+                # Sort by relevance score (highest first)
+                tweets.sort(key=lambda t: t.get('relevance_score', 0), reverse=True)
+                self.logger.info(f"📊 Sorted {len(tweets)} results by relevance")
+
+            self.logger.info(f"🏁 Search query scraping completed: {len(tweets)} tweets extracted")
+
+            # Phase 2.2: Enhanced result structure
+            result = {
+                "type": "comprehensive_search",
+                "search_query": search_query,
+                "search_parameters": {
+                    "query": search_query,
+                    "max_tweets": max_tweets,
+                    "result_type": result_type,
+                    "date_filter": date_filter,
+                    "scrape_level": scrape_level,
+                    "include_media": include_media
+                },
+                "posts": tweets,
+                "extraction_stats": {
+                    "total_posts": len(tweets),
+                    "scroll_attempts": scroll_attempts,
+                    "extraction_method": "phase2_search_enhanced",
+                    "with_media": len([t for t in tweets if t.get('has_media')]),
+                    "with_engagement": len([t for t in tweets if any(t.get(m) is not None for m in ['likes', 'retweets', 'replies'])]),
+                    "with_threads": len([t for t in tweets if t.get('thread_info', {}).get('is_thread')]),
+                    "avg_relevance": sum(t.get('relevance_score', 0) for t in tweets) / len(tweets) if tweets else 0
+                }
+            }
+
+            self.logger.info(f"📊 Phase 2.2 Results: {result['extraction_stats']['total_posts']} posts, avg relevance: {result['extraction_stats']['avg_relevance']:.2f}")
+
+            return [result]
+
+        except Exception as e:
+            self.logger.error(f"❌ Search query scraping failed: {e}")
+            return []
+
+    def _calculate_search_relevance(self, text: str, search_query: str) -> float:
+        """
+        Calculate relevance score between tweet text and search query.
+        Returns score from 0.0 to 1.0.
+        """
+        try:
+            text_lower = text.lower()
+            query_lower = search_query.lower()
+
+            # Exact query match (highest score)
+            if query_lower in text_lower:
+                return 1.0
+
+            # Split query into terms
+            query_terms = query_lower.split()
+            text_words = text_lower.split()
+
+            # Count matching terms
+            matches = sum(1 for term in query_terms if term in text_words)
+
+            # Calculate base relevance
+            relevance = matches / len(query_terms) if query_terms else 0
+
+            # Boost for hashtags in query
+            if search_query.startswith('#') and search_query.lower() in text_lower:
+                relevance += 0.3
+
+            # Boost for @mentions in query
+            if search_query.startswith('@') and search_query.lower() in text_lower:
+                relevance += 0.3
+
+            return min(relevance, 1.0)
+
+        except Exception:
+            return 0.0
+
+    async def monitor_real_time(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Phase 3.1: Real-time Monitoring Mode.
+
+        Continuous monitoring system that supports:
+        - User account monitoring
+        - Hashtag monitoring
+        - Search query monitoring
+        - Periodic updates with change detection
+        - Delta reporting (only new content)
+        - Configurable monitoring intervals
+        """
+        monitor_type = params.get('monitor_type', 'user')  # user, hashtag, search
+        monitor_target = params.get('monitor_target', '')  # username, hashtag, or query
+        monitoring_interval = params.get('monitoring_interval', 300)  # seconds between checks
+        max_iterations = params.get('max_iterations', 10)  # maximum monitoring cycles
+        delta_only = params.get('delta_only', True)  # only return new content
+        scrape_level = params.get('scrape_level', 4)
+
+        self.logger.info(f"🔄 Phase 3.1: REAL-TIME MONITORING MODE")
+        self.logger.info(f"🎯 Type: {monitor_type} | Target: '{monitor_target}'")
+        self.logger.info(f"⏱️ Interval: {monitoring_interval}s | Max cycles: {max_iterations}")
+        self.logger.info(f"🔄 Delta only: {delta_only}")
+
+        monitoring_results = []
+        previous_content_ids = set()
+        monitoring_start_time = time.time()
+
+        try:
+            for iteration in range(max_iterations):
+                cycle_start_time = time.time()
+                self.logger.info(f"🔄 Monitoring cycle {iteration + 1}/{max_iterations}")
+
+                # Prepare parameters for the specific monitoring type
+                monitoring_params = {
+                    'scrape_level': scrape_level,
+                    'max_tweets': params.get('max_tweets', 20)
+                }
+
+                current_results = []
+
+                # Route to appropriate scraping method based on monitor type
+                if monitor_type == 'user':
+                    monitoring_params['username'] = monitor_target.replace('@', '')
+                    monitoring_params['scrape_posts'] = True
+                    current_results = await self._extract_posts_adaptive(
+                        monitoring_params['username'],
+                        monitoring_params['max_tweets'],
+                        scrape_level
+                    )
+
+                elif monitor_type == 'hashtag':
+                    monitoring_params['hashtag'] = monitor_target.replace('#', '')
+                    monitoring_params['max_tweets'] = monitoring_params.pop('max_tweets')
+                    hashtag_results = await self.scrape_hashtag(monitoring_params)
+                    if hashtag_results and len(hashtag_results) > 0:
+                        current_results = hashtag_results[0].get('posts', [])
+
+                elif monitor_type == 'search':
+                    monitoring_params['search_query'] = monitor_target
+                    monitoring_params['max_tweets'] = monitoring_params.pop('max_tweets')
+                    search_results = await self.scrape_search_query(monitoring_params)
+                    if search_results and len(search_results) > 0:
+                        current_results = search_results[0].get('posts', [])
+
+                else:
+                    self.logger.error(f"❌ Invalid monitor type: {monitor_type}")
+                    break
+
+                # Process results for delta detection
+                current_content_ids = set()
+                new_content = []
+                updated_content = []
+
+                for item in current_results:
+                    item_id = item.get('tweet_id') or item.get('id')
+                    if item_id:
+                        current_content_ids.add(item_id)
+
+                        # Add monitoring metadata
+                        item['monitoring_metadata'] = {
+                            'cycle': iteration + 1,
+                            'detected_at': time.time(),
+                            'monitor_type': monitor_type,
+                            'monitor_target': monitor_target,
+                            'is_new': item_id not in previous_content_ids
+                        }
+
+                        # Classify as new or updated content
+                        if item_id not in previous_content_ids:
+                            new_content.append(item)
+                        else:
+                            # Check for updates (engagement changes, etc.)
+                            if self._has_content_changed(item, monitoring_results, item_id):
+                                updated_content.append(item)
+
+                # Calculate monitoring metrics
+                cycle_duration = time.time() - cycle_start_time
+                total_new = len(new_content)
+                total_updated = len(updated_content)
+
+                cycle_result = {
+                    'cycle': iteration + 1,
+                    'timestamp': cycle_start_time,
+                    'duration_seconds': cycle_duration,
+                    'monitor_type': monitor_type,
+                    'monitor_target': monitor_target,
+                    'total_items_found': len(current_results),
+                    'new_items': total_new,
+                    'updated_items': total_updated,
+                    'content': new_content if delta_only else current_results
+                }
+
+                monitoring_results.append(cycle_result)
+
+                self.logger.info(f"🔄 Cycle {iteration + 1} complete:")
+                self.logger.info(f"   📊 Total items: {len(current_results)}")
+                self.logger.info(f"   ✨ New items: {total_new}")
+                self.logger.info(f"   🔄 Updated items: {total_updated}")
+                self.logger.info(f"   ⏱️ Duration: {cycle_duration:.1f}s")
+
+                # Update tracking sets
+                previous_content_ids.update(current_content_ids)
+
+                # Wait for next cycle (unless it's the last iteration)
+                if iteration < max_iterations - 1:
+                    self.logger.info(f"⏳ Waiting {monitoring_interval}s for next cycle...")
+                    await asyncio.sleep(monitoring_interval)
+
+            # Generate comprehensive monitoring summary
+            total_duration = time.time() - monitoring_start_time
+            total_new_items = sum(result['new_items'] for result in monitoring_results)
+            total_updated_items = sum(result['updated_items'] for result in monitoring_results)
+
+            monitoring_summary = {
+                'type': 'real_time_monitoring',
+                'monitor_type': monitor_type,
+                'monitor_target': monitor_target,
+                'monitoring_parameters': {
+                    'interval_seconds': monitoring_interval,
+                    'max_iterations': max_iterations,
+                    'delta_only': delta_only,
+                    'scrape_level': scrape_level
+                },
+                'monitoring_results': monitoring_results,
+                'monitoring_stats': {
+                    'total_cycles': len(monitoring_results),
+                    'total_duration_seconds': total_duration,
+                    'total_new_items': total_new_items,
+                    'total_updated_items': total_updated_items,
+                    'avg_cycle_duration': sum(r['duration_seconds'] for r in monitoring_results) / len(monitoring_results) if monitoring_results else 0,
+                    'items_per_minute': (total_new_items + total_updated_items) / (total_duration / 60) if total_duration > 0 else 0
+                }
+            }
+
+            self.logger.info(f"🏁 Real-time monitoring complete:")
+            self.logger.info(f"   🔄 {len(monitoring_results)} cycles over {total_duration:.1f}s")
+            self.logger.info(f"   ✨ {total_new_items} new items discovered")
+            self.logger.info(f"   🔄 {total_updated_items} items updated")
+
+            return [monitoring_summary]
+
+        except Exception as e:
+            self.logger.error(f"❌ Real-time monitoring failed: {e}")
+            return []
+
+    def _has_content_changed(self, current_item: Dict[str, Any], previous_results: List[Dict[str, Any]], item_id: str) -> bool:
+        """
+        Check if content has changed since last monitoring cycle.
+        Compares engagement metrics and other mutable fields.
+        """
+        try:
+            # Find the item in previous results
+            for cycle_result in reversed(previous_results):  # Check most recent first
+                for prev_item in cycle_result.get('content', []):
+                    if prev_item.get('tweet_id') == item_id or prev_item.get('id') == item_id:
+                        # Compare engagement metrics
+                        engagement_fields = ['likes', 'retweets', 'replies', 'views']
+                        for field in engagement_fields:
+                            if current_item.get(field) != prev_item.get(field):
+                                return True
+
+                        # Compare other mutable fields
+                        if current_item.get('text') != prev_item.get('text'):
+                            return True
+
+                        return False
+
+            return False  # Item not found in previous results
+
+        except Exception:
+            return False
+
+    def classify_content(self, tweet_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Phase 3.2: Advanced Content Classification.
+
+        Intelligent content categorization and analysis:
+        - Content type detection (announcement, question, opinion, etc.)
+        - Sentiment analysis (positive, negative, neutral)
+        - Topic classification (tech, business, personal, etc.)
+        - Language detection
+        - Content quality scoring
+        - Engagement potential prediction
+        """
+        try:
+            text = tweet_data.get('text', '')
+            if not text:
+                return {'classification_error': 'No text content'}
+
+            classification = {
+                'content_type': self._classify_content_type(text),
+                'sentiment': self._analyze_sentiment(text),
+                'topics': self._classify_topics(text),
+                'language': self._detect_language(text),
+                'quality_score': self._calculate_quality_score(tweet_data),
+                'engagement_potential': self._predict_engagement_potential(tweet_data),
+                'content_features': self._extract_content_features(text),
+                'classification_confidence': 0.0
+            }
+
+            # Calculate overall classification confidence
+            classification['classification_confidence'] = self._calculate_classification_confidence(classification)
+
+            return classification
+
+        except Exception as e:
+            return {'classification_error': str(e)}
+
+    def _classify_content_type(self, text: str) -> Dict[str, Any]:
+        """Classify the type/nature of the content."""
+        content_type_indicators = {
+            'question': ['?', 'how to', 'what is', 'why', 'when', 'where', 'who'],
+            'announcement': ['announcing', 'excited to share', 'launching', 'introducing', 'release'],
+            'opinion': ['i think', 'in my opinion', 'i believe', 'imo', 'personally'],
+            'news': ['breaking', 'just in', 'report', 'according to', 'sources'],
+            'tutorial': ['how to', 'step by step', 'guide', 'tutorial', 'learn'],
+            'promotion': ['check out', 'link in bio', 'buy now', 'discount', 'sale'],
+            'request': ['please', 'help', 'need', 'looking for', 'can someone'],
+            'celebration': ['congratulations', 'congrats', 'achieved', 'milestone', 'success'],
+            'complaint': ['frustrated', 'annoying', 'terrible', 'worst', 'disappointed'],
+            'thread': ['thread', '🧵', '1/', 'part 1', 'continued']
+        }
+
+        text_lower = text.lower()
+        detected_types = []
+        confidence_scores = {}
+
+        for content_type, indicators in content_type_indicators.items():
+            score = 0
+            for indicator in indicators:
+                if indicator in text_lower:
+                    score += 1
+
+            if score > 0:
+                confidence = min(score / len(indicators), 1.0)
+                detected_types.append(content_type)
+                confidence_scores[content_type] = confidence
+
+        # Default to 'general' if no specific type detected
+        if not detected_types:
+            detected_types = ['general']
+            confidence_scores['general'] = 0.5
+
+        return {
+            'primary_type': detected_types[0],
+            'all_types': detected_types,
+            'confidence_scores': confidence_scores
+        }
+
+    def _analyze_sentiment(self, text: str) -> Dict[str, Any]:
+        """Analyze sentiment of the content."""
+        positive_words = [
+            'amazing', 'awesome', 'great', 'excellent', 'fantastic', 'love', 'best',
+            'incredible', 'wonderful', 'outstanding', 'perfect', 'brilliant', 'excited',
+            'happy', 'successful', 'breakthrough', 'revolutionary', 'innovative'
+        ]
+
+        negative_words = [
+            'terrible', 'awful', 'hate', 'worst', 'disappointing', 'frustrated',
+            'angry', 'sad', 'broken', 'failed', 'disaster', 'crisis', 'problem',
+            'issue', 'concerned', 'worried', 'unfortunate', 'disappointing'
+        ]
+
+        neutral_words = [
+            'update', 'information', 'report', 'data', 'analysis', 'research',
+            'study', 'findings', 'results', 'statistics', 'facts', 'details'
+        ]
+
+        text_lower = text.lower()
+
+        positive_score = sum(1 for word in positive_words if word in text_lower)
+        negative_score = sum(1 for word in negative_words if word in text_lower)
+        neutral_score = sum(1 for word in neutral_words if word in text_lower)
+
+        total_score = positive_score + negative_score + neutral_score
+
+        if total_score == 0:
+            return {'sentiment': 'neutral', 'confidence': 0.3, 'scores': {'positive': 0, 'negative': 0, 'neutral': 1}}
+
+        sentiment_scores = {
+            'positive': positive_score / total_score,
+            'negative': negative_score / total_score,
+            'neutral': neutral_score / total_score
+        }
+
+        # Determine primary sentiment
+        primary_sentiment = max(sentiment_scores.keys(), key=lambda x: sentiment_scores[x])
+        confidence = sentiment_scores[primary_sentiment]
+
+        return {
+            'sentiment': primary_sentiment,
+            'confidence': confidence,
+            'scores': sentiment_scores
+        }
+
+    def _classify_topics(self, text: str) -> List[str]:
+        """Classify content topics."""
+        topic_keywords = {
+            'technology': ['ai', 'artificial intelligence', 'machine learning', 'ml', 'tech', 'software', 'programming', 'code', 'api', 'cloud', 'data'],
+            'business': ['startup', 'entrepreneur', 'funding', 'investment', 'revenue', 'market', 'business', 'company', 'strategy', 'growth'],
+            'crypto': ['bitcoin', 'ethereum', 'crypto', 'blockchain', 'defi', 'nft', 'web3', 'dao', 'token', 'mining'],
+            'science': ['research', 'study', 'experiment', 'discovery', 'scientific', 'paper', 'journal', 'peer review'],
+            'education': ['learning', 'course', 'tutorial', 'education', 'teaching', 'student', 'university', 'school'],
+            'health': ['health', 'medical', 'doctor', 'hospital', 'medicine', 'treatment', 'therapy', 'wellness'],
+            'finance': ['money', 'investment', 'stock', 'market', 'finance', 'trading', 'economy', 'bank'],
+            'politics': ['government', 'policy', 'election', 'vote', 'political', 'congress', 'senate', 'president'],
+            'entertainment': ['movie', 'music', 'game', 'entertainment', 'show', 'celebrity', 'art', 'culture'],
+            'sports': ['sport', 'football', 'basketball', 'soccer', 'baseball', 'team', 'player', 'game', 'match']
+        }
+
+        text_lower = text.lower()
+        detected_topics = []
+
+        for topic, keywords in topic_keywords.items():
+            if any(keyword in text_lower for keyword in keywords):
+                detected_topics.append(topic)
+
+        return detected_topics if detected_topics else ['general']
+
+    def _detect_language(self, text: str) -> str:
+        """Simple language detection."""
+        # Simple heuristic-based language detection
+        if any(char in text for char in 'àáäâèéëêìíïîòóöôùúüûñç'):
+            return 'romance'  # French, Spanish, Italian, etc.
+        elif any(char in text for char in 'äöüß'):
+            return 'german'
+        elif any(char in text for char in 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'):
+            return 'russian'
+        elif any(char in text for char in '你我他她它们的是在有中国'):
+            return 'chinese'
+        elif any(char in text for char in 'ひらがなカタカナ'):
+            return 'japanese'
+        else:
+            return 'english'  # Default assumption
+
+    def _calculate_quality_score(self, tweet_data: Dict[str, Any]) -> float:
+        """Calculate content quality score based on various factors."""
+        try:
+            text = tweet_data.get('text', '')
+            score = 0.5  # Base score
+
+            # Length factor (optimal range)
+            text_length = len(text)
+            if 50 <= text_length <= 280:
+                score += 0.2
+            elif text_length < 20:
+                score -= 0.2
+
+            # Engagement factor
+            engagement_metrics = ['likes', 'retweets', 'replies']
+            total_engagement = sum(tweet_data.get(metric, 0) for metric in engagement_metrics)
+            if total_engagement > 100:
+                score += 0.2
+            elif total_engagement > 10:
+                score += 0.1
+
+            # Media presence
+            if tweet_data.get('has_media'):
+                score += 0.1
+
+            # Thread factor
+            if tweet_data.get('thread_info', {}).get('is_thread'):
+                score += 0.1
+
+            # URL presence (information sharing)
+            if 'http' in text or 'www.' in text:
+                score += 0.05
+
+            # Hashtag usage (moderate is good)
+            hashtag_count = text.count('#')
+            if 1 <= hashtag_count <= 3:
+                score += 0.05
+            elif hashtag_count > 5:
+                score -= 0.1
+
+            return min(max(score, 0.0), 1.0)
+
+        except Exception:
+            return 0.5
+
+    def _predict_engagement_potential(self, tweet_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Predict engagement potential based on content features."""
+        try:
+            text = tweet_data.get('text', '')
+
+            engagement_factors = {
+                'has_question': '?' in text,
+                'has_media': tweet_data.get('has_media', False),
+                'is_thread': tweet_data.get('thread_info', {}).get('is_thread', False),
+                'has_hashtags': '#' in text,
+                'has_mentions': '@' in text,
+                'has_url': any(url in text for url in ['http', 'www.']),
+                'optimal_length': 50 <= len(text) <= 200,
+                'has_emoji': any(ord(char) > 127 for char in text)
+            }
+
+            # Calculate engagement score
+            engagement_score = sum(engagement_factors.values()) / len(engagement_factors)
+
+            # Predict engagement level
+            if engagement_score >= 0.7:
+                potential = 'high'
+            elif engagement_score >= 0.4:
+                potential = 'medium'
+            else:
+                potential = 'low'
+
+            return {
+                'potential': potential,
+                'score': engagement_score,
+                'factors': engagement_factors
+            }
+
+        except Exception:
+            return {'potential': 'unknown', 'score': 0.0, 'factors': {}}
+
+    def _extract_content_features(self, text: str) -> Dict[str, Any]:
+        """Extract detailed content features."""
+        return {
+            'length': len(text),
+            'word_count': len(text.split()),
+            'hashtag_count': text.count('#'),
+            'mention_count': text.count('@'),
+            'url_count': text.count('http') + text.count('www.'),
+            'emoji_count': sum(1 for char in text if ord(char) > 127),
+            'question_marks': text.count('?'),
+            'exclamation_marks': text.count('!'),
+            'capital_letters_ratio': sum(1 for char in text if char.isupper()) / len(text) if text else 0
+        }
+
+    def _calculate_classification_confidence(self, classification: Dict[str, Any]) -> float:
+        """Calculate overall confidence in the classification."""
+        try:
+            confidence_factors = []
+
+            # Content type confidence
+            content_type_conf = classification.get('content_type', {}).get('confidence_scores', {})
+            if content_type_conf:
+                confidence_factors.append(max(content_type_conf.values()))
+
+            # Sentiment confidence
+            sentiment_conf = classification.get('sentiment', {}).get('confidence', 0)
+            confidence_factors.append(sentiment_conf)
+
+            # Topic detection confidence (based on number of topics)
+            topics = classification.get('topics', [])
+            topic_conf = 0.8 if len(topics) > 1 else 0.6 if len(topics) == 1 else 0.3
+            confidence_factors.append(topic_conf)
+
+            return sum(confidence_factors) / len(confidence_factors) if confidence_factors else 0.0
+
+        except Exception:
+            return 0.0
 
     async def scrape_user_comprehensive(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Comprehensive user account scraping with all options."""
@@ -4406,6 +6273,340 @@ class TwitterScraper:
             self.logger.error(f"❌ Comprehensive user scraping failed: {e}")
             return [results]  # Return partial results
     
+    @staticmethod
+    async def _export_results_multi_format(
+        result: Dict[str, Any],
+        output_dir: str,
+        formats: List[str],
+        logger: logging.Logger
+    ) -> List[str]:
+        """
+        Phase 4.1: Multi-Format Export System
+
+        Exports data in multiple formats including JSON, CSV, XML, Parquet, and enhanced formats.
+        """
+        exported_files = []
+
+        try:
+            # Extract posts data for processing
+            posts_data = []
+            data = result.get('data', [])
+
+            for item in data:
+                if isinstance(item, dict):
+                    if 'posts' in item:
+                        posts_data.extend(item['posts'])
+                    elif 'text' in item:  # Direct post object
+                        posts_data.append(item)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            for format_type in formats:
+                try:
+                    if format_type.lower() == 'json':
+                        # Enhanced JSON with metadata
+                        file_path = os.path.join(output_dir, f"twitter_data_{timestamp}.json")
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            enhanced_result = {
+                                **result,
+                                "export_metadata": {
+                                    "format": "json",
+                                    "exported_at": datetime.now().isoformat(),
+                                    "posts_count": len(posts_data),
+                                    "phase_enhancements": ["media", "engagement", "threads", "classification"]
+                                }
+                            }
+                            json.dump(enhanced_result, f, indent=2, ensure_ascii=False)
+                        exported_files.append(file_path)
+
+                    elif format_type.lower() == 'csv':
+                        # Flattened CSV format
+                        file_path = os.path.join(output_dir, f"twitter_posts_{timestamp}.csv")
+                        await TwitterTask._export_to_csv(posts_data, file_path)
+                        exported_files.append(file_path)
+
+                    elif format_type.lower() == 'xml':
+                        # Structured XML format
+                        file_path = os.path.join(output_dir, f"twitter_data_{timestamp}.xml")
+                        await TwitterTask._export_to_xml(result, file_path)
+                        exported_files.append(file_path)
+
+                    elif format_type.lower() == 'parquet':
+                        # High-performance parquet format
+                        file_path = os.path.join(output_dir, f"twitter_posts_{timestamp}.parquet")
+                        await TwitterTask._export_to_parquet(posts_data, file_path)
+                        exported_files.append(file_path)
+
+                    elif format_type.lower() == 'excel':
+                        # Excel workbook with multiple sheets
+                        file_path = os.path.join(output_dir, f"twitter_analysis_{timestamp}.xlsx")
+                        await TwitterTask._export_to_excel(result, posts_data, file_path)
+                        exported_files.append(file_path)
+
+                    elif format_type.lower() == 'markdown':
+                        # Human-readable markdown report
+                        file_path = os.path.join(output_dir, f"twitter_report_{timestamp}.md")
+                        await TwitterTask._export_to_markdown(result, posts_data, file_path)
+                        exported_files.append(file_path)
+
+                    else:
+                        logger.warning(f"⚠️ Unknown export format: {format_type}")
+
+                except Exception as format_error:
+                    logger.error(f"❌ Failed to export {format_type}: {format_error}")
+
+        except Exception as e:
+            logger.error(f"❌ Multi-format export failed: {e}")
+
+        return exported_files
+
+    @staticmethod
+    async def _export_to_csv(posts_data: List[Dict], file_path: str):
+        """Export posts to CSV format with flattened structure."""
+        import csv
+
+        if not posts_data:
+            return
+
+        # Define CSV headers including all Phase enhancements
+        headers = [
+            'id', 'text', 'author', 'author_name', 'timestamp', 'url',
+            'likes', 'retweets', 'replies', 'views', 'quotes',
+            'has_media', 'media_count', 'media_types',
+            'is_thread', 'thread_position', 'thread_size',
+            'content_type', 'sentiment', 'topics', 'quality_score', 'language',
+            'extraction_method', 'validation_confidence'
+        ]
+
+        with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=headers)
+            writer.writeheader()
+
+            for post in posts_data:
+                # Flatten complex objects for CSV
+                row = {}
+                for header in headers:
+                    if header in post:
+                        value = post[header]
+                        if isinstance(value, (list, dict)):
+                            row[header] = json.dumps(value) if value else ''
+                        else:
+                            row[header] = str(value) if value is not None else ''
+                    else:
+                        # Handle nested data
+                        if header == 'media_count':
+                            row[header] = len(post.get('media', []))
+                        elif header == 'media_types':
+                            media_types = [m.get('type', 'unknown') for m in post.get('media', [])]
+                            row[header] = ','.join(set(media_types)) if media_types else ''
+                        elif header in ['is_thread', 'thread_position', 'thread_size']:
+                            thread_info = post.get('thread_info', {})
+                            if header == 'is_thread':
+                                row[header] = str(thread_info.get('is_thread', False))
+                            else:
+                                row[header] = str(thread_info.get(header.replace('thread_', ''), ''))
+                        elif header in ['content_type', 'sentiment', 'topics', 'quality_score', 'language']:
+                            classification = post.get('classification', {})
+                            if header == 'topics':
+                                row[header] = ','.join(classification.get('topics', []))
+                            else:
+                                row[header] = str(classification.get(header, ''))
+                        else:
+                            row[header] = ''
+
+                writer.writerow(row)
+
+    @staticmethod
+    async def _export_to_xml(result: Dict, file_path: str):
+        """Export data to XML format."""
+        xml_content = ['<?xml version="1.0" encoding="UTF-8"?>']
+        xml_content.append('<twitter_data>')
+
+        # Add metadata
+        metadata = result.get('search_metadata', {})
+        xml_content.append('  <metadata>')
+        for key, value in metadata.items():
+            xml_content.append(f'    <{key}>{str(value)}</{key}>')
+        xml_content.append('  </metadata>')
+
+        # Add posts
+        xml_content.append('  <posts>')
+        data = result.get('data', [])
+
+        for item in data:
+            if isinstance(item, dict) and 'posts' in item:
+                for post in item['posts']:
+                    xml_content.append('    <post>')
+
+                    # Basic fields
+                    for field in ['id', 'text', 'author', 'author_name', 'timestamp', 'url']:
+                        value = post.get(field, '')
+                        if value:
+                            escaped_value = str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                            xml_content.append(f'      <{field}>{escaped_value}</{field}>')
+
+                    # Engagement metrics
+                    xml_content.append('      <engagement>')
+                    for metric in ['likes', 'retweets', 'replies', 'views']:
+                        value = post.get(metric, 0)
+                        xml_content.append(f'        <{metric}>{value}</{metric}>')
+                    xml_content.append('      </engagement>')
+
+                    # Media
+                    if post.get('media'):
+                        xml_content.append('      <media>')
+                        for media in post['media']:
+                            xml_content.append('        <item>')
+                            xml_content.append(f'          <type>{media.get("type", "")}</type>')
+                            xml_content.append(f'          <url>{media.get("url", "")}</url>')
+                            xml_content.append('        </item>')
+                        xml_content.append('      </media>')
+
+                    # Classification
+                    if post.get('classification'):
+                        cls = post['classification']
+                        xml_content.append('      <classification>')
+                        xml_content.append(f'        <content_type>{cls.get("content_type", "")}</content_type>')
+                        xml_content.append(f'        <sentiment>{cls.get("sentiment", "")}</sentiment>')
+                        xml_content.append(f'        <quality_score>{cls.get("quality_score", 0)}</quality_score>')
+                        xml_content.append('      </classification>')
+
+                    xml_content.append('    </post>')
+
+        xml_content.append('  </posts>')
+        xml_content.append('</twitter_data>')
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(xml_content))
+
+    @staticmethod
+    async def _export_to_parquet(posts_data: List[Dict], file_path: str):
+        """Export to high-performance Parquet format."""
+        try:
+            import pandas as pd
+
+            if not posts_data:
+                return
+
+            # Flatten the data for pandas
+            flattened_data = []
+            for post in posts_data:
+                flat_post = {}
+
+                # Basic fields
+                for field in ['id', 'text', 'author', 'author_name', 'timestamp', 'url']:
+                    flat_post[field] = post.get(field, '')
+
+                # Engagement metrics
+                for metric in ['likes', 'retweets', 'replies', 'views', 'quotes']:
+                    flat_post[metric] = post.get(metric, 0)
+
+                # Media info
+                flat_post['has_media'] = post.get('has_media', False)
+                flat_post['media_count'] = len(post.get('media', []))
+
+                # Thread info
+                thread_info = post.get('thread_info', {})
+                flat_post['is_thread'] = thread_info.get('is_thread', False)
+                flat_post['thread_position'] = thread_info.get('thread_position', 0)
+
+                # Classification
+                classification = post.get('classification', {})
+                flat_post['content_type'] = classification.get('content_type', '')
+                flat_post['sentiment'] = classification.get('sentiment', '')
+                flat_post['quality_score'] = classification.get('quality_score', 0.0)
+                flat_post['language'] = classification.get('language', '')
+
+                flattened_data.append(flat_post)
+
+            df = pd.DataFrame(flattened_data)
+            df.to_parquet(file_path, index=False)
+
+        except ImportError:
+            # Fallback to JSON if pandas not available
+            with open(file_path.replace('.parquet', '.json'), 'w', encoding='utf-8') as f:
+                json.dump(posts_data, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    async def _export_to_excel(result: Dict, posts_data: List[Dict], file_path: str):
+        """Export to Excel with multiple sheets."""
+        try:
+            import pandas as pd
+
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                # Posts sheet
+                if posts_data:
+                    df_posts = pd.json_normalize(posts_data)
+                    df_posts.to_excel(writer, sheet_name='Posts', index=False)
+
+                # Summary sheet
+                summary_data = {
+                    'Metric': ['Total Posts', 'With Media', 'With Threads', 'Avg Quality Score'],
+                    'Value': [
+                        len(posts_data),
+                        sum(1 for p in posts_data if p.get('has_media')),
+                        sum(1 for p in posts_data if p.get('thread_info', {}).get('is_thread')),
+                        sum(p.get('classification', {}).get('quality_score', 0) for p in posts_data) / max(len(posts_data), 1)
+                    ]
+                }
+                df_summary = pd.DataFrame(summary_data)
+                df_summary.to_excel(writer, sheet_name='Summary', index=False)
+
+        except ImportError:
+            # Fallback to CSV
+            await TwitterTask._export_to_csv(posts_data, file_path.replace('.xlsx', '.csv'))
+
+    @staticmethod
+    async def _export_to_markdown(result: Dict, posts_data: List[Dict], file_path: str):
+        """Export to human-readable Markdown report."""
+        lines = []
+        lines.append('# Twitter Data Analysis Report')
+        lines.append('')
+
+        # Metadata
+        metadata = result.get('search_metadata', {})
+        lines.append('## Extraction Summary')
+        lines.append('')
+        lines.append(f"- **Target**: {metadata.get('target_username', 'N/A')}")
+        lines.append(f"- **Total Posts**: {len(posts_data)}")
+        lines.append(f"- **Extraction Method**: {metadata.get('extraction_method', 'N/A')}")
+        lines.append(f"- **Completed At**: {metadata.get('search_completed_at', 'N/A')}")
+        lines.append('')
+
+        # Analytics
+        if posts_data:
+            with_media = sum(1 for p in posts_data if p.get('has_media'))
+            with_threads = sum(1 for p in posts_data if p.get('thread_info', {}).get('is_thread'))
+            avg_quality = sum(p.get('classification', {}).get('quality_score', 0) for p in posts_data) / len(posts_data)
+
+            lines.append('## Content Analysis')
+            lines.append('')
+            lines.append(f"- **Posts with Media**: {with_media} ({with_media/len(posts_data)*100:.1f}%)")
+            lines.append(f"- **Thread Posts**: {with_threads} ({with_threads/len(posts_data)*100:.1f}%)")
+            lines.append(f"- **Average Quality Score**: {avg_quality:.2f}/1.0")
+            lines.append('')
+
+            # Sample posts
+            lines.append('## Sample Posts')
+            lines.append('')
+
+            for i, post in enumerate(posts_data[:5]):
+                lines.append(f"### Post {i+1}")
+                lines.append('')
+                lines.append(f"**Text**: {post.get('text', '')[:200]}...")
+                lines.append('')
+                lines.append(f"**Author**: @{post.get('author', 'unknown')}")
+                lines.append(f"**Engagement**: ❤️ {post.get('likes', 0)} | 🔄 {post.get('retweets', 0)} | 💬 {post.get('replies', 0)}")
+
+                classification = post.get('classification', {})
+                if classification:
+                    lines.append(f"**Analysis**: {classification.get('content_type', 'N/A')} | {classification.get('sentiment', 'N/A')} sentiment")
+
+                lines.append('')
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
     async def close(self):
         """Enhanced resource cleanup with memory optimization."""
         try:
@@ -6651,44 +8852,554 @@ class TwitterScraper:
             return []
 
     async def _extract_media_from_tweet(self, tweet_element) -> List[Dict[str, Any]]:
-        """Extract media information from a tweet element."""
+        """Extract comprehensive media information from a tweet element - Phase B: Noise Reduction Enhanced."""
         media_items = []
 
         try:
-            # Images
-            images = await tweet_element.locator('[data-testid="tweetPhoto"] img').all()
-            for img in images:
+            # PHASE B: PRIORITY-BASED SELECTORS - Tweet content media first
+            # Priority 1: High-confidence tweet photo selectors (signal)
+            high_priority_image_selectors = [
+                '[data-testid="tweetPhoto"] img',
+                '[data-testid="Tweet-Photo"] img',
+                'div[data-testid="tweetPhoto"] img',
+                '[data-testid="tweetPhotoWrapper"] img',
+                'div[role="img"][aria-label*="Image"] img'
+            ]
+
+            # Priority 2: Medium-confidence selectors with filtering
+            medium_priority_image_selectors = [
+                'img[src*="pbs.twimg.com/media/"]',  # Only media folder, not profiles
+                'img[src*="media.twitter.com"]',
+                'article div[data-testid*="media"] img',
+                'div[data-testid*="card"] img'  # Link preview images
+            ]
+
+            # Priority 3: Low-confidence selectors (use only if others fail)
+            low_priority_image_selectors = [
+                'img[alt*="Image"]:not([alt*="avatar"]):not([alt*="profile"])',
+                'article img[src]:not([alt*="avatar"]):not([alt*="profile"])'
+            ]
+
+            # Process selectors in priority order
+            selector_groups = [
+                ("HIGH_PRIORITY", high_priority_image_selectors),
+                ("MEDIUM_PRIORITY", medium_priority_image_selectors),
+                ("LOW_PRIORITY", low_priority_image_selectors)
+            ]
+
+            for priority, selectors in selector_groups:
+                for selector in selectors:
+                    try:
+                        images = await tweet_element.locator(selector).all()
+                        for img in images:
+                            try:
+                                src = await img.get_attribute('src')
+                                alt = await img.get_attribute('alt')
+                                width = await img.get_attribute('width')
+                                height = await img.get_attribute('height')
+
+                                if src and not any(item.get('url') == src for item in media_items):
+                                    # PHASE B: NOISE FILTERING - Advanced filtering logic
+                                    if self._is_content_media(src, alt, selector):
+                                        media_items.append({
+                                            'type': 'image',
+                                            'url': src,
+                                            'alt_text': alt or '',
+                                            'width': width,
+                                            'height': height,
+                                            'extracted_from': selector,
+                                            'priority_level': priority,
+                                            'confidence_score': self._calculate_media_confidence(src, alt, selector)
+                                        })
+                                        self.logger.debug(f"✅ MEDIA SIGNAL: {priority} - {selector} -> {src[:80]}...")
+                                    else:
+                                        self.logger.debug(f"❌ MEDIA NOISE: Filtered {selector} -> {src[:80]}...")
+                            except:
+                                continue
+                    except:
+                        continue
+
+                # If we found high-priority media, skip lower priorities to reduce noise
+                if priority == "HIGH_PRIORITY" and len([m for m in media_items if m.get('priority_level') == 'HIGH_PRIORITY']) > 0:
+                    self.logger.debug(f"📸 HIGH PRIORITY MEDIA FOUND - Skipping lower priority selectors to reduce noise")
+                    break
+
+            # Videos - Enhanced with multiple selectors
+            video_selectors = [
+                '[data-testid="videoPlayer"] video',
+                '[data-testid="Tweet-Video"] video',
+                'video[src]',
+                'div[data-testid="videoPlayer"] video',
+                '[data-testid="videoComponent"] video'
+            ]
+
+            for selector in video_selectors:
                 try:
-                    src = await img.get_attribute('src')
-                    alt = await img.get_attribute('alt')
-                    if src:
-                        media_items.append({
-                            'type': 'image',
-                            'url': src,
-                            'alt_text': alt or '',
-                        })
+                    videos = await tweet_element.locator(selector).all()
+                    for video in videos:
+                        try:
+                            src = await video.get_attribute('src')
+                            poster = await video.get_attribute('poster')
+                            duration = await video.get_attribute('duration')
+
+                            if (src or poster) and not any(item.get('url') == (src or poster) for item in media_items):
+                                media_items.append({
+                                    'type': 'video',
+                                    'url': src or poster,
+                                    'poster_url': poster,
+                                    'duration': duration,
+                                    'extracted_from': selector
+                                })
+                        except:
+                            continue
                 except:
                     continue
 
-            # Videos
-            videos = await tweet_element.locator('[data-testid="videoPlayer"] video').all()
-            for video in videos:
+            # GIFs - New addition
+            gif_selectors = [
+                '[data-testid="gifPlayer"] video',
+                'video[src*="gif"]',
+                'img[src*="gif"]',
+                '[alt*="GIF"]'
+            ]
+
+            for selector in gif_selectors:
                 try:
-                    src = await video.get_attribute('src')
-                    poster = await video.get_attribute('poster')
-                    if src or poster:
-                        media_items.append({
-                            'type': 'video',
-                            'url': src or poster,
-                            'poster_url': poster,
-                        })
+                    gifs = await tweet_element.locator(selector).all()
+                    for gif in gifs:
+                        try:
+                            src = await gif.get_attribute('src')
+                            poster = await gif.get_attribute('poster')
+                            alt = await gif.get_attribute('alt')
+
+                            if (src or poster) and not any(item.get('url') == (src or poster) for item in media_items):
+                                media_items.append({
+                                    'type': 'gif',
+                                    'url': src or poster,
+                                    'alt_text': alt or '',
+                                    'poster_url': poster,
+                                    'extracted_from': selector
+                                })
+                        except:
+                            continue
+                except:
+                    continue
+
+            # Link previews/cards - New addition
+            card_selectors = [
+                '[data-testid="card.wrapper"] img',
+                '[data-testid="Card"] img',
+                'div[role="link"] img'
+            ]
+
+            for selector in card_selectors:
+                try:
+                    cards = await tweet_element.locator(selector).all()
+                    for card in cards:
+                        try:
+                            src = await card.get_attribute('src')
+                            alt = await card.get_attribute('alt')
+
+                            if src and not any(item.get('url') == src for item in media_items):
+                                media_items.append({
+                                    'type': 'link_preview',
+                                    'url': src,
+                                    'alt_text': alt or '',
+                                    'extracted_from': selector
+                                })
+                        except:
+                            continue
                 except:
                     continue
 
         except Exception as e:
             self.logger.warning(f"⚠️ Failed to extract media: {e}")
 
+        # PHASE B: ENHANCED LOGGING WITH NOISE ANALYSIS
+        if media_items:
+            media_types = {}
+            priority_breakdown = {}
+            avg_confidence = 0
+
+            for item in media_items:
+                media_type = item['type']
+                priority = item.get('priority_level', 'UNKNOWN')
+                confidence = item.get('confidence_score', 0)
+
+                media_types[media_type] = media_types.get(media_type, 0) + 1
+                priority_breakdown[priority] = priority_breakdown.get(priority, 0) + 1
+                avg_confidence += confidence
+
+            avg_confidence = avg_confidence / len(media_items) if media_items else 0
+
+            self.logger.info(f"📷 MEDIA SUCCESS (Phase B): {len(media_items)} items, avg confidence: {avg_confidence:.2f}")
+            self.logger.info(f"   Types: {media_types}")
+            self.logger.info(f"   Priorities: {priority_breakdown}")
+        else:
+            self.logger.debug("📷 No media items extracted")
+
         return media_items
+
+    def _is_content_media(self, src: str, alt: str = '', selector: str = '') -> bool:
+        """Phase B: Determine if media is actual tweet content (signal) vs noise (profile pics, etc)."""
+        if not src:
+            return False
+
+        # NOISE PATTERNS - Strong indicators this is NOT tweet content
+        noise_patterns = [
+            'profile_images',      # Twitter profile pictures
+            'profile_banners',     # Twitter profile banners
+            'default_profile',     # Default avatar images
+            '/sticky/',           # Twitter UI elements
+            '/emoji/',            # Emoji images
+            '/hashflags/',        # Twitter hashflag images
+        ]
+
+        alt_noise_patterns = [
+            'avatar', 'profile picture', 'profile photo', 'profile image',
+            'default avatar', 'user avatar', 'twitter avatar'
+        ]
+
+        # Check URL-based noise patterns
+        for pattern in noise_patterns:
+            if pattern in src.lower():
+                return False
+
+        # Check alt-text based noise patterns
+        if alt:
+            alt_lower = alt.lower()
+            for pattern in alt_noise_patterns:
+                if pattern in alt_lower:
+                    return False
+
+        # SIGNAL PATTERNS - Strong indicators this IS tweet content
+        signal_patterns = [
+            'pbs.twimg.com/media/',    # Twitter media storage for tweet content
+            'pbs.twimg.com/ext_tw_video_thumb/',  # Video thumbnails
+            'media.twitter.com',       # Direct media links
+            'twimg.com/media/',       # Alternative media path
+        ]
+
+        high_confidence_selectors = [
+            'tweetPhoto', 'Tweet-Photo', 'tweetPhotoWrapper',
+            'videoPlayer', 'Tweet-Video', 'gifPlayer'
+        ]
+
+        # Check URL-based signal patterns
+        for pattern in signal_patterns:
+            if pattern in src:
+                return True
+
+        # Check selector-based signal patterns
+        for pattern in high_confidence_selectors:
+            if pattern in selector:
+                return True
+
+        # DEFAULT: Allow if no clear noise indicators (conservative approach)
+        # This balances between filtering noise and missing content
+        return True
+
+    def _calculate_media_confidence(self, src: str, alt: str = '', selector: str = '') -> float:
+        """Phase B: Calculate confidence score for media item (0.0 to 1.0)."""
+        confidence = 0.5  # Base confidence
+
+        # HIGH CONFIDENCE BOOSTS
+        if 'tweetPhoto' in selector or 'Tweet-Photo' in selector:
+            confidence += 0.4
+        elif 'pbs.twimg.com/media/' in src:
+            confidence += 0.3
+        elif 'videoPlayer' in selector or 'gifPlayer' in selector:
+            confidence += 0.35
+
+        # MEDIUM CONFIDENCE BOOSTS
+        if 'media.twitter.com' in src:
+            confidence += 0.2
+        elif any(pattern in selector for pattern in ['media', 'card']):
+            confidence += 0.15
+
+        # CONFIDENCE REDUCTIONS (noise indicators)
+        if 'profile_images' in src or 'profile_banners' in src:
+            confidence -= 0.6
+        elif any(pattern in alt.lower() for pattern in ['avatar', 'profile']):
+            confidence -= 0.4
+        elif '/emoji/' in src or '/hashflags/' in src:
+            confidence -= 0.5
+
+        # Clamp between 0.0 and 1.0
+        return max(0.0, min(1.0, confidence))
+
+    def _parse_engagement_number(self, number_str: str) -> int:
+        """Parse engagement numbers like '1.2K', '3.4M', '156' into integers - Phase 1.2 Enhancement."""
+        if not number_str:
+            return 0
+
+        try:
+            # Remove commas and whitespace
+            clean_str = number_str.replace(',', '').strip()
+
+            # Handle K (thousands)
+            if clean_str.endswith('K') or clean_str.endswith('k'):
+                number = float(clean_str[:-1])
+                return int(number * 1000)
+
+            # Handle M (millions)
+            elif clean_str.endswith('M') or clean_str.endswith('m'):
+                number = float(clean_str[:-1])
+                return int(number * 1000000)
+
+            # Handle B (billions)
+            elif clean_str.endswith('B') or clean_str.endswith('b'):
+                number = float(clean_str[:-1])
+                return int(number * 1000000000)
+
+            # Handle regular numbers
+            else:
+                return int(float(clean_str))
+
+        except (ValueError, TypeError) as e:
+            self.logger.debug(f"📊 ENGAGEMENT PARSE: Failed to parse '{number_str}': {e}")
+            return 0
+
+    async def _detect_and_extract_thread_info(self, tweet_element, tweet_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Phase 1.3: Advanced Thread Detection and Reconstruction.
+
+        Detects if a tweet is part of a thread and extracts thread metadata.
+        Returns enhanced tweet data with thread information.
+        """
+        try:
+            thread_info = {
+                'is_thread': False,
+                'thread_position': None,
+                'thread_id': None,
+                'thread_size': None,
+                'is_thread_starter': False,
+                'has_continuation': False,
+                'replied_to_tweet_id': None
+            }
+
+            # 1. DETECT THREAD INDICATORS
+            thread_indicators = []
+
+            # Look for "Show this thread" text
+            try:
+                show_thread_elements = await tweet_element.locator('text="Show this thread"').all()
+                if len(show_thread_elements) > 0:
+                    thread_indicators.append('show_thread_link')
+                    thread_info['has_continuation'] = True
+                    self.logger.info("🧵 THREAD: Found 'Show this thread' indicator")
+            except Exception as e:
+                self.logger.debug(f"🧵 THREAD: Show thread detection error: {e}")
+
+            # Look for threading indicators in aria-labels
+            try:
+                threading_selectors = [
+                    '[aria-label*="thread"]',
+                    '[aria-label*="Thread"]',
+                    '[aria-label*="This Tweet is part of"]',
+                    '[aria-label*="This post is part of"]'
+                ]
+
+                for selector in threading_selectors:
+                    elements = await tweet_element.locator(selector).all()
+                    if len(elements) > 0:
+                        thread_indicators.append('aria_thread_indicator')
+                        break
+            except Exception as e:
+                self.logger.debug(f"🧵 THREAD: Aria thread detection error: {e}")
+
+            # Look for reply chains (replied to indicators)
+            try:
+                reply_selectors = [
+                    '[data-testid="tweet"] [aria-label*="Replying to"]',
+                    '[aria-label*="Replying to"]',
+                    'span:has-text("Replying to")',
+                    'text="Replying to"'
+                ]
+
+                for selector in reply_selectors:
+                    elements = await tweet_element.locator(selector).all()
+                    if len(elements) > 0:
+                        thread_indicators.append('reply_indicator')
+
+                        # Try to extract the replied-to username/ID
+                        try:
+                            reply_element = elements[0]
+                            reply_text = await reply_element.inner_text()
+                            # Extract @username from "Replying to @username"
+                            import re
+                            replied_to_match = re.search(r'@(\w+)', reply_text)
+                            if replied_to_match:
+                                thread_info['replied_to_username'] = replied_to_match.group(1)
+                                self.logger.info(f"🧵 THREAD: Found reply to @{replied_to_match.group(1)}")
+                        except Exception as extract_error:
+                            self.logger.debug(f"🧵 THREAD: Reply username extraction error: {extract_error}")
+                        break
+            except Exception as e:
+                self.logger.debug(f"🧵 THREAD: Reply detection error: {e}")
+
+            # Look for thread numbering (1/n, 2/n format)
+            try:
+                tweet_text = tweet_data.get('text', '')
+                import re
+
+                # Pattern for thread numbering like "1/5", "2/12", etc.
+                thread_number_pattern = r'(\d+)/(\d+)'
+                thread_match = re.search(thread_number_pattern, tweet_text)
+
+                if thread_match:
+                    thread_indicators.append('numbered_thread')
+                    thread_info['thread_position'] = int(thread_match.group(1))
+                    thread_info['thread_size'] = int(thread_match.group(2))
+                    thread_info['is_thread_starter'] = (thread_info['thread_position'] == 1)
+                    self.logger.info(f"🧵 THREAD: Found numbered thread {thread_match.group(1)}/{thread_match.group(2)}")
+
+                # Alternative patterns
+                thread_alt_patterns = [
+                    r'Thread\s+(\d+)/',  # "Thread 1/"
+                    r'🧵\s*(\d+)/',       # "🧵 1/"
+                    r'(\d+)\s*\.\s*/',    # "1. /"
+                ]
+
+                for pattern in thread_alt_patterns:
+                    alt_match = re.search(pattern, tweet_text, re.IGNORECASE)
+                    if alt_match:
+                        thread_indicators.append('alt_numbered_thread')
+                        thread_info['thread_position'] = int(alt_match.group(1))
+                        self.logger.info(f"🧵 THREAD: Found alternative thread numbering: position {alt_match.group(1)}")
+                        break
+
+            except Exception as e:
+                self.logger.debug(f"🧵 THREAD: Thread numbering detection error: {e}")
+
+            # Look for thread emoji indicators
+            try:
+                tweet_text = tweet_data.get('text', '')
+                thread_emojis = ['🧵', '👇', '⬇️', '↓']
+
+                for emoji in thread_emojis:
+                    if emoji in tweet_text:
+                        thread_indicators.append('emoji_thread_indicator')
+                        self.logger.info(f"🧵 THREAD: Found thread emoji indicator: {emoji}")
+                        break
+            except Exception as e:
+                self.logger.debug(f"🧵 THREAD: Emoji detection error: {e}")
+
+            # 2. DETERMINE THREAD STATUS
+            if len(thread_indicators) > 0:
+                thread_info['is_thread'] = True
+                thread_info['thread_indicators'] = thread_indicators
+
+                # Generate thread ID based on tweet URL/ID
+                if tweet_data.get('tweet_id'):
+                    base_id = tweet_data['tweet_id']
+                    # For threads, use the original tweet ID as thread ID
+                    if thread_info['is_thread_starter']:
+                        thread_info['thread_id'] = f"thread_{base_id}"
+                    else:
+                        # For continuation tweets, we'd need the original tweet ID
+                        # For now, use a derived ID
+                        thread_info['thread_id'] = f"thread_{base_id}_cont"
+
+                self.logger.info(f"🧵 THREAD DETECTED: {len(thread_indicators)} indicators found")
+
+            # 3. ADD THREAD INFO TO TWEET DATA
+            tweet_data['thread_info'] = thread_info
+
+            return tweet_data
+
+        except Exception as e:
+            self.logger.debug(f"🧵 THREAD: Detection failed: {e}")
+            # Return original tweet data with empty thread info on error
+            tweet_data['thread_info'] = {
+                'is_thread': False,
+                'error': str(e)
+            }
+            return tweet_data
+
+    async def _reconstruct_thread_sequence(self, tweets: List[Dict[str, Any]], username: str) -> List[Dict[str, Any]]:
+        """
+        Phase 1.3: Thread Reconstruction.
+
+        Takes a list of tweets and reconstructs thread sequences,
+        organizing them by thread and adding sequence metadata.
+        """
+        try:
+            # Group tweets by thread
+            threads = {}
+            standalone_tweets = []
+
+            for tweet in tweets:
+                thread_info = tweet.get('thread_info', {})
+
+                if thread_info.get('is_thread', False):
+                    thread_id = thread_info.get('thread_id')
+                    if thread_id:
+                        if thread_id not in threads:
+                            threads[thread_id] = []
+                        threads[thread_id].append(tweet)
+                    else:
+                        # Thread tweet without ID, treat as standalone
+                        standalone_tweets.append(tweet)
+                else:
+                    standalone_tweets.append(tweet)
+
+            # Reconstruct each thread
+            reconstructed_tweets = []
+
+            for thread_id, thread_tweets in threads.items():
+                self.logger.info(f"🧵 RECONSTRUCTING: Thread {thread_id} with {len(thread_tweets)} tweets")
+
+                # Sort by thread position if available
+                def sort_key(tweet):
+                    thread_info = tweet.get('thread_info', {})
+                    position = thread_info.get('thread_position')
+                    if position is not None:
+                        return position
+                    # Fallback to timestamp
+                    timestamp = tweet.get('timestamp', '')
+                    try:
+                        from datetime import datetime
+                        return datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    except:
+                        return datetime.min
+
+                sorted_thread = sorted(thread_tweets, key=sort_key)
+
+                # Add thread reconstruction metadata
+                for i, tweet in enumerate(sorted_thread):
+                    thread_info = tweet.get('thread_info', {})
+                    thread_info.update({
+                        'reconstructed_position': i + 1,
+                        'reconstructed_thread_size': len(sorted_thread),
+                        'thread_reconstruction_method': 'position_and_timestamp',
+                        'is_reconstructed': True
+                    })
+                    tweet['thread_info'] = thread_info
+
+                reconstructed_tweets.extend(sorted_thread)
+
+            # Add standalone tweets
+            reconstructed_tweets.extend(standalone_tweets)
+
+            # Sort final list by timestamp
+            def final_sort_key(tweet):
+                timestamp = tweet.get('timestamp', '')
+                try:
+                    from datetime import datetime
+                    return datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                except:
+                    return datetime.min
+
+            final_tweets = sorted(reconstructed_tweets, key=final_sort_key, reverse=True)
+
+            self.logger.info(f"🧵 THREAD RECONSTRUCTION: {len(threads)} threads, {len(standalone_tweets)} standalone tweets")
+
+            return final_tweets
+
+        except Exception as e:
+            self.logger.error(f"🧵 THREAD RECONSTRUCTION ERROR: {e}")
+            return tweets  # Return original on error
 
     async def _extract_tweets_from_scrolled_content(
         self,

@@ -31,7 +31,7 @@ class JobStatus(str, Enum):
     TIMEOUT = "timeout"
 
 
-class JobRecord(BaseModel):
+class ReliableJobRecord(BaseModel):
     """Enhanced job record with reliability features."""
 
     job_id: str
@@ -85,21 +85,7 @@ class JobRecord(BaseModel):
         return self.retry_count < self.max_retries and self.status in [JobStatus.FAILED, JobStatus.TIMEOUT]
 
 
-class SubmitRequest(BaseModel):
-    """Enhanced job submission with reliability features."""
-
-    proxy: Optional[str] = None
-    user_agent: Optional[str] = None
-    headless: Optional[bool] = None
-    timeout_seconds: int = 300  # 5 minutes default
-    priority: int = 0  # Higher numbers = higher priority
-    max_retries: int = 3
-
-    class Config:
-        extra = "allow"
-
-
-class JobStore:
+class ReliableJobStore:
     """Redis-backed job store with persistence and recovery capabilities."""
 
     def __init__(self, redis_url: str = "redis://localhost:6379/0", logger: Optional[logging.Logger] = None):
@@ -113,9 +99,6 @@ class JobStore:
         self.priority_queue_key = "priority_job_queue"
         self.running_jobs_key = "running_jobs"
         self.worker_heartbeat_key = "worker_heartbeat:{worker_id}"
-        # Phase 2.4: Dead Letter Queue
-        self.dlq_key = "dead_letter_queue"
-        self.dlq_job_key_pattern = "dlq_job:{job_id}"
 
     async def connect(self) -> None:
         """Initialize Redis connection."""
@@ -133,7 +116,7 @@ class JobStore:
             await self.redis_client.close()
             self.redis_client = None
 
-    async def add_job(self, job: JobRecord) -> None:
+    async def add_job(self, job: ReliableJobRecord) -> None:
         """Add a new job to the store and queue."""
         if not self.redis_client:
             raise RuntimeError("Redis client not connected")
@@ -151,7 +134,7 @@ class JobStore:
 
         self.logger.info(f"Added job {job.job_id} to queue with priority {job.priority}")
 
-    async def get_job(self, job_id: str) -> Optional[JobRecord]:
+    async def get_job(self, job_id: str) -> Optional[ReliableJobRecord]:
         """Retrieve a job by ID."""
         if not self.redis_client:
             raise RuntimeError("Redis client not connected")
@@ -160,10 +143,10 @@ class JobStore:
         job_data = await self.redis_client.get(job_key)
 
         if job_data:
-            return JobRecord.parse_raw(job_data)
+            return ReliableJobRecord.parse_raw(job_data)
         return None
 
-    async def update_job(self, job: JobRecord) -> None:
+    async def update_job(self, job: ReliableJobRecord) -> None:
         """Update job data in Redis."""
         if not self.redis_client:
             raise RuntimeError("Redis client not connected")
@@ -253,9 +236,6 @@ class JobStore:
             job.status = JobStatus.FAILED
             self.logger.error(f"Job {job_id} failed permanently: {error}")
 
-            # Phase 2.4: Add to Dead Letter Queue
-            await self._add_to_dead_letter_queue(job)
-
         await self.update_job(job)
         await self.redis_client.srem(self.running_jobs_key, job_id)
 
@@ -336,18 +316,14 @@ class JobStore:
         priority_queue_size = await self.redis_client.zcard(self.priority_queue_key)
         running_jobs_count = await self.redis_client.scard(self.running_jobs_key)
 
-        # Phase 2.4: Include DLQ stats
-        dlq_stats = await self.get_dlq_stats()
-
         return {
             "regular_queue_size": regular_queue_size,
             "priority_queue_size": priority_queue_size,
             "running_jobs_count": running_jobs_count,
             "total_queued": regular_queue_size + priority_queue_size,
-            "dead_letter_queue": dlq_stats
         }
 
-    async def list_running_jobs(self) -> List[JobRecord]:
+    async def list_running_jobs(self) -> List[ReliableJobRecord]:
         """Get list of currently running jobs."""
         if not self.redis_client:
             raise RuntimeError("Redis client not connected")
@@ -362,128 +338,11 @@ class JobStore:
 
         return jobs
 
-    # Phase 2.4: Dead Letter Queue implementation
-    async def _add_to_dead_letter_queue(self, job: JobRecord) -> None:
-        """Add a permanently failed job to the dead letter queue."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
-        dlq_entry = {
-            "job_id": job.job_id,
-            "task_name": job.task_name,
-            "params": job.params,
-            "error": job.error,
-            "retry_count": job.retry_count,
-            "failed_at": job.finished_at.isoformat() if job.finished_at else None,
-            "created_at": job.created_at.isoformat(),
-            "worker_id": job.worker_id,
-            "reason": "max_retries_exceeded"
-        }
-
-        # Store in DLQ with timestamp as score for ordering
-        timestamp = job.finished_at.timestamp() if job.finished_at else datetime.datetime.utcnow().timestamp()
-        await self.redis_client.zadd(self.dlq_key, {job.job_id: timestamp})
-
-        # Store detailed DLQ entry
-        dlq_job_key = self.dlq_job_key_pattern.format(job_id=job.job_id)
-        await self.redis_client.set(dlq_job_key, json.dumps(dlq_entry))
-
-        self.logger.warning(f"📮 Job {job.job_id} added to Dead Letter Queue (reason: max_retries_exceeded)")
-
-    async def get_dead_letter_jobs(self, start: int = 0, count: int = 10) -> List[Dict[str, Any]]:
-        """Get jobs from the dead letter queue."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
-        # Get job IDs from DLQ (newest first)
-        job_ids = await self.redis_client.zrevrange(self.dlq_key, start, start + count - 1)
-
-        dlq_jobs = []
-        for job_id in job_ids:
-            dlq_job_key = self.dlq_job_key_pattern.format(job_id=job_id)
-            dlq_data = await self.redis_client.get(dlq_job_key)
-            if dlq_data:
-                dlq_jobs.append(json.loads(dlq_data))
-
-        return dlq_jobs
-
-    async def replay_dead_letter_job(self, job_id: str, reset_retries: bool = True) -> bool:
-        """Replay a job from the dead letter queue."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
-        # Get DLQ entry
-        dlq_job_key = self.dlq_job_key_pattern.format(job_id=job_id)
-        dlq_data = await self.redis_client.get(dlq_job_key)
-
-        if not dlq_data:
-            return False
-
-        dlq_entry = json.loads(dlq_data)
-
-        # Create new job from DLQ entry
-        new_job = JobRecord(
-            job_id=str(uuid.uuid4()),  # New job ID
-            task_name=dlq_entry["task_name"],
-            params=dlq_entry["params"],
-            retry_count=0 if reset_retries else dlq_entry["retry_count"]
-        )
-
-        # Add to queue
-        await self.add_job(new_job)
-
-        self.logger.info(f"🔁 Replayed dead letter job {job_id} as new job {new_job.job_id}")
-        return True
-
-    async def get_dlq_stats(self) -> Dict[str, Any]:
-        """Get dead letter queue statistics."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
-        total_dlq_jobs = await self.redis_client.zcard(self.dlq_key)
-
-        # Get recent failures (last 24 hours)
-        yesterday = datetime.datetime.utcnow() - datetime.timedelta(days=1)
-        recent_failures = await self.redis_client.zcount(
-            self.dlq_key,
-            yesterday.timestamp(),
-            datetime.datetime.utcnow().timestamp()
-        )
-
-        return {
-            "total_dead_letter_jobs": total_dlq_jobs,
-            "recent_failures_24h": recent_failures,
-            "oldest_failure": await self._get_oldest_dlq_timestamp(),
-            "newest_failure": await self._get_newest_dlq_timestamp()
-        }
-
-    async def _get_oldest_dlq_timestamp(self) -> Optional[str]:
-        """Get timestamp of oldest DLQ entry."""
-        if not self.redis_client:
-            return None
-
-        oldest = await self.redis_client.zrange(self.dlq_key, 0, 0, withscores=True)
-        if oldest:
-            timestamp = oldest[0][1]
-            return datetime.datetime.fromtimestamp(timestamp).isoformat()
-        return None
-
-    async def _get_newest_dlq_timestamp(self) -> Optional[str]:
-        """Get timestamp of newest DLQ entry."""
-        if not self.redis_client:
-            return None
-
-        newest = await self.redis_client.zrevrange(self.dlq_key, 0, 0, withscores=True)
-        if newest:
-            timestamp = newest[0][1]
-            return datetime.datetime.fromtimestamp(timestamp).isoformat()
-        return None
-
 
 class JobManager:
     """High-level job management interface."""
 
-    def __init__(self, job_store: JobStore, logger: Optional[logging.Logger] = None):
+    def __init__(self, job_store: ReliableJobStore, logger: Optional[logging.Logger] = None):
         self.job_store = job_store
         self.logger = logger or logging.getLogger(__name__)
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -519,7 +378,7 @@ class JobManager:
         """Submit a new job and return job ID."""
         job_id = uuid.uuid4().hex
 
-        job = JobRecord(
+        job = ReliableJobRecord(
             job_id=job_id,
             task_name=task_name,
             params=params,
@@ -532,7 +391,7 @@ class JobManager:
         self.logger.info(f"Submitted job {job_id} for task {task_name}")
         return job_id
 
-    async def get_job_status(self, job_id: str) -> Optional[JobRecord]:
+    async def get_job_status(self, job_id: str) -> Optional[ReliableJobRecord]:
         """Get current job status."""
         return await self.job_store.get_job(job_id)
 

@@ -47,6 +47,7 @@ services:
       - X_USERNAME=@AaAa68681464708
       - X_PASS=Aa-Aa441419
       - DISPLAY=${DISPLAY:-:0}
+      - REDIS_URL=redis://redis:6379/0
     ports:
       - "${BROWSER_PORT}:${BROWSER_PORT}"
     volumes:
@@ -55,8 +56,16 @@ services:
       - ./storage/scraped_data:/scraped_data
       - ./storage/sessions:/sessions    # Session storage
       - /tmp/.X11-unix:/tmp/.X11-unix:rw  # GUI access for session capture
-    
+    depends_on:
+      - redis
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
 
   notebook:
     build: ./notebook
@@ -72,6 +81,7 @@ services:
     volumes:
       - ./notebook:/home/jovyan/notebooks:rw   # editable even in dev
       - ./storage/models_cache:/models:ro
-      - ./storage:/storage                     # Access to scraped data and logs 
-      
+      - ./storage:/storage                     # Access to scraped data and logs
 
+volumes:
+  redis_data:
