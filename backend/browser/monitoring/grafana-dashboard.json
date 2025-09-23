@@ -1,0 +1,344 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Browser Automation Service - Production Dashboard",
+    "tags": ["browser-automation", "production", "reliability"],
+    "style": "dark",
+    "timezone": "browser",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "10s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Service Overview",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "mappings": [],
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "red", "value": 80}
+              ]
+            }
+          }
+        },
+        "options": {
+          "orientation": "horizontal",
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"],
+            "fields": ""
+          },
+          "textMode": "auto"
+        },
+        "targets": [
+          {
+            "expr": "up{job=\"browser-automation\"}",
+            "legendFormat": "Service Status",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(http_requests_total[5m])",
+            "legendFormat": "Request Rate",
+            "refId": "B"
+          },
+          {
+            "expr": "active_jobs",
+            "legendFormat": "Active Jobs",
+            "refId": "C"
+          },
+          {
+            "expr": "healthy_workers",
+            "legendFormat": "Healthy Workers",
+            "refId": "D"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "HTTP Request Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "yAxes": [
+          {"label": "requests/sec", "show": true},
+          {"show": false}
+        ],
+        "targets": [
+          {
+            "expr": "rate(http_requests_total[5m])",
+            "legendFormat": "{{method}} {{endpoint}}",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "HTTP Response Times",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "yAxes": [
+          {"label": "seconds", "show": true},
+          {"show": false}
+        ],
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "95th percentile",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "50th percentile",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Job Processing",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "yAxes": [
+          {"label": "jobs", "show": true},
+          {"show": false}
+        ],
+        "targets": [
+          {
+            "expr": "rate(jobs_total[5m])",
+            "legendFormat": "{{task_name}} - {{status}}",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Job Duration",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "yAxes": [
+          {"label": "seconds", "show": true},
+          {"show": false}
+        ],
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(job_duration_seconds_bucket[5m]))",
+            "legendFormat": "95th percentile",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(job_duration_seconds_bucket[5m]))",
+            "legendFormat": "50th percentile",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Queue and Worker Status",
+        "type": "stat",
+        "gridPos": {"h": 6, "w": 8, "x": 0, "y": 24},
+        "targets": [
+          {
+            "expr": "job_queue_size",
+            "legendFormat": "Queue Size",
+            "refId": "A"
+          },
+          {
+            "expr": "active_jobs",
+            "legendFormat": "Active Jobs",
+            "refId": "B"
+          },
+          {
+            "expr": "worker_pool_size",
+            "legendFormat": "Total Workers",
+            "refId": "C"
+          },
+          {
+            "expr": "healthy_workers",
+            "legendFormat": "Healthy Workers",
+            "refId": "D"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Browser Contexts",
+        "type": "stat",
+        "gridPos": {"h": 6, "w": 8, "x": 8, "y": 24},
+        "targets": [
+          {
+            "expr": "browser_contexts_active",
+            "legendFormat": "Active Contexts",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(browser_contexts_created_total[5m])",
+            "legendFormat": "Context Creation Rate",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "System Resources",
+        "type": "stat",
+        "gridPos": {"h": 6, "w": 8, "x": 16, "y": 24},
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 70},
+                {"color": "red", "value": 85}
+              ]
+            }
+          }
+        },
+        "targets": [
+          {
+            "expr": "cpu_usage_percent",
+            "legendFormat": "CPU %",
+            "refId": "A"
+          },
+          {
+            "expr": "memory_usage_bytes / 1024 / 1024 / 1024",
+            "legendFormat": "Memory GB",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Error Rates",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+        "yAxes": [
+          {"label": "errors/sec", "show": true},
+          {"show": false}
+        ],
+        "targets": [
+          {
+            "expr": "rate(errors_total[5m])",
+            "legendFormat": "{{error_type}} - {{component}}",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(external_service_errors_total[5m])",
+            "legendFormat": "External - {{service}}",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Circuit Breakers",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {"type": "value", "value": "0", "text": "Closed"},
+              {"type": "value", "value": "1", "text": "Open"},
+              {"type": "value", "value": "2", "text": "Half-Open"}
+            ]
+          }
+        },
+        "targets": [
+          {
+            "expr": "circuit_breaker_state",
+            "legendFormat": "{{service}}",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 11,
+        "title": "Data Extraction Metrics",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 38},
+        "yAxes": [
+          {"label": "items/sec", "show": true},
+          {"show": false}
+        ],
+        "targets": [
+          {
+            "expr": "rate(data_extracted_items_total[5m])",
+            "legendFormat": "{{source}} - {{type}}",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 12,
+        "title": "Success Rates",
+        "type": "stat",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 38},
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 80},
+                {"color": "green", "value": 95}
+              ]
+            }
+          }
+        },
+        "targets": [
+          {
+            "expr": "extraction_success_rate * 100",
+            "legendFormat": "{{source}}",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 13,
+        "title": "Health Check Status",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 46},
+        "yAxes": [
+          {"label": "score", "min": 0, "max": 1, "show": true},
+          {"show": false}
+        ],
+        "targets": [
+          {
+            "expr": "component_health_score",
+            "legendFormat": "{{component}}",
+            "refId": "A"
+          }
+        ]
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "instance",
+          "type": "query",
+          "query": "label_values(up{job=\"browser-automation\"}, instance)",
+          "refresh": 2,
+          "includeAll": true,
+          "multi": true
+        }
+      ]
+    },
+    "annotations": {
+      "list": [
+        {
+          "name": "Deployments",
+          "datasource": "prometheus",
+          "expr": "changes(up{job=\"browser-automation\"}[1m]) > 0",
+          "iconColor": "green",
+          "title": "Service Restart"
+        }
+      ]
+    }
+  }
+}

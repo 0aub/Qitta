@@ -13,8 +13,11 @@ from .circuit_breaker import (
     CircuitBreakerError, CircuitState
 )
 from .fallback_manager import (
-    FallbackManager, FallbackConfig, FallbackStrategy, 
+    FallbackManager, FallbackConfig, FallbackStrategy,
     ServiceLevel, FallbackExecution, ServiceHealth
+)
+from .stealth import (
+    StealthManager, StealthLevel, UserAgentPool, TimingProfile, BrowserProfile
 )
 from .resource_manager import (
     ResourceMonitor, ResourceOptimizer, AdaptiveWorkerPool,
@@ -38,7 +41,10 @@ __all__ = [
     # Fallback Management
     'FallbackManager', 'FallbackConfig', 'FallbackStrategy',
     'ServiceLevel', 'FallbackExecution', 'ServiceHealth',
-    
+
+    # Stealth and Anti-Detection
+    'StealthManager', 'StealthLevel', 'UserAgentPool', 'TimingProfile', 'BrowserProfile',
+
     # Resource Management
     'ResourceMonitor', 'ResourceOptimizer', 'AdaptiveWorkerPool',
     'ConcurrencyThrottler', 'ResourceState', 'ScalingAction',

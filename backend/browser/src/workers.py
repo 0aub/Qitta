@@ -49,23 +49,35 @@ class JobTimeoutError(WorkerError):
 class BrowserContextManager:
     """Manages browser contexts with proper lifecycle and cleanup."""
 
-    def __init__(self, browser: Browser, logger: logging.Logger):
+    def __init__(self, browser: Browser, logger: logging.Logger, stealth_manager=None):
         self.browser = browser
         self.logger = logger
         self._active_contexts: Dict[str, BrowserContext] = {}
+        # Phase 4.3: Stealth integration
+        self.stealth_manager = stealth_manager
 
     @asynccontextmanager
     async def get_context(self, job_id: str, **context_options):
         """Get a dedicated browser context for a job with guaranteed cleanup."""
         context = None
         try:
-            # Create new context with options
-            context_options.setdefault('user_agent',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
+            # Phase 4.3: Enhanced context creation with stealth integration
+            if self.stealth_manager:
+                # Remove default user agent as stealth manager will handle it
+                context_options.pop('user_agent', None)
+            else:
+                # Fallback user agent if no stealth manager
+                context_options.setdefault('user_agent',
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                )
 
             context = await self.browser.new_context(**context_options)
             self._active_contexts[job_id] = context
+
+            # Phase 4.3: Apply stealth measures to the context
+            if self.stealth_manager:
+                await self.stealth_manager.apply_stealth_to_context(context)
+                self.logger.debug(f"Applied {self.stealth_manager.stealth_level.value} stealth to context for job {job_id}")
 
             self.logger.debug(f"Created browser context for job {job_id}")
             yield context
@@ -77,6 +89,9 @@ class BrowserContextManager:
             # Guaranteed cleanup
             if context:
                 try:
+                    # Phase 4.3: Clean up stealth traces before closing context
+                    if self.stealth_manager:
+                        await self.stealth_manager.cleanup_traces(context)
                     await context.close()
                     self.logger.debug(f"Closed browser context for job {job_id}")
                 except Exception as e:
@@ -125,7 +140,8 @@ class Worker:
         logger: logging.Logger,
         heartbeat_interval: int = 30,
         circuit_breaker_manager: Optional[CircuitBreakerManager] = None,
-        fallback_manager: Optional[FallbackManager] = None
+        fallback_manager: Optional[FallbackManager] = None,
+        stealth_manager=None
     ):
         self.worker_id = worker_id
         self.job_store = job_store
@@ -135,7 +151,9 @@ class Worker:
         self.logger = logger.getChild(f"worker-{worker_id}")
         self.heartbeat_interval = heartbeat_interval
 
-        self.context_manager = BrowserContextManager(browser, self.logger)
+        # Phase 4.3: Stealth manager support
+        self.stealth_manager = stealth_manager
+        self.context_manager = BrowserContextManager(browser, self.logger, stealth_manager)
         self.error_handler = ErrorHandler(self.logger)
         self._task: Optional[asyncio.Task] = None
 
@@ -149,6 +167,9 @@ class Worker:
         self._current_job: Optional[JobRecord] = None
         self._shutdown_event = asyncio.Event()
         self._consecutive_failures = 0
+
+        # Phase 4.2a: Initialize _last_success to fix health monitor attribute error
+        self._last_success = datetime.datetime.utcnow()
 
     def _get_circuit_breaker_name(self, task_name: str) -> str:
         """Map task names to appropriate circuit breakers."""
@@ -257,18 +278,18 @@ class Worker:
 
             task_fn = self.task_registry[job.task_name]
 
-            # Process with dedicated browser context
-            async with self.context_manager.get_context(job_id) as context:
-                # Update error context with browser state
-                error_context.browser_state = {
-                    "browser_connected": self.browser.is_connected(),
-                    "context_id": id(context)
-                }
+            # Phase 2.5: Execute task through circuit breaker (including browser context creation)
+            circuit_breaker_name = self._get_circuit_breaker_name(job.task_name)
 
-                # Phase 2.5: Execute task through circuit breaker
-                circuit_breaker_name = self._get_circuit_breaker_name(job.task_name)
+            async def execute_task():
+                # Phase 4.2b: Include browser context creation in circuit breaker scope
+                async with self.context_manager.get_context(job_id) as context:
+                    # Update error context with browser state
+                    error_context.browser_state = {
+                        "browser_connected": self.browser.is_connected(),
+                        "context_id": id(context)
+                    }
 
-                async def execute_task():
                     # Check if task function expects context parameter
                     import inspect
                     sig = inspect.signature(task_fn)
@@ -514,7 +535,7 @@ class Worker:
             "active_contexts": self.context_manager.get_active_context_count(),
             "started_at": self._current_job.started_at.isoformat() if self._current_job and self._current_job.started_at else None,
             "consecutive_failures": self._consecutive_failures,
-            "last_success": self._last_success.isoformat(),
+            "last_success": self._last_success.isoformat() if self._last_success else None,
             "needs_restart": getattr(self, '_needs_restart', False),
             "error_stats": self.error_handler.get_error_stats()
         }
@@ -557,6 +578,10 @@ class WorkerPool:
         # Phase 2.6: Fallback management
         self.fallback_manager = FallbackManager(self.circuit_breaker_manager, logger)
         self._setup_fallback_strategies()
+
+        # Phase 4.3: Stealth management
+        from .reliability.stealth import StealthManager, StealthLevel
+        self.stealth_manager = StealthManager(StealthLevel.MODERATE, logger)
 
         # Configure throttling for external services
         self.throttler.add_service_limit("twitter", max_concurrent=3, rate_limit_per_minute=100)
@@ -707,7 +732,8 @@ class WorkerPool:
             data_root=self.data_root,
             logger=self.logger,
             circuit_breaker_manager=self.circuit_breaker_manager,
-            fallback_manager=self.fallback_manager
+            fallback_manager=self.fallback_manager,
+            stealth_manager=self.stealth_manager
         )
 
         await worker.start()

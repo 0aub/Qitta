@@ -139,9 +139,16 @@ class FallbackManager:
         if await self._should_use_fallback(service_name):
             return await self._execute_fallback(service_name, fallback_data, start_time)
 
-        # Try primary function first
+        # Try primary function first through circuit breaker
         try:
-            result = await primary_func(*args, **kwargs)
+            # Phase 4.2b: Execute primary function through circuit breaker for proper metrics
+            if self.circuit_breaker_manager:
+                result = await self.circuit_breaker_manager.call_with_breaker(
+                    service_name, primary_func, *args, **kwargs
+                )
+            else:
+                result = await primary_func(*args, **kwargs)
+
             response_time = (time.time() - start_time) * 1000
 
             # Update service health on success
@@ -159,7 +166,8 @@ class FallbackManager:
 
         except Exception as e:
             response_time = (time.time() - start_time) * 1000
-            await self._update_service_health(service_name, False, response_time)
+            # Phase 4.2d: Pass error details for enhanced external service detection
+            await self._update_service_health(service_name, False, response_time, str(e))
 
             self.logger.warning(f"Primary function failed for service '{service_name}': {e}")
             return await self._execute_fallback(service_name, fallback_data, start_time, str(e))
@@ -178,11 +186,23 @@ class FallbackManager:
         # Check service health
         health = self.service_health.get(service_name)
         if health:
+            # Phase 4.2d: Enhanced external service detection triggers
+            # Check for recent external service errors
+            if hasattr(health, '_external_service_errors') and health._external_service_errors:
+                recent_external_errors = [
+                    err for err in health._external_service_errors
+                    if (datetime.utcnow() - datetime.fromisoformat(err['timestamp'])).total_seconds() < 300  # 5 minutes
+                ]
+                # Use fallback immediately if multiple external service errors in last 5 minutes
+                if len(recent_external_errors) >= 2:
+                    self.logger.info(f"Triggering fallback for '{service_name}' due to {len(recent_external_errors)} recent external service errors")
+                    return True
+
             # Use fallback if error rate is too high
             if health.error_rate_percent > 50.0:
                 return True
-            # Use fallback if too many consecutive failures
-            if health.consecutive_failures >= 3:
+            # Use fallback if too many consecutive failures (lowered threshold for external services)
+            if health.consecutive_failures >= 2:  # Reduced from 3 to 2 for faster fallback
                 return True
             # Use fallback if response time is too slow
             if health.response_time_ms > 30000:  # 30 seconds
@@ -422,8 +442,9 @@ class FallbackManager:
     async def _update_service_health(self,
                                    service_name: str,
                                    success: bool,
-                                   response_time_ms: float) -> None:
-        """Update health status for a service."""
+                                   response_time_ms: float,
+                                   error_details: Optional[str] = None) -> None:
+        """Update health status for a service with enhanced external service detection."""
         now = datetime.utcnow()
 
         health = self.service_health.get(service_name)
@@ -461,6 +482,45 @@ class FallbackManager:
             failures = sum(1 for req in health._recent_requests if not req)
             health.error_rate_percent = (failures / len(health._recent_requests)) * 100
             health.availability_percent = ((len(health._recent_requests) - failures) / len(health._recent_requests)) * 100
+
+        # Phase 4.2d: Enhanced external service detection
+        if not success and error_details:
+            external_service_indicators = [
+                "EXTERNAL_SERVICE",
+                "403 Forbidden",
+                "CloudFlare",
+                "Access denied",
+                "Rate limited",
+                "IP blocked",
+                "Service unavailable",
+                "Connection refused",
+                "Timeout",
+                "Network unreachable"
+            ]
+
+            # Check if this is likely an external service issue
+            is_external_service_error = any(
+                indicator.lower() in error_details.lower()
+                for indicator in external_service_indicators
+            )
+
+            if is_external_service_error:
+                self.logger.warning(
+                    f"External service degradation detected for '{service_name}': {error_details}"
+                )
+                # Mark service as critically degraded for external service issues
+                health.is_healthy = False
+                # Add external service specific metadata
+                if not hasattr(health, '_external_service_errors'):
+                    health._external_service_errors = []
+                health._external_service_errors.append({
+                    'timestamp': now.isoformat(),
+                    'error': error_details,
+                    'consecutive_failures': health.consecutive_failures
+                })
+                # Keep only recent external service errors (last 10)
+                if len(health._external_service_errors) > 10:
+                    health._external_service_errors.pop(0)
 
     async def _health_monitoring_loop(self) -> None:
         """Continuous health monitoring and service level adjustment."""
@@ -559,7 +619,14 @@ class FallbackManager:
                     "availability": h.availability_percent,
                     "error_rate": h.error_rate_percent,
                     "response_time_ms": h.response_time_ms,
-                    "consecutive_failures": h.consecutive_failures
+                    "consecutive_failures": h.consecutive_failures,
+                    # Phase 4.2d: Enhanced external service error reporting
+                    "external_service_errors": len(getattr(h, '_external_service_errors', [])),
+                    "recent_external_errors": len([
+                        err for err in getattr(h, '_external_service_errors', [])
+                        if (datetime.utcnow() - datetime.fromisoformat(err['timestamp'])).total_seconds() < 300
+                    ]),
+                    "last_external_error": getattr(h, '_external_service_errors', [])[-1] if getattr(h, '_external_service_errors', []) else None
                 }
                 for h in self.service_health.values()
             ],

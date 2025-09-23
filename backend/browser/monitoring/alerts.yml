@@ -1,0 +1,209 @@
+# Prometheus Alerting Rules for Browser Automation Service
+# Phase 4.4c: Metrics and Observability Enhancements
+
+groups:
+  - name: browser_automation_alerts
+    rules:
+      # Service Availability
+      - alert: ServiceDown
+        expr: up{job="browser-automation"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Browser automation service is down"
+          description: "The browser automation service has been down for more than 1 minute."
+
+      - alert: HighErrorRate
+        expr: rate(errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value | humanize }} errors per second."
+
+      # Performance Alerts
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP response times"
+          description: "95th percentile response time is {{ $value | humanizeDuration }}."
+
+      - alert: HighJobProcessingTime
+        expr: histogram_quantile(0.95, rate(job_duration_seconds_bucket[5m])) > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High job processing times"
+          description: "95th percentile job processing time is {{ $value | humanizeDuration }}."
+
+      # Queue and Worker Alerts
+      - alert: HighQueueSize
+        expr: job_queue_size > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job queue size is high"
+          description: "Job queue size is {{ $value }}, indicating potential processing bottleneck."
+
+      - alert: LowWorkerAvailability
+        expr: healthy_workers / worker_pool_size < 0.5
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Low worker availability"
+          description: "Only {{ $value | humanizePercentage }} of workers are healthy."
+
+      - alert: NoHealthyWorkers
+        expr: healthy_workers == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No healthy workers available"
+          description: "All workers are unhealthy, service cannot process jobs."
+
+      # Resource Alerts
+      - alert: HighCPUUsage
+        expr: cpu_usage_percent > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage"
+          description: "CPU usage is {{ $value }}%."
+
+      - alert: HighMemoryUsage
+        expr: (memory_usage_bytes / 1024 / 1024 / 1024) > 3.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is {{ $value | humanize }}GB."
+
+      # Circuit Breaker Alerts
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker is open"
+          description: "Circuit breaker for {{ $labels.service }} is open, indicating service degradation."
+
+      - alert: HighCircuitBreakerFailures
+        expr: rate(circuit_breaker_failures_total[5m]) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High circuit breaker failure rate"
+          description: "Circuit breaker failure rate for {{ $labels.service }} is {{ $value | humanize }} failures per second."
+
+      # External Service Alerts
+      - alert: ExternalServiceErrors
+        expr: rate(external_service_errors_total[5m]) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High external service error rate"
+          description: "External service {{ $labels.service }} error rate is {{ $value | humanize }} errors per second."
+
+      # Business Logic Alerts
+      - alert: LowExtractionSuccessRate
+        expr: extraction_success_rate < 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low data extraction success rate"
+          description: "Data extraction success rate for {{ $labels.source }} is {{ $value | humanizePercentage }}."
+
+      - alert: NoDataExtraction
+        expr: rate(data_extracted_items_total[10m]) == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No data extraction activity"
+          description: "No data has been extracted for the past 15 minutes."
+
+      # Health Check Alerts
+      - alert: ComponentHealthDegraded
+        expr: component_health_score < 0.7
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Component health degraded"
+          description: "Health score for {{ $labels.component }} is {{ $value | humanizePercentage }}."
+
+      - alert: ComponentUnhealthy
+        expr: component_health_score < 0.3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Component is unhealthy"
+          description: "Component {{ $labels.component }} health score is {{ $value | humanizePercentage }}."
+
+      # Browser-specific Alerts
+      - alert: TooManyBrowserContexts
+        expr: browser_contexts_active > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Too many active browser contexts"
+          description: "{{ $value }} browser contexts are active, indicating potential resource leaks."
+
+      - alert: SlowPageLoads
+        expr: histogram_quantile(0.95, rate(page_load_duration_seconds_bucket[5m])) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow page load times"
+          description: "95th percentile page load time is {{ $value | humanizeDuration }}."
+
+  - name: browser_automation_critical
+    rules:
+      # Critical business alerts
+      - alert: ServiceCompletelyDown
+        expr: up{job="browser-automation"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          pager: "true"
+        annotations:
+          summary: "CRITICAL: Browser automation service completely down"
+          description: "The browser automation service has been completely down for 5+ minutes. Immediate attention required."
+
+      - alert: DataExtractionStopped
+        expr: rate(data_extracted_items_total[30m]) == 0
+        for: 30m
+        labels:
+          severity: critical
+          pager: "true"
+        annotations:
+          summary: "CRITICAL: Data extraction has stopped"
+          description: "No data extraction activity for 30+ minutes. Business operations may be impacted."
+
+      - alert: AllWorkersDown
+        expr: healthy_workers == 0 and worker_pool_size > 0
+        for: 2m
+        labels:
+          severity: critical
+          pager: "true"
+        annotations:
+          summary: "CRITICAL: All workers are down"
+          description: "All {{ $labels.worker_pool_size }} workers are down. Service cannot process any jobs."
