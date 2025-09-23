@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 import json
 import uuid
 
-from .ultra_scale import UltraScaleManager, UltraScaleExtractionRequest
+from .ultra_scale_manager import UltraScaleBatchManager, UltraScaleExtractionRequest
 
 
 class PaginationStrategy(str, Enum):
@@ -111,7 +111,7 @@ class AdvancedPaginationRequest:
 class AdvancedPaginationManager:
     """Manages advanced timeline pagination with intelligent deduplication."""
 
-    def __init__(self, base_ultra_manager: UltraScaleManager, logger: Optional[logging.Logger] = None):
+    def __init__(self, base_ultra_manager: UltraScaleBatchManager, logger: Optional[logging.Logger] = None):
         self.base_manager = base_ultra_manager
         self.logger = logger or logging.getLogger(__name__)
 

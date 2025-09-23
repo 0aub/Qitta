@@ -45,7 +45,7 @@ from .workers import WorkerPool
 from .tasks import task_registry, normalise_task
 from .reliability import MetricsCollector, AlertManager, HealthMonitor, AlertSeverity
 from .batch import BatchManager, BatchExtractionRequest, BatchStatus
-from .batch.ultra_scale_manager import UltraScaleBatchManager, UltraScaleExtractionRequest, UltraScaleTierStatus
+from .batch.ultra_scale_manager import UltraScaleBatchManager, UltraScaleExtractionRequest
 from .batch.advanced_pagination import AdvancedPaginationManager, AdvancedPaginationRequest, PaginationStrategy
 
 # ----------------------------------------------------------------------------

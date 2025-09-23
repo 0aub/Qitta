@@ -82,7 +82,6 @@ class UltraScaleProgress:
     total_windows: int
     completed_windows: int
     failed_windows: int
-    current_window: Optional[int] = None
 
     # Batch progress
     total_batches: int
@@ -92,6 +91,9 @@ class UltraScaleProgress:
     # Performance metrics
     extraction_rate: float
     average_window_time: float
+
+    # Fields with default values must come after fields without defaults
+    current_window: Optional[int] = None
     estimated_completion: Optional[datetime] = None
 
     # Quality metrics

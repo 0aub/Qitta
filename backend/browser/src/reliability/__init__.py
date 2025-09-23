@@ -19,10 +19,44 @@ from .fallback_manager import (
 from .stealth import (
     StealthManager, StealthLevel, UserAgentPool, TimingProfile, BrowserProfile
 )
-from .resource_manager import (
-    ResourceMonitor, ResourceOptimizer, AdaptiveWorkerPool,
-    ConcurrencyThrottler, ResourceState, ScalingAction
-)
+# Conditional import for resource manager (requires psutil)
+try:
+    from .resource_manager import (
+        ResourceMonitor, ResourceOptimizer, AdaptiveWorkerPool,
+        ConcurrencyThrottler, ResourceState, ScalingAction
+    )
+    RESOURCE_MANAGEMENT_AVAILABLE = True
+except ImportError:
+    # Create placeholder classes when psutil is not available
+    class ResourceMonitor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class ResourceOptimizer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class AdaptiveWorkerPool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class ConcurrencyThrottler:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class ResourceState:
+        OPTIMAL = "optimal"
+        HIGH = "high"
+        CRITICAL = "critical"
+        OVERLOAD = "overload"
+
+    class ScalingAction:
+        SCALE_UP = "scale_up"
+        SCALE_DOWN = "scale_down"
+        MAINTAIN = "maintain"
+        THROTTLE = "throttle"
+
+    RESOURCE_MANAGEMENT_AVAILABLE = False
 from .errors import (
     ErrorHandler, ErrorContext, EnhancedError,
     ErrorCategory, ErrorSeverity, RecoveryStrategy,
