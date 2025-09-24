@@ -1065,7 +1065,7 @@ async def on_startup() -> None:
         service_logger.info("✅ Intelligent batch manager initialized for 1000+ post extractions")
 
         # Initialize ultra-scale manager for massive extractions (5000+ and 10,000+ posts)
-        ultra_scale_manager = UltraScaleManager(
+        ultra_scale_manager = UltraScaleBatchManager(
             base_batch_manager=batch_manager,
             logger=service_logger
         )

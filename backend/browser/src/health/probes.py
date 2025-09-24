@@ -18,7 +18,19 @@ from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
-import redis
+# Optional Redis dependency with graceful fallback
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    # Create placeholder redis module when not available
+    class RedisPlaceholder:
+        @staticmethod
+        def from_url(*args, **kwargs):
+            raise ImportError("Redis module not available - install with: pip install redis")
+    redis = RedisPlaceholder()
+    REDIS_AVAILABLE = False
+
 from playwright.async_api import Browser
 
 
@@ -90,7 +102,7 @@ class ProductionHealthChecker:
     """Comprehensive health checker for production deployment."""
 
     def __init__(self,
-                 redis_client: Optional[redis.Redis] = None,
+                 redis_client: Optional = None,  # Optional Redis client (any type when Redis unavailable)
                  browser_runtime = None,
                  worker_pool = None,
                  circuit_breaker_manager = None,

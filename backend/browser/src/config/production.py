@@ -37,7 +37,8 @@ class LogLevel(str, Enum):
 @dataclass
 class SecurityConfig:
     """Security configuration for production deployment."""
-    api_key_required: bool = True
+    api_key_required: bool = False
+    api_key: str = ""  # Set via BROWSER_API_KEY environment variable
     rate_limiting_enabled: bool = True
     rate_limit_per_minute: int = 60
     max_request_size_mb: int = 10

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, List
 from playwright.async_api import async_playwright, Browser
 
@@ -8,11 +9,11 @@ from playwright.async_api import async_playwright, Browser
 try:
     from .reliability.stealth import StealthManager, StealthLevel
     STEALTH_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     # Create placeholder classes when stealth is not available
     class StealthManager:
         def __init__(self, *args, **kwargs):
-            pass
+            self.stealth_level = type('StealthLevel', (), {'value': 'basic'})()
         async def apply_stealth_to_context(self, *args, **kwargs):
             pass
         async def cleanup_traces(self, *args, **kwargs):
@@ -25,6 +26,130 @@ except ImportError:
         PARANOID = "paranoid"
 
     STEALTH_AVAILABLE = False
+
+
+# Phase 6.6: Container detection for alternative runtime
+def is_running_in_container():
+    """Detect if running inside a Docker container."""
+    try:
+        # Check for container-specific files/environment
+        if os.path.exists('/.dockerenv'):
+            return True
+        if os.path.exists('/proc/1/cgroup'):
+            with open('/proc/1/cgroup', 'r') as f:
+                return 'docker' in f.read() or 'container' in f.read()
+        # Check environment variables
+        if any(var in os.environ for var in ['CONTAINER', 'DOCKER', 'KUBERNETES']):
+            return True
+        return False
+    except:
+        return False
+
+
+class ContainerBrowserRuntime:
+    """Alternative browser runtime optimized for containers."""
+
+    def __init__(self, *, headless: bool = True, logger: Optional[logging.Logger] = None):
+        self._logger = logger or logging.getLogger("container_browser")
+        self._headless = headless
+        self.browser: Optional[Browser] = None
+        self._playwright = None
+
+    async def start(self) -> None:
+        self._logger.info("🐳 Starting Container-Optimized Browser Runtime...")
+
+        # Phase 6.6: Ultra-minimal container approach
+        import os
+
+        # Set minimal environment
+        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/ms-playwright'
+        os.environ['PLAYWRIGHT_DOWNLOAD_HOST'] = ''
+        os.environ['PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD'] = '1'
+
+        self._playwright = await async_playwright().start()
+
+        # Ultra-minimal Chromium launch for containers
+        minimal_args = [
+            # CRITICAL: Core container compatibility
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-gpu-sandbox',
+            '--single-process',
+            '--no-zygote',
+            '--disable-software-rasterizer',
+            '--memory-pressure-off',
+
+            # Disable ALL non-essential features
+            '--disable-web-security',
+            '--disable-features=VizDisplayCompositor,VizServiceDBus,AudioServiceSandbox',
+            '--disable-extensions',
+            '--disable-plugins',
+            '--disable-sync',
+            '--disable-translate',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-field-trial-config',
+            '--disable-ipc-flooding-protection',
+            '--disable-hang-monitor',
+            '--disable-prompt-on-repost',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-extensions-with-background-pages',
+            '--disable-default-apps',
+            '--disable-desktop-notifications',
+            '--disable-permissions-api',
+            '--disable-web-bluetooth',
+            '--disable-webgl',
+            '--disable-webgl2',
+            '--disable-webrtc',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--use-gl=disabled',
+            '--enable-automation',
+            '--allow-running-insecure-content',
+            '--aggressive'
+        ]
+
+        try:
+            self.browser = await self._playwright.chromium.launch(
+                headless=True,  # Force headless in containers
+                args=minimal_args,
+                timeout=60000,  # Reduced timeout
+                slow_mo=0,
+                devtools=False
+            )
+            self._logger.info("✅ Container browser launched successfully")
+
+        except Exception as e:
+            self._logger.error(f"❌ Container browser launch failed: {e}")
+            # Fallback: Use Firefox if Chromium fails
+            try:
+                self._logger.info("🔄 Attempting Firefox fallback...")
+                self.browser = await self._playwright.firefox.launch(
+                    headless=True,
+                    timeout=30000
+                )
+                self._logger.info("✅ Firefox container browser launched successfully")
+            except Exception as e2:
+                self._logger.error(f"❌ Firefox fallback failed: {e2}")
+                raise RuntimeError(f"Container browser startup failed: {e}, Firefox fallback: {e2}")
+
+    async def stop(self) -> None:
+        self._logger.info("🐳 Shutting down container browser runtime...")
+        if self.browser:
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
 
 
 class BrowserRuntime:
@@ -42,6 +167,19 @@ class BrowserRuntime:
         self.stealth_manager = StealthManager(stealth_level, logger)
 
     async def start(self) -> None:
+        # Phase 6.6: Automatic container detection and alternative runtime
+        if is_running_in_container():
+            self._logger.info("🐳 Container environment detected - using ContainerBrowserRuntime")
+            container_runtime = ContainerBrowserRuntime(
+                headless=True,  # Force headless in containers
+                logger=self._logger
+            )
+            await container_runtime.start()
+            # Replace our browser instance with the container one
+            self.browser = container_runtime.browser
+            self._playwright = container_runtime._playwright
+            return
+
         self._logger.info("Starting Playwright runtime…")
         self._playwright = await async_playwright().start()
 

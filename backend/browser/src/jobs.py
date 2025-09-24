@@ -17,7 +17,19 @@ import uuid
 from typing import Any, Dict, Optional, List
 from enum import Enum
 
-import redis.asyncio as redis
+# Optional Redis dependency with graceful fallback
+try:
+    import redis.asyncio as redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    # Create placeholder redis module when not available
+    class RedisPlaceholder:
+        @staticmethod
+        def from_url(*args, **kwargs):
+            raise ImportError("Redis module not available - install with: pip install redis")
+    redis = RedisPlaceholder()
+    REDIS_AVAILABLE = False
+
 from pydantic import BaseModel, Field
 
 
@@ -100,12 +112,13 @@ class SubmitRequest(BaseModel):
 
 
 class JobStore:
-    """Redis-backed job store with persistence and recovery capabilities."""
+    """Job store with Redis backing and graceful in-memory fallback."""
 
     def __init__(self, redis_url: str = "redis://localhost:6379/0", logger: Optional[logging.Logger] = None):
         self.redis_url = redis_url
         self.logger = logger or logging.getLogger(__name__)
         self.redis_client: Optional[redis.Redis] = None
+        self.use_redis = REDIS_AVAILABLE
 
         # Redis key patterns
         self.job_key_pattern = "job:{job_id}"
@@ -117,15 +130,26 @@ class JobStore:
         self.dlq_key = "dead_letter_queue"
         self.dlq_job_key_pattern = "dlq_job:{job_id}"
 
+        # In-memory fallback storage when Redis unavailable
+        self.memory_jobs: Dict[str, JobRecord] = {}
+        self.memory_queue: List[str] = []
+        self.memory_running: Dict[str, str] = {}  # job_id -> worker_id
+        self.memory_dlq: List[str] = []
+
     async def connect(self) -> None:
-        """Initialize Redis connection."""
+        """Initialize Redis connection with graceful fallback."""
+        if not self.use_redis:
+            self.logger.warning("Redis not available - using in-memory fallback job storage")
+            return
+
         try:
             self.redis_client = redis.from_url(self.redis_url, decode_responses=True)
             await self.redis_client.ping()
             self.logger.info(f"Connected to Redis at {self.redis_url}")
         except Exception as e:
-            self.logger.error(f"Failed to connect to Redis: {e}")
-            raise
+            self.logger.warning(f"Redis connection failed ({e}) - falling back to in-memory storage")
+            self.use_redis = False
+            self.redis_client = None
 
     async def disconnect(self) -> None:
         """Close Redis connection."""
@@ -135,64 +159,82 @@ class JobStore:
 
     async def add_job(self, job: JobRecord) -> None:
         """Add a new job to the store and queue."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
+        if self.use_redis and self.redis_client:
+            # Redis-based storage
+            job_key = self.job_key_pattern.format(job_id=job.job_id)
+            job_data = job.json()
+            await self.redis_client.set(job_key, job_data)
 
-        # Store job data
-        job_key = self.job_key_pattern.format(job_id=job.job_id)
-        job_data = job.json()
-        await self.redis_client.set(job_key, job_data)
-
-        # Add to appropriate queue based on priority
-        if job.priority > 0:
-            await self.redis_client.zadd(self.priority_queue_key, {job.job_id: job.priority})
+            # Add to appropriate queue based on priority
+            if job.priority > 0:
+                await self.redis_client.zadd(self.priority_queue_key, {job.job_id: job.priority})
+            else:
+                await self.redis_client.lpush(self.queue_key, job.job_id)
         else:
-            await self.redis_client.lpush(self.queue_key, job.job_id)
+            # In-memory fallback storage
+            self.memory_jobs[job.job_id] = job
+            # Simple priority queue implementation for in-memory
+            if job.priority > 0:
+                # Insert in priority order (higher priority first)
+                inserted = False
+                for i, existing_job_id in enumerate(self.memory_queue):
+                    existing_job = self.memory_jobs.get(existing_job_id)
+                    if existing_job and existing_job.priority < job.priority:
+                        self.memory_queue.insert(i, job.job_id)
+                        inserted = True
+                        break
+                if not inserted:
+                    self.memory_queue.append(job.job_id)
+            else:
+                self.memory_queue.append(job.job_id)
 
         self.logger.info(f"Added job {job.job_id} to queue with priority {job.priority}")
 
     async def get_job(self, job_id: str) -> Optional[JobRecord]:
         """Retrieve a job by ID."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
-        job_key = self.job_key_pattern.format(job_id=job_id)
-        job_data = await self.redis_client.get(job_key)
-
-        if job_data:
-            return JobRecord.parse_raw(job_data)
-        return None
+        if self.use_redis and self.redis_client:
+            # Redis-based retrieval
+            job_key = self.job_key_pattern.format(job_id=job_id)
+            job_data = await self.redis_client.get(job_key)
+            if job_data:
+                return JobRecord.parse_raw(job_data)
+            return None
+        else:
+            # In-memory fallback retrieval
+            return self.memory_jobs.get(job_id)
 
     async def update_job(self, job: JobRecord) -> None:
-        """Update job data in Redis."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
-        job_key = self.job_key_pattern.format(job_id=job.job_id)
-        job_data = job.json()
-        await self.redis_client.set(job_key, job_data)
+        """Update job data in storage."""
+        if self.use_redis and self.redis_client:
+            # Redis-based update
+            job_key = self.job_key_pattern.format(job_id=job.job_id)
+            job_data = job.json()
+            await self.redis_client.set(job_key, job_data)
+        else:
+            # In-memory fallback update
+            self.memory_jobs[job.job_id] = job
 
     async def get_next_job(self) -> Optional[str]:
         """Get the next job ID from the queue (priority first, then FIFO)."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
-        # Check priority queue first
-        priority_jobs = await self.redis_client.zrevrange(self.priority_queue_key, 0, 0)
-        if priority_jobs:
-            job_id = priority_jobs[0]
-            await self.redis_client.zrem(self.priority_queue_key, job_id)
+        if self.use_redis and self.redis_client:
+            # Redis-based queue retrieval
+            # Check priority queue first
+            priority_jobs = await self.redis_client.zrevrange(self.priority_queue_key, 0, 0)
+            if priority_jobs:
+                job_id = priority_jobs[0]
+                await self.redis_client.zrem(self.priority_queue_key, job_id)
+                return job_id
+            # Then check regular queue
+            job_id = await self.redis_client.rpop(self.queue_key)
             return job_id
-
-        # Then check regular queue
-        job_id = await self.redis_client.rpop(self.queue_key)
-        return job_id
+        else:
+            # In-memory fallback queue retrieval
+            if self.memory_queue:
+                return self.memory_queue.pop(0)
+            return None
 
     async def mark_job_running(self, job_id: str, worker_id: str) -> None:
         """Mark a job as running and track the worker."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
         job = await self.get_job(job_id)
         if not job:
             raise ValueError(f"Job {job_id} not found")
@@ -203,13 +245,15 @@ class JobStore:
         job.worker_id = worker_id
 
         await self.update_job(job)
-        await self.redis_client.sadd(self.running_jobs_key, job_id)
+
+        if self.use_redis and self.redis_client:
+            await self.redis_client.sadd(self.running_jobs_key, job_id)
+        else:
+            # In-memory fallback tracking
+            self.memory_running[job_id] = worker_id
 
     async def mark_job_completed(self, job_id: str, result: Dict[str, Any]) -> None:
         """Mark a job as completed with results."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
         job = await self.get_job(job_id)
         if not job:
             raise ValueError(f"Job {job_id} not found")
@@ -219,13 +263,15 @@ class JobStore:
         job.result = result
 
         await self.update_job(job)
-        await self.redis_client.srem(self.running_jobs_key, job_id)
+
+        if self.use_redis and self.redis_client:
+            await self.redis_client.srem(self.running_jobs_key, job_id)
+        else:
+            # In-memory fallback cleanup
+            self.memory_running.pop(job_id, None)
 
     async def mark_job_failed(self, job_id: str, error: str, should_retry: bool = True) -> None:
         """Mark a job as failed and optionally retry."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
         job = await self.get_job(job_id)
         if not job:
             raise ValueError(f"Job {job_id} not found")
@@ -243,10 +289,26 @@ class JobStore:
             delay_seconds = min(60 * (2 ** job.retry_count), 600)  # Max 10 minutes
             await asyncio.sleep(delay_seconds)
 
-            if job.priority > 0:
-                await self.redis_client.zadd(self.priority_queue_key, {job.job_id: job.priority})
+            if self.use_redis and self.redis_client:
+                if job.priority > 0:
+                    await self.redis_client.zadd(self.priority_queue_key, {job.job_id: job.priority})
+                else:
+                    await self.redis_client.lpush(self.queue_key, job.job_id)
             else:
-                await self.redis_client.lpush(self.queue_key, job.job_id)
+                # In-memory re-queueing with priority
+                if job.priority > 0:
+                    # Insert in priority order
+                    inserted = False
+                    for i, existing_job_id in enumerate(self.memory_queue):
+                        existing_job = self.memory_jobs.get(existing_job_id)
+                        if existing_job and existing_job.priority < job.priority:
+                            self.memory_queue.insert(i, job.job_id)
+                            inserted = True
+                            break
+                    if not inserted:
+                        self.memory_queue.append(job.job_id)
+                else:
+                    self.memory_queue.append(job.job_id)
 
             self.logger.info(f"Retrying job {job_id} (attempt {job.retry_count}/{job.max_retries})")
         else:
@@ -257,13 +319,15 @@ class JobStore:
             await self._add_to_dead_letter_queue(job)
 
         await self.update_job(job)
-        await self.redis_client.srem(self.running_jobs_key, job_id)
+
+        if self.use_redis and self.redis_client:
+            await self.redis_client.srem(self.running_jobs_key, job_id)
+        else:
+            # In-memory cleanup
+            self.memory_running.pop(job_id, None)
 
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a job if it's not already completed."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
         job = await self.get_job(job_id)
         if not job:
             return False
@@ -275,43 +339,54 @@ class JobStore:
         job.finished_at = datetime.datetime.utcnow()
 
         await self.update_job(job)
-        await self.redis_client.srem(self.running_jobs_key, job_id)
 
-        # Remove from queues if not started
-        if job.status == JobStatus.QUEUED:
-            await self.redis_client.lrem(self.queue_key, 0, job_id)
-            await self.redis_client.zrem(self.priority_queue_key, job_id)
+        if self.use_redis and self.redis_client:
+            await self.redis_client.srem(self.running_jobs_key, job_id)
+            # Remove from queues if not started
+            if job.status == JobStatus.QUEUED:
+                await self.redis_client.lrem(self.queue_key, 0, job_id)
+                await self.redis_client.zrem(self.priority_queue_key, job_id)
+        else:
+            # In-memory cleanup
+            self.memory_running.pop(job_id, None)
+            # Remove from in-memory queue if not started
+            if job_id in self.memory_queue:
+                self.memory_queue.remove(job_id)
 
         self.logger.info(f"Cancelled job {job_id}")
         return True
 
     async def update_heartbeat(self, job_id: str, worker_id: str) -> None:
         """Update job heartbeat to indicate worker is alive."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
         job = await self.get_job(job_id)
         if job and job.status == JobStatus.RUNNING:
             job.last_heartbeat = datetime.datetime.utcnow()
             await self.update_job(job)
 
-            # Update worker heartbeat
-            worker_key = self.worker_heartbeat_key.format(worker_id=worker_id)
-            await self.redis_client.setex(worker_key, 60, datetime.datetime.utcnow().isoformat())
+            if self.use_redis and self.redis_client:
+                # Update worker heartbeat in Redis
+                worker_key = self.worker_heartbeat_key.format(worker_id=worker_id)
+                await self.redis_client.setex(worker_key, 60, datetime.datetime.utcnow().isoformat())
+            # Note: In-memory mode doesn't need persistent worker heartbeat tracking
 
     async def cleanup_expired_jobs(self) -> List[str]:
         """Find and cleanup expired/stuck jobs."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
+        if self.use_redis and self.redis_client:
+            running_job_ids = await self.redis_client.smembers(self.running_jobs_key)
+        else:
+            # In-memory fallback - get running job IDs from memory
+            running_job_ids = list(self.memory_running.keys())
 
-        running_job_ids = await self.redis_client.smembers(self.running_jobs_key)
         expired_jobs = []
 
         for job_id in running_job_ids:
             job = await self.get_job(job_id)
             if not job:
                 # Job data missing but still in running set
-                await self.redis_client.srem(self.running_jobs_key, job_id)
+                if self.use_redis and self.redis_client:
+                    await self.redis_client.srem(self.running_jobs_key, job_id)
+                else:
+                    self.memory_running.pop(job_id, None)
                 continue
 
             if job.is_expired:
@@ -320,24 +395,39 @@ class JobStore:
                 job.error = f"Job timed out after {job.timeout_seconds} seconds"
 
                 await self.update_job(job)
-                await self.redis_client.srem(self.running_jobs_key, job_id)
-                expired_jobs.append(job_id)
 
+                if self.use_redis and self.redis_client:
+                    await self.redis_client.srem(self.running_jobs_key, job_id)
+                else:
+                    self.memory_running.pop(job_id, None)
+
+                expired_jobs.append(job_id)
                 self.logger.warning(f"Job {job_id} timed out and was cleaned up")
 
         return expired_jobs
 
     async def get_queue_stats(self) -> Dict[str, Any]:
         """Get queue statistics for monitoring."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
-        regular_queue_size = await self.redis_client.llen(self.queue_key)
-        priority_queue_size = await self.redis_client.zcard(self.priority_queue_key)
-        running_jobs_count = await self.redis_client.scard(self.running_jobs_key)
-
-        # Phase 2.4: Include DLQ stats
-        dlq_stats = await self.get_dlq_stats()
+        if self.use_redis and self.redis_client:
+            regular_queue_size = await self.redis_client.llen(self.queue_key)
+            priority_queue_size = await self.redis_client.zcard(self.priority_queue_key)
+            running_jobs_count = await self.redis_client.scard(self.running_jobs_key)
+            # Phase 2.4: Include DLQ stats
+            dlq_stats = await self.get_dlq_stats()
+        else:
+            # In-memory fallback stats
+            # Count priority jobs in memory queue
+            priority_count = sum(1 for job_id in self.memory_queue
+                               if job_id in self.memory_jobs and self.memory_jobs[job_id].priority > 0)
+            regular_queue_size = len(self.memory_queue) - priority_count
+            priority_queue_size = priority_count
+            running_jobs_count = len(self.memory_running)
+            # Simple DLQ stats for memory mode
+            dlq_stats = {
+                "total_jobs": len(self.memory_dlq),
+                "oldest_timestamp": None,
+                "newest_timestamp": None
+            }
 
         return {
             "regular_queue_size": regular_queue_size,
@@ -349,12 +439,13 @@ class JobStore:
 
     async def list_running_jobs(self) -> List[JobRecord]:
         """Get list of currently running jobs."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
+        if self.use_redis and self.redis_client:
+            running_job_ids = await self.redis_client.smembers(self.running_jobs_key)
+        else:
+            # In-memory fallback - get running job IDs from memory
+            running_job_ids = list(self.memory_running.keys())
 
-        running_job_ids = await self.redis_client.smembers(self.running_jobs_key)
         jobs = []
-
         for job_id in running_job_ids:
             job = await self.get_job(job_id)
             if job:
@@ -365,9 +456,6 @@ class JobStore:
     # Phase 2.4: Dead Letter Queue implementation
     async def _add_to_dead_letter_queue(self, job: JobRecord) -> None:
         """Add a permanently failed job to the dead letter queue."""
-        if not self.redis_client:
-            raise RuntimeError("Redis client not connected")
-
         dlq_entry = {
             "job_id": job.job_id,
             "task_name": job.task_name,
@@ -380,13 +468,21 @@ class JobStore:
             "reason": "max_retries_exceeded"
         }
 
-        # Store in DLQ with timestamp as score for ordering
-        timestamp = job.finished_at.timestamp() if job.finished_at else datetime.datetime.utcnow().timestamp()
-        await self.redis_client.zadd(self.dlq_key, {job.job_id: timestamp})
+        if self.use_redis and self.redis_client:
+            # Store in DLQ with timestamp as score for ordering
+            timestamp = job.finished_at.timestamp() if job.finished_at else datetime.datetime.utcnow().timestamp()
+            await self.redis_client.zadd(self.dlq_key, {job.job_id: timestamp})
 
-        # Store detailed DLQ entry
-        dlq_job_key = self.dlq_job_key_pattern.format(job_id=job.job_id)
-        await self.redis_client.set(dlq_job_key, json.dumps(dlq_entry))
+            # Store detailed DLQ entry
+            dlq_job_key = self.dlq_job_key_pattern.format(job_id=job.job_id)
+            await self.redis_client.set(dlq_job_key, json.dumps(dlq_entry))
+        else:
+            # In-memory DLQ fallback - simple append
+            self.memory_dlq.append(job.job_id)
+            # Store DLQ entry in memory jobs with a special DLQ marker
+            dlq_job = job.copy(deep=True)
+            dlq_job.status = JobStatus.FAILED
+            self.memory_jobs[f"dlq_{job.job_id}"] = dlq_job
 
         self.logger.warning(f"📮 Job {job.job_id} added to Dead Letter Queue (reason: max_retries_exceeded)")
 
