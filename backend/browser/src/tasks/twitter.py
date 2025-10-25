@@ -7,10 +7,50 @@ Built following the successful Airbnb/Booking scraper patterns.
 
 Features:
 - Authenticated login with session persistence
-- Profile data extraction  
+- Profile data extraction
 - Tweet timeline scraping
 - Rate limiting and error handling
-- Multiple extraction levels
+- Multiple extraction levels (1-4)
+- Batch processing support
+- Date filtering for timeline extraction
+
+Extraction Levels:
+-----------------
+Level 1 (Basic):
+    - User profile information (name, bio, counts)
+    - Recent tweets (last 10-20)
+    - Fast extraction (~30-60 seconds)
+    - Minimal resource usage
+
+Level 2 (Standard):
+    - Everything from Level 1
+    - Extended tweet timeline (50-100 tweets)
+    - Basic engagement data (likes, retweets per tweet)
+    - Moderate extraction (~2-5 minutes)
+
+Level 3 (Advanced):
+    - Everything from Level 2
+    - Social graph data (followers/following lists)
+    - Media content extraction
+    - User interactions (mentions, replies)
+    - Intensive extraction (~5-15 minutes)
+
+Level 4 (Complete):
+    - Everything from Level 3
+    - Unlimited post extraction mode
+    - Complete timeline historical data
+    - All engagement metrics
+    - Full media gallery
+    - Maximum resource usage (~15+ minutes)
+    - Supports 1000+ post extraction with intelligent batching
+
+Shared Components:
+-----------------
+This scraper uses the following shared components for reusability:
+- shared.session_manager: Session pooling and concurrency control
+- shared.batch_processor: Intelligent batch job processing
+- shared.date_utils: Date filtering and timeline management
+- shared.metrics: Success rate calculation
 
 Version: 1.0
 Author: Based on successful Airbnb/Booking patterns
@@ -25,8 +65,23 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Union
 import hashlib
 
+# Import reusable components from existing modules
+from ..observability.metrics import calculate_extraction_success_rate
+from ..utils import (
+    parse_date_range,
+    parse_custom_date,
+    get_date_filter_bounds,
+    is_within_date_range,
+    parse_relative_timestamp,
+    format_date,
+    calculate_date_range_days,
+    get_expected_data_reduction
+)
+from ..human_behavior import HumanBehavior
 
-def calculate_extraction_success_rate(results: Union[List[Dict[str, Any]], bool, None], params: Dict[str, Any], method: str) -> float:
+
+# DEPRECATED: Kept for backward compatibility - use shared.metrics.calculate_extraction_success_rate
+def calculate_extraction_success_rate_legacy(results: Union[List[Dict[str, Any]], bool, None], params: Dict[str, Any], method: str) -> float:
     """Calculate realistic success rate based on actual data quality."""
     # CRITICAL FIX: Type validation first to prevent "object of type 'bool' has no len()" error
     if not isinstance(results, (list, tuple)):
@@ -127,11 +182,41 @@ def calculate_extraction_success_rate(results: Union[List[Dict[str, Any]], bool,
         return len(results) / max(max_requested, 1) if max_requested > 0 else 0.0
 
 
+# Create TwitterDateUtils class as wrapper around utils functions for backward compatibility
 class TwitterDateUtils:
     """Utility class for handling date filtering in Twitter extraction."""
-    
+
     @staticmethod
     def parse_date_range(date_range: str) -> tuple[datetime, datetime]:
+        """Parse predefined date ranges into start/end datetime objects."""
+        return parse_date_range(date_range)
+
+    @staticmethod
+    def parse_custom_date(date_str: str) -> Optional[datetime]:
+        """Parse custom date string into datetime object."""
+        return parse_custom_date(date_str)
+
+    @staticmethod
+    def get_date_filter_bounds(params: Dict[str, Any]) -> tuple[Optional[datetime], Optional[datetime]]:
+        """Get date filtering bounds from parameters."""
+        return get_date_filter_bounds(params)
+
+    @staticmethod
+    def is_within_date_range(tweet_timestamp: str, start_dt: datetime, end_dt: datetime) -> bool:
+        """Check if tweet timestamp is within the specified date range."""
+        return is_within_date_range(tweet_timestamp, start_dt, end_dt)
+
+    @staticmethod
+    def _parse_relative_timestamp(timestamp: str, start_dt: datetime, end_dt: datetime) -> bool:
+        """Parse relative timestamps like '2h', '3d ago', 'yesterday'."""
+        return parse_relative_timestamp(timestamp, start_dt, end_dt)
+
+
+class TwitterDateUtils_Legacy:
+    """DEPRECATED - kept for reference only."""
+
+    @staticmethod
+    def parse_date_range_legacy(date_range: str) -> tuple[datetime, datetime]:
         """Parse predefined date ranges into start/end datetime objects."""
         now = datetime.now()
         
@@ -279,7 +364,7 @@ class TwitterTask:
     LOGIN_URL = "https://twitter.com/i/flow/login"
 
     @staticmethod
-    async def run(params: Dict[str, Any], logger: logging.Logger, browser, job_output_dir: str = None) -> Dict[str, Any]:
+    async def run(params: Dict[str, Any], logger: logging.Logger, browser, context=None, job_output_dir: str = None) -> Dict[str, Any]:
         """Main entry point for Twitter scraping."""
         try:
             # Extract nested params if present (consistent with Airbnb/Booking)
@@ -327,12 +412,21 @@ class TwitterTask:
                 logger.info(f"➡️ Following Limit: {clean_params.get('max_following', 150)}")
             if clean_params.get('scrape_reposts', False):
                 logger.info(f"🔄 Reposts Limit: {clean_params.get('max_reposts', 50)}")
+
+            # Post-level engagement scraping
+            if clean_params.get('scrape_post_likers', False):
+                logger.info(f"💖 Post Likers: {clean_params.get('max_likers_per_post', 20)} per post")
+            if clean_params.get('scrape_post_repliers', False):
+                logger.info(f"💬 Post Repliers: {clean_params.get('max_repliers_per_post', 20)} per post")
+            if clean_params.get('scrape_post_reposters', False):
+                logger.info(f"🔁 Post Reposters: {clean_params.get('max_reposters_per_post', 20)} per post")
+
             if not any([clean_params.get('scrape_posts', True), clean_params.get('scrape_likes', False),
                        clean_params.get('scrape_mentions', False), clean_params.get('scrape_media', False),
                        clean_params.get('scrape_followers', False), clean_params.get('scrape_following', False),
                        clean_params.get('scrape_reposts', False)]):
                 logger.info(f"🔢 Max Results: {clean_params.get('max_results', 10)}")
-            
+
             # Initialize concurrency manager for session isolation
             concurrency_manager = TwitterConcurrencyManager()
             
@@ -340,16 +434,20 @@ class TwitterTask:
             start_time = time.time()
             session_file = await concurrency_manager.get_available_session(logger)
             
-            # Initialize scraper with assigned session
-            scraper = TwitterScraper(browser, logger)
+            # Initialize scraper with assigned session and context from workers
+            scraper = TwitterScraper(browser, logger, output_dir=job_output_dir, context=context)
             
             # Load the assigned session
             if clean_params.get("use_session") or os.path.exists(session_file):
                 logger.info(f"🍪 Using session for authentication: {session_file}")
+                logger.info("⏳ STEP 1/5: Loading session cookies...")
                 await scraper.load_session(session_file)
+                logger.info("✅ STEP 1/5: Session loaded successfully")
             else:
                 logger.info("🔐 Using credential-based authentication...")
+                logger.info("⏳ STEP 1/5: Starting authentication...")
                 await scraper.authenticate()
+                logger.info("✅ STEP 1/5: Authentication completed")
             
             # Add the corrected parameters to clean_params (FIXED ROUTING)
             # Only set target_username for user scraping, not search operations
@@ -533,33 +631,60 @@ class TwitterTask:
                     results = await scraper.scrape_user_comprehensive(clean_params_level4)
                     extraction_method = "level_4_enhanced"
                 elif scrape_level >= 3:
-                    # Level 3: Full profile + posts + some engagement data
-                    logger.info(f"📊 LEVEL 3: Full profile with enhanced data")
+                    # Level 3: Full profile + posts + media + likes + mentions + reposts + sample social graph + post engagement
+                    logger.info(f"📊 LEVEL 3: Full profile with all features and sample social graph")
                     clean_params_level3 = clean_params.copy()
                     clean_params_level3.update({
                         'scrape_posts': True,
                         'scrape_media': True,
-                        'scrape_likes': False,
-                        'scrape_mentions': False,
-                        'scrape_followers': False,
-                        'scrape_following': False,
-                        'scrape_reposts': False
+                        # FORCE enable these features for Level 3 (override False from _validate_params)
+                        'scrape_likes': True,  # Always enabled for Level 3
+                        'max_likes': min(clean_params.get('max_likes', 10), 10),  # Sample 10 for Level 3
+                        'scrape_mentions': True,  # Always enabled for Level 3
+                        'max_mentions': min(clean_params.get('max_mentions', 10), 10),  # Sample 10
+                        # Level 3: Allow sample followers/following if requested
+                        'scrape_followers': clean_params.get('scrape_followers', False),
+                        'max_followers': min(clean_params.get('max_followers', 25), 25),  # Max 25 for level 3
+                        'scrape_following': clean_params.get('scrape_following', False),
+                        'max_following': min(clean_params.get('max_following', 25), 25),  # Max 25 for level 3
+                        'scrape_reposts': True,  # Always enabled for Level 3
+                        'max_reposts': min(clean_params.get('max_reposts', 10), 10),  # Sample 10
+                        # Post-level engagement (enabled by default for Level 3)
+                        'scrape_post_likers': True,  # Always enabled for Level 3
+                        'max_likers_per_post': clean_params.get('max_likers_per_post', 5),  # Sample 5 per post
+                        'scrape_post_repliers': True,  # Always enabled for Level 3
+                        'max_repliers_per_post': clean_params.get('max_repliers_per_post', 5),  # Sample 5 per post
+                        'scrape_post_reposters': True,  # Always enabled for Level 3
+                        'max_reposters_per_post': clean_params.get('max_reposters_per_post', 5)  # Sample 5 per post
                     })
+                    # DEBUG: Log the params being sent
+                    logger.info(f"🔍 DEBUG LEVEL 3 PARAMS: scrape_likes={clean_params_level3.get('scrape_likes')}, scrape_mentions={clean_params_level3.get('scrape_mentions')}, scrape_reposts={clean_params_level3.get('scrape_reposts')}")
+                    logger.info(f"🔍 DEBUG ENGAGEMENT: scrape_post_likers={clean_params_level3.get('scrape_post_likers')}, scrape_post_repliers={clean_params_level3.get('scrape_post_repliers')}, scrape_post_reposters={clean_params_level3.get('scrape_post_reposters')}")
                     results = await scraper.scrape_user_comprehensive(clean_params_level3)
                     extraction_method = "level_3_with_media"
                 elif scrape_level >= 2:
-                    # Level 2: Profile + posts only
-                    logger.info(f"📊 LEVEL 2: Profile and posts extraction")
+                    # Level 2: Profile + posts + sample social graph + optional post engagement
+                    logger.info(f"📊 LEVEL 2: Profile and posts extraction with sample social graph")
                     clean_params_level2 = clean_params.copy()
                     clean_params_level2.update({
                         'scrape_posts': True,
                         'scrape_media': False,
                         'scrape_likes': False,
                         'scrape_mentions': False,
-                        'scrape_followers': False,
-                        'scrape_following': False,
+                        # Level 2: Allow sample followers/following if requested
+                        'scrape_followers': clean_params.get('scrape_followers', False),
+                        'max_followers': min(clean_params.get('max_followers', 10), 10),  # Max 10 for level 2
+                        'scrape_following': clean_params.get('scrape_following', False),
+                        'max_following': min(clean_params.get('max_following', 10), 10),  # Max 10 for level 2
                         'scrape_reposts': False,
-                        'max_posts': min(clean_params.get('max_posts', 10), 15)  # Limit posts for level 2
+                        'max_posts': min(clean_params.get('max_posts', 10), 15),  # Limit posts for level 2
+                        # Post-level engagement (optional, user-controlled)
+                        'scrape_post_likers': clean_params.get('scrape_post_likers', False),
+                        'max_likers_per_post': clean_params.get('max_likers_per_post', 20),
+                        'scrape_post_repliers': clean_params.get('scrape_post_repliers', False),
+                        'max_repliers_per_post': clean_params.get('max_repliers_per_post', 20),
+                        'scrape_post_reposters': clean_params.get('scrape_post_reposters', False),
+                        'max_reposters_per_post': clean_params.get('max_reposters_per_post', 20)
                     })
                     results = await scraper.scrape_user_comprehensive(clean_params_level2)
                     extraction_method = "level_2_full_profile"
@@ -670,11 +795,19 @@ class TwitterTask:
                     os.makedirs(job_output_dir, exist_ok=True)
 
                     # Export in multiple formats
-                    exported_files = await TwitterTask._export_results_multi_format(
-                        result, job_output_dir, export_formats, logger
-                    )
+                    # NOTE: Export temporarily disabled - data is saved in partial_results files
+                    # exported_files = await TwitterTask._export_results_multi_format(
+                    #     result, job_output_dir, export_formats, logger
+                    # )
+                    exported_files = []
 
-                    logger.info(f"💾 Phase 4.1: Exported data in {len(export_formats)} formats: {exported_files}")
+                    # Save basic JSON output
+                    json_path = os.path.join(job_output_dir, "results.json")
+                    with open(json_path, 'w', encoding='utf-8') as f:
+                        json.dump(result, f, indent=2, ensure_ascii=False)
+                    exported_files.append(json_path)
+
+                    logger.info(f"💾 Phase 4.1: Exported data to: {exported_files}")
                 except Exception as e:
                     logger.error(f"❌ Failed to save output: {e}")
             
@@ -758,6 +891,14 @@ class TwitterTask:
             "scrape_reposts": params.get("scrape_reposts", params.get("enable_reposts", False)),
             "max_reposts": min(params.get("max_reposts", params.get("reposts_count", 50)), 200),
 
+            # Post-level engagement scraping (who liked/replied/reposted each post)
+            "scrape_post_likers": params.get("scrape_post_likers", False),
+            "max_likers_per_post": min(params.get("max_likers_per_post", 20), 100),
+            "scrape_post_repliers": params.get("scrape_post_repliers", False),
+            "max_repliers_per_post": min(params.get("max_repliers_per_post", 20), 100),
+            "scrape_post_reposters": params.get("scrape_post_reposters", False),
+            "max_reposters_per_post": min(params.get("max_reposters_per_post", 20), 100),
+
             # Batch processing parameters
             "batch_usernames": params.get("batch_usernames", []),
             "batch_hashtags": params.get("batch_hashtags", []),
@@ -774,9 +915,10 @@ class TwitterTask:
         }
 
 
+# Twitter-specific batch processing implementation
 class TwitterBatchProcessor:
-    """Intelligent batch processing with session reuse and optimization."""
-    
+    """Intelligent batch processing with session reuse and optimization for Twitter."""
+
     def __init__(self, concurrency_manager):
         self.concurrency_manager = concurrency_manager
         self.batch_cache = {}
@@ -1148,16 +1290,17 @@ class TwitterBatchProcessor:
         }
 
 
+# Twitter-specific session pool management
 class TwitterSessionPool:
-    """Advanced multi-session pool management with dynamic scaling and intelligent rotation."""
-    
+    """Advanced multi-session pool management with dynamic scaling and intelligent rotation for Twitter."""
+
     def __init__(self, concurrency_manager):
         self.concurrency_manager = concurrency_manager
         self.pool_config = {
             'min_pool_size': 3,
             'max_pool_size': 8,
-            'target_utilization': 0.7,  # 70% utilization target
-            'scale_up_threshold': 0.8,   # Scale up at 80% utilization
+            'target_utilization': 0.7,   # 70% utilization target
+            'scale_up_threshold': 0.8,    # Scale up at 80% utilization
             'scale_down_threshold': 0.3,  # Scale down at 30% utilization
             'rotation_interval': 300,     # 5 minutes
             'health_check_interval': 120  # 2 minutes
@@ -1401,9 +1544,10 @@ class TwitterSessionPool:
         }
 
 
+# Twitter-specific concurrency management with session isolation and health monitoring
 class TwitterConcurrencyManager:
     """Advanced concurrent Twitter scraping with session isolation, health monitoring, and resource management."""
-    
+
     _instance = None
     _session_pool = []
     _session_usage = {}
@@ -1411,18 +1555,18 @@ class TwitterConcurrencyManager:
     _session_health = {}
     _session_metrics = {}
     _session_failures = {}
-    
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
-    
+
     def __init__(self):
         if not hasattr(self, 'initialized'):
             self.initialized = True
             self.session_files = [
                 "/sessions/twitter_session.json",
-                "/sessions/twitter_session_2.json", 
+                "/sessions/twitter_session_2.json",
                 "/sessions/twitter_session_3.json"
             ]
             self.max_concurrent_per_session = 2
@@ -1430,10 +1574,10 @@ class TwitterConcurrencyManager:
             self.session_health_check_interval = 300.0  # 5 minutes
             self.max_session_failures = 3  # Max failures before session rotation
             self.session_timeout_threshold = 600.0  # 10 minutes for session timeout
-            
+
             # Initialize batch processor for session reuse optimization
             self.batch_processor = TwitterBatchProcessor(self)
-            
+
             # Initialize advanced session pool management
             self.session_pool_manager = TwitterSessionPool(self)
             
@@ -1846,10 +1990,11 @@ class TwitterScraper:
     BASE_URL = "https://x.com"
     LOGIN_URL = "https://x.com/i/flow/login"
     
-    def __init__(self, browser, logger: logging.Logger):
+    def __init__(self, browser, logger: logging.Logger, output_dir: str = None, context=None):
         self.browser = browser
         self.logger = logger
-        self.context = None
+        self.output_dir = output_dir
+        self.context = context  # Use context from workers if provided
         self.page = None
         self.date_filter_start = None
         self.date_filter_end = None
@@ -1861,6 +2006,120 @@ class TwitterScraper:
         self.email = os.getenv('X_EMAIL', '')
         self.username = os.getenv('X_USERNAME', '')
         self.password = os.getenv('X_PASS', '')
+
+    async def _with_timeout(self, operation, timeout_ms=10000, operation_name="operation", default=None):
+        """Wrapper to add timeout to async operations with graceful fallback."""
+        try:
+            return await asyncio.wait_for(operation, timeout=timeout_ms/1000)
+        except asyncio.TimeoutError:
+            self.logger.warning(f"⏱️ {operation_name} timed out after {timeout_ms}ms")
+            return default
+        except Exception as e:
+            self.logger.warning(f"⚠️ {operation_name} failed: {e}")
+            return default
+
+    def _save_partial_results(self, results: Dict[str, Any], output_dir: str, reason: str = "checkpoint"):
+        """Save partial results to avoid data loss."""
+        try:
+            import json
+            checkpoint_file = f"{output_dir}/partial_results_{reason}.json"
+            with open(checkpoint_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            self.logger.info(f"💾 Saved partial results to {checkpoint_file}")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Could not save partial results: {e}")
+
+    async def _extract_posts_simple_fast(self, username: str, max_posts: int) -> List[Dict[str, Any]]:
+        """Simple, fast, reliable post extraction with timeouts."""
+        self.logger.info(f"⚡ FAST EXTRACTION: Getting {max_posts} posts from @{username}")
+        posts = []
+        seen_texts = set()
+
+        try:
+            # Already on profile page from previous navigation
+            tweet_selector = 'article[data-testid="tweet"]'
+
+            # Extract visible posts first
+            self.logger.info(f"📊 Extracting visible posts...")
+            tweets = self.page.locator(tweet_selector)
+            initial_count = await self._with_timeout(tweets.count(), 5000, "Count initial tweets", 0)
+            self.logger.info(f"   Found {initial_count} visible tweets")
+
+            for i in range(min(initial_count, max_posts)):
+                tweet_elem = tweets.nth(i)
+                text = await self._with_timeout(
+                    tweet_elem.inner_text(),
+                    3000,
+                    f"Extract tweet {i+1} text",
+                    ""
+                )
+
+                if text and text not in seen_texts and len(text) > 10:
+                    seen_texts.add(text)
+                    posts.append({
+                        'id': f'tweet_{len(posts)+1}',
+                        'text': text[:500],  # Limit text length
+                        'author': username,
+                        'url': f'https://x.com/{username}',
+                        'extraction_method': 'simple_fast'
+                    })
+                    if len(posts) >= max_posts:
+                        break
+
+            # Scroll to get more if needed
+            max_scrolls = min(5, (max_posts - len(posts)) // 2 + 1)
+            self.logger.info(f"🔄 Scrolling up to {max_scrolls} times for more posts...")
+
+            for scroll_num in range(max_scrolls):
+                if len(posts) >= max_posts:
+                    break
+
+                # Scroll
+                await self.page.mouse.wheel(0, 600)
+                await asyncio.sleep(1)
+
+                # Extract new posts
+                tweets = self.page.locator(tweet_selector)
+                count = await self._with_timeout(tweets.count(), 5000, f"Count tweets after scroll {scroll_num+1}", 0)
+
+                found_new = False
+                for i in range(count):
+                    if len(posts) >= max_posts:
+                        break
+
+                    tweet_elem = tweets.nth(i)
+                    text = await self._with_timeout(
+                        tweet_elem.inner_text(),
+                        2000,
+                        f"Extract scrolled tweet {i+1}",
+                        ""
+                    )
+
+                    if text and text not in seen_texts and len(text) > 10:
+                        seen_texts.add(text)
+                        posts.append({
+                            'id': f'tweet_{len(posts)+1}',
+                            'text': text[:500],
+                            'author': username,
+                            'url': f'https://x.com/{username}',
+                            'extraction_method': 'simple_fast',
+                            'scroll_round': scroll_num + 1
+                        })
+                        found_new = True
+
+                if not found_new:
+                    self.logger.info(f"   No new posts found after scroll {scroll_num+1}, stopping")
+                    break
+
+                self.logger.info(f"   Progress: {len(posts)}/{max_posts} posts extracted")
+
+            self.logger.info(f"✅ EXTRACTION COMPLETE: {len(posts)} posts extracted")
+            return posts[:max_posts]
+
+        except Exception as e:
+            self.logger.error(f"❌ Simple extraction failed: {e}")
+            self.logger.info(f"⚠️ Returning {len(posts)} partial results")
+            return posts
 
         # ENHANCED: Authentication resilience features
         self.auth_attempts = 0
@@ -1987,50 +2246,59 @@ class TwitterScraper:
             ]
             user_agent = random.choice(mobile_user_agents)
             
-            self.logger.info(f"📱 MOBILE MODE: {viewport['width']}x{viewport['height']}")
-            self.logger.info(f"📱 Mobile UA: {user_agent[:50]}...")
-            
-            # Create ULTRA-STEALTH mobile context to bypass Twitter's detection
-            self.context = await self.browser.new_context(
-                viewport=viewport,
-                user_agent=user_agent,
-                locale='en-US',
-                timezone_id='America/New_York',
-                device_scale_factor=2.0,
-                has_touch=True,
-                is_mobile=True,
-                permissions=['geolocation'],
-                geolocation={'latitude': 40.7128, 'longitude': -74.0060},
-                # ENHANCED HEADERS - Mimic real mobile Twitter app
-                extra_http_headers={
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br, zstd',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                    'Upgrade-Insecure-Requests': '1',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-User': '?1',
-                    'Sec-Fetch-Dest': 'document',
-                    'Cache-Control': 'max-age=0',
-                    'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-                    'sec-ch-ua-mobile': '?1',
-                    'sec-ch-ua-platform': '"iOS"' if 'iPhone' in user_agent else '"Android"',
-                    'sec-ch-ua-platform-version': '"15.0"' if 'iPhone' in user_agent else '"11.0"',
-                    'DNT': '1',  # Do Not Track
-                    'Connection': 'keep-alive'
-                },
-                # BYPASS AUTOMATION FLAGS
-                ignore_https_errors=True,
-                java_script_enabled=True,
-                bypass_csp=True,
-                # STEALTH PROXY SETTINGS
-                proxy={
-                    'server': 'http://127.0.0.1:0'  # Disable proxy detection
-                } if random.choice([True, False]) else None
-            )
-            
+            # Use context from workers if provided, otherwise create one
+            if self.context is None:
+                self.logger.info(f"📱 MOBILE MODE: {viewport['width']}x{viewport['height']}")
+                self.logger.info(f"📱 Mobile UA: {user_agent[:50]}...")
+
+                # Create ULTRA-STEALTH mobile context to bypass Twitter's detection
+                self.context = await self.browser.new_context(
+                    viewport=viewport,
+                    user_agent=user_agent,
+                    locale='en-US',
+                    timezone_id='America/New_York',
+                    device_scale_factor=2.0,
+                    has_touch=True,
+                    is_mobile=True,
+                    permissions=['geolocation'],
+                    geolocation={'latitude': 40.7128, 'longitude': -74.0060},
+                    # ENHANCED HEADERS - Mimic real mobile Twitter app
+                    extra_http_headers={
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept-Encoding': 'gzip, deflate, br, zstd',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                        'Upgrade-Insecure-Requests': '1',
+                        'Sec-Fetch-Site': 'none',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-User': '?1',
+                        'Sec-Fetch-Dest': 'document',
+                        'Cache-Control': 'max-age=0',
+                        'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                        'sec-ch-ua-mobile': '?1',
+                        'sec-ch-ua-platform': '"iOS"' if 'iPhone' in user_agent else '"Android"',
+                        'sec-ch-ua-platform-version': '"15.0"' if 'iPhone' in user_agent else '"11.0"',
+                        'DNT': '1',  # Do Not Track
+                        'Connection': 'keep-alive'
+                    },
+                    # BYPASS AUTOMATION FLAGS
+                    ignore_https_errors=True,
+                    java_script_enabled=True,
+                    bypass_csp=True,
+                    # STEALTH PROXY SETTINGS
+                    proxy={
+                        'server': 'http://127.0.0.1:0'  # Disable proxy detection
+                    } if random.choice([True, False]) else None
+                )
+            else:
+                self.logger.info("✅ Using stealth context from workers (already created)")
+
             self.page = await self.context.new_page()
-            
+
+            # ENHANCED STEALTH: Apply extra stealth measures to page
+            from ..stealth_config import EnhancedStealthConfig
+            await EnhancedStealthConfig.apply_extra_stealth_to_page(self.page)
+            self.logger.info("🔒 Enhanced stealth applied to page")
+
             # CRITICAL: Block redirects away from mobile.twitter.com
             await self.page.route("**/*", self._mobile_route_handler)
             
@@ -2536,67 +2804,99 @@ class TwitterScraper:
         }]
 
     async def scrape_level_2(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Level 2: Enhanced profile + tweets + engagement metrics."""
-        self.logger.info("🐦 Level 2: Enhanced profile with engagement")
-        
+        """Level 2: Enhanced profile + tweets + engagement metrics + sample social graph."""
+        self.logger.info("🐦 Level 2: Enhanced profile with engagement and sample social graph")
+
         username = params.get('username', '')
         if not username:
             return await self._extract_timeline_tweets(params)
-        
+
         # Navigate to user profile
         profile_url = f"https://x.com/{username}"
         await self.page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
         await self._human_delay(3, 5)
-        
+
         # Enhanced content loading
         await self.page.wait_for_timeout(8000)
-        
+
         # Full profile extraction
         profile_data = await self._extract_profile_info(username)
-        
+
         # More tweets with engagement (up to 15)
         posts = await self._extract_posts_with_engagement(username, max_posts=15)
-        
+
+        # Level 2: Sample followers/following (10 each)
+        followers = []
+        following = []
+
+        if params.get('scrape_followers', False):
+            max_followers = params.get('max_followers', 10)
+            self.logger.info(f"👥 Level 2: Scraping sample followers ({max_followers})...")
+            followers = await self._scrape_user_followers(username, max_followers)
+
+        if params.get('scrape_following', False):
+            max_following = params.get('max_following', 10)
+            self.logger.info(f"➡️ Level 2: Scraping sample following ({max_following})...")
+            following = await self._scrape_user_following(username, max_following)
+
         return [{
             "type": "enhanced_user_data",
             "username": f"@{username}",
             "profile": profile_data,
-            "posts": posts[:15]
+            "posts": posts[:15],
+            "followers": followers,
+            "following": following
         }]
 
     async def scrape_level_3(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Level 3: Full profile + tweets + media + likes/mentions."""
-        self.logger.info("📸 Level 3: Full profile with media and interaction data")
-        
+        """Level 3: Full profile + tweets + media + likes/mentions + sample social graph."""
+        self.logger.info("📸 Level 3: Full profile with media, interaction data, and sample social graph")
+
         username = params.get('username', '')
         if not username:
             return await self._extract_timeline_tweets(params)
-        
+
         # Navigate to user profile
         profile_url = f"https://x.com/{username}"
         await self.page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
         await self._human_delay(4, 7)
-        
+
         # Full content loading
         await self.page.wait_for_timeout(12000)
-        
+
         # Complete profile extraction
         profile_data = await self._extract_profile_info(username)
-        
+
         # More tweets with full metadata (up to 25)
         posts = await self._extract_posts_with_full_data(username, max_posts=25)
-        
+
         # Extract likes and mentions (limited for performance)
         likes = await self._extract_user_likes(username, max_likes=10)
         mentions = await self._extract_user_mentions(username, max_mentions=5)
-        
+
+        # Level 3: Sample followers/following (25 each)
+        followers = []
+        following = []
+
+        if params.get('scrape_followers', False):
+            max_followers = params.get('max_followers', 25)
+            self.logger.info(f"👥 Level 3: Scraping sample followers ({max_followers})...")
+            followers = await self._scrape_user_followers(username, max_followers)
+
+        if params.get('scrape_following', False):
+            max_following = params.get('max_following', 25)
+            self.logger.info(f"➡️ Level 3: Scraping sample following ({max_following})...")
+            following = await self._scrape_user_following(username, max_following)
+
         return [{
             "type": "full_user_data",
             "username": f"@{username}",
             "profile": profile_data,
             "posts": posts[:25],
             "likes": likes[:10],
-            "mentions": mentions[:5]
+            "mentions": mentions[:5],
+            "followers": followers,
+            "following": following
         }]
 
     async def scrape_level_4(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2937,6 +3237,27 @@ class TwitterScraper:
                         for i in range(min(count, 10)):  # Limit to avoid spam
                             element = text_elements.nth(i)
                             try:
+                                # CRITICAL FIX: Skip socialContext elements (UI labels like "Naval reposted")
+                                try:
+                                    # Check if this element is inside socialContext
+                                    parent = element
+                                    is_social_context = False
+                                    for _ in range(5):  # Check up to 5 levels up
+                                        try:
+                                            testid = await asyncio.wait_for(parent.get_attribute('data-testid'), timeout=1.0)
+                                            if testid == 'socialContext':
+                                                is_social_context = True
+                                                self.logger.debug(f"🚫 TEXT SKIP: Element {i} is inside socialContext, skipping")
+                                                break
+                                            parent = parent.locator('xpath=..')
+                                        except:
+                                            break
+
+                                    if is_social_context:
+                                        continue  # Skip this element
+                                except:
+                                    pass  # If check fails, continue processing
+
                                 # Add timeout protection for element operations
                                 is_visible = await asyncio.wait_for(element.is_visible(), timeout=2.0)
                                 element_text = await asyncio.wait_for(element.inner_text(), timeout=3.0)
@@ -2946,14 +3267,15 @@ class TwitterScraper:
                                     # Enhanced filtering logic
                                     text_clean = element_text.strip()
 
-                                    # Skip clearly non-content elements
+                                    # Skip clearly non-content elements (ENHANCED with repost/retweet patterns)
                                     skip_patterns = [
                                         'follow', 'following', 'followers', 'show this thread',
                                         'quote tweet', 'reply', 'retweet', 'like', 'share',
                                         'view', 'views', 'translate', 'show more', 'show less',
                                         'promoted', 'sponsored', 'ad', 'advertisement',
                                         'see fewer tweets like this', 'not interested',
-                                        'report tweet', 'embed tweet', 'copy link'
+                                        'report tweet', 'embed tweet', 'copy link',
+                                        'reposted', 'retweeted'  # ADDED: Skip UI repost labels
                                     ]
 
                                     # Skip if text is too short or matches skip patterns
@@ -3402,7 +3724,36 @@ class TwitterScraper:
                         
             except Exception as e:
                 self.logger.debug(f"⚠️ Timestamp extraction failed: {e}")
-            
+
+            # CRITICAL FIX: Validate timestamp format to prevent corruption
+            try:
+                if 'timestamp' in tweet_data:
+                    timestamp_value = tweet_data.get('timestamp', '')
+
+                    # Check if timestamp looks corrupted (contains newlines, non-date chars, etc.)
+                    if isinstance(timestamp_value, str):
+                        # Valid timestamp should NOT contain newlines or random short strings
+                        if ('\n' in timestamp_value or
+                            len(timestamp_value) < 8 or  # Too short to be a real date
+                            (len(timestamp_value) < 15 and not any(c.isdigit() for c in timestamp_value))):  # Short non-numeric
+                            self.logger.warning(f"🚨 CORRUPTED TIMESTAMP DETECTED: '{timestamp_value}' - removing")
+                            # Remove corrupted timestamp rather than keeping bad data
+                            tweet_data.pop('timestamp', None)
+                            tweet_data.pop('date', None)
+                            # Keep date_human if it exists and looks valid
+                            if 'date_human' in tweet_data:
+                                date_human = tweet_data['date_human']
+                                if '\n' in str(date_human) or len(str(date_human)) < 3:
+                                    tweet_data.pop('date_human', None)
+
+                    # Log final timestamp status
+                    if 'timestamp' in tweet_data:
+                        self.logger.debug(f"✅ Timestamp validated: {tweet_data['timestamp']}")
+                    else:
+                        self.logger.warning(f"⚠️ No valid timestamp for tweet")
+            except Exception as val_e:
+                self.logger.debug(f"Timestamp validation error: {val_e}")
+
             # 4. EXTRACT TWEET URL/ID - Enhanced with multiple fallback strategies
             try:
                 # Strategy 1: Enhanced status link extraction with modern patterns
@@ -3496,34 +3847,114 @@ class TwitterScraper:
             except Exception as e:
                 self.logger.debug(f"⚠️ Tweet URL/ID extraction failed: {e}")
             
-            # 5. EXTRACT AUTHOR INFO
+            # 5. EXTRACT AUTHOR INFO - ENHANCED
             try:
-                # Username - EXTRACT ACTUAL AUTHOR FROM TWEET
-                username_element = tweet_element.locator('[data-testid="User-Name"] a').first
-                if await username_element.count() > 0:
-                    username_text = await username_element.inner_text()
-                    if '@' in username_text:
-                        actual_username = username_text.split('@')[1].split(' ')[0]
-                        tweet_data['username'] = actual_username
-                        # CRITICAL FIX: Use actual extracted username as author
+                # Strategy 1: Extract author from URL (most reliable)
+                actual_username = None
+                if tweet_data.get('url'):
+                    import re
+                    url_match = re.search(r'x\.com/([^/]+)/status', tweet_data['url'])
+                    if url_match:
+                        actual_username = url_match.group(1)
                         tweet_data['author'] = actual_username
-                        # Also update URL to use correct author if no URL was extracted from links
-                        if tweet_data.get('url') == f"https://x.com/{username}":
-                            tweet_data['url'] = f"https://x.com/{actual_username}"
-                        self.logger.info(f"🔧 AUTHOR FIX APPLIED: {username} → {actual_username} | URL: {tweet_data.get('url', 'N/A')}")
+                        tweet_data['username'] = actual_username
+                        self.logger.info(f"✅ AUTHOR FROM URL: {actual_username} (Profile: {username})")
+
+                # Strategy 2: Try to extract from User-Name element (fallback)
+                if not actual_username:
+                    username_element = tweet_element.locator('[data-testid="User-Name"] a').first
+                    username_count = await username_element.count()
+
+                    self.logger.debug(f"🔍 AUTHOR DEBUG: Found {username_count} username elements")
+
+                    if username_count > 0:
+                        # Try to get href attribute which contains username
+                        try:
+                            href = await username_element.get_attribute('href')
+                            if href:
+                                # Extract username from href like "/username" or "https://x.com/username"
+                                username_from_href = href.strip('/').split('/')[-1]
+                                if username_from_href and username_from_href not in ['status', 'home', 'search']:
+                                    actual_username = username_from_href
+                                    tweet_data['author'] = actual_username
+                                    tweet_data['username'] = actual_username
+                                    self.logger.info(f"✅ AUTHOR FROM HREF: {actual_username} (Profile: {username})")
+                        except:
+                            pass
+
+                        # Fallback: try text extraction
+                        if not actual_username:
+                            username_text = await username_element.inner_text()
+                            self.logger.debug(f"🔍 AUTHOR DEBUG: Username text = '{username_text}'")
+
+                            if '@' in username_text:
+                                # Extract username after @ symbol, handle multiline text
+                                actual_username = username_text.split('@')[1].split('\n')[0].split(' ')[0].strip()
+                                tweet_data['username'] = actual_username
+                                tweet_data['author'] = actual_username
+                                self.logger.info(f"✅ AUTHOR FROM TEXT: {actual_username} (Profile: {username})")
+                            else:
+                                self.logger.warning(f"⚠️ AUTHOR DEBUG: No @ found in username text: '{username_text}'")
                     else:
-                        self.logger.debug(f"🔍 AUTHOR DEBUG: No @ found in username text: '{username_text}'")
-                else:
-                    self.logger.debug(f"🔍 AUTHOR DEBUG: No username element found, keeping default author: {username}")
-                
-                # Display name
+                        self.logger.warning(f"⚠️ AUTHOR DEBUG: No username element found, keeping default author: {username}")
+
+                # Display name - extract from first line before @username
                 name_element = tweet_element.locator('[data-testid="User-Name"] span').first
                 if await name_element.count() > 0:
-                    display_name = await name_element.inner_text()
+                    display_name_text = await name_element.inner_text()
+                    # Get first line (display name, before @username)
+                    display_name = display_name_text.split('\n')[0].split('@')[0].strip()
                     if display_name and not display_name.startswith('@'):
                         tweet_data['author_name'] = display_name
-            except:
-                pass
+                        self.logger.debug(f"✅ DISPLAY NAME: {display_name}")
+
+            except Exception as e:
+                self.logger.error(f"❌ Author extraction failed: {e}")
+                import traceback
+                self.logger.error(f"Traceback: {traceback.format_exc()}")
+
+            # 6. DETECT IF THIS IS A RETWEET
+            try:
+                is_retweet = False
+                retweeted_by = None
+
+                # Check for retweet text indicator (Twitter shows "X reposted" above retweets)
+                try:
+                    social_context = await tweet_element.locator('[data-testid="socialContext"]').first.inner_text()
+                    if social_context and ('reposted' in social_context.lower() or 'retweeted' in social_context.lower()):
+                        is_retweet = True
+                        # Extract who reposted it
+                        if username in social_context:
+                            retweeted_by = username
+                        self.logger.debug(f"🔄 Retweet detected via socialContext: '{social_context}'")
+                except:
+                    pass
+
+                # Alternative: Check if URL author differs from profile username
+                if not is_retweet and tweet_data.get('author'):
+                    url_author = tweet_data.get('author')
+                    if url_author != username:
+                        is_retweet = True
+                        retweeted_by = username
+                        self.logger.debug(f"🔄 Retweet detected via author mismatch: {url_author} != {username}")
+
+                # CRITICAL FIX: Ensure retweeted_by is ALWAYS set when is_retweet is True
+                if is_retweet and not retweeted_by:
+                    retweeted_by = username  # Default to profile username
+                    self.logger.debug(f"🔄 Auto-populated retweeted_by: {retweeted_by}")
+
+                # Add retweet fields
+                tweet_data['is_retweet'] = is_retweet
+                if is_retweet:
+                    tweet_data['retweeted_by'] = retweeted_by
+                    tweet_data['original_author'] = tweet_data.get('author')  # Preserve original author
+                    self.logger.info(f"🔄 RETWEET: {retweeted_by} retweeted {tweet_data.get('original_author')}'s post")
+                else:
+                    self.logger.debug(f"📝 Original post by {tweet_data.get('author')}")
+
+            except Exception as e:
+                self.logger.debug(f"⚠️ Retweet detection failed: {e}")
+                tweet_data['is_retweet'] = False
 
             # 7. EXTRACT EMBEDDED MEDIA - Phase 1.1 Enhancement
             try:
@@ -4160,7 +4591,7 @@ class TwitterScraper:
             return []
 
     async def _perform_intelligent_scroll(self, scroll_attempt: int, extraction_state: dict) -> bool:
-        """Perform intelligent scroll with adaptive behavior"""
+        """Perform intelligent scroll with adaptive behavior and human-like patterns"""
         try:
             # Adaptive scroll distance based on performance
             if len(extraction_state['scroll_performance']) > 5:
@@ -4176,18 +4607,17 @@ class TwitterScraper:
             else:
                 scroll_distance = 800
 
-            # Perform scroll with mouse wheel for naturalness
-            await self.page.mouse.wheel(0, scroll_distance)
+            # HUMAN BEHAVIOR: Use human-like scrolling instead of instant scroll
+            await HumanBehavior.human_scroll(self.page, 'down', scroll_distance)
 
-            # Adaptive wait based on scroll attempt
-            if scroll_attempt < 10:
-                wait_time = 3.0  # Slower at start
-            elif scroll_attempt < 50:
-                wait_time = 2.0  # Medium speed
-            else:
-                wait_time = 1.5  # Faster for large scale
+            # HUMAN BEHAVIOR: Random mouse movements occasionally
+            if scroll_attempt % 5 == 0:  # Every 5 scrolls
+                await HumanBehavior.random_mouse_movements(self.page, count=1)
 
-            await asyncio.sleep(wait_time)
+            # HUMAN BEHAVIOR: Take breaks occasionally to seem human
+            if HumanBehavior.should_take_break(scroll_attempt, threshold=15):
+                await HumanBehavior.take_human_break(self.page, duration_seconds=3)
+
             return True
 
         except Exception as e:
@@ -4195,7 +4625,7 @@ class TwitterScraper:
             return False
 
     async def _extract_new_tweets_batch(self, username: str, extraction_state: dict) -> List[Dict[str, Any]]:
-        """Extract new tweets from current viewport"""
+        """Extract new tweets from current viewport with human-like behavior"""
         try:
             tweets = []
             tweet_elements = self.page.locator('article[data-testid="tweet"]')
@@ -4206,9 +4636,18 @@ class TwitterScraper:
                 try:
                     element = tweet_elements.nth(i)
                     if await element.is_visible():
+                        # HUMAN BEHAVIOR: Simulate reading the tweet before extracting
+                        if i % 3 == 0:  # Every 3rd tweet, add reading delay
+                            await HumanBehavior.random_delay(300, 800)
+
                         tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
                         if tweet_data and tweet_data.get('text'):
                             tweets.append(tweet_data)
+
+                            # HUMAN BEHAVIOR: Simulate reading time based on text length
+                            text_length = len(tweet_data.get('text', ''))
+                            if text_length > 100:  # Longer tweets get more reading time
+                                await HumanBehavior.reading_delay(text_length, wpm=250)
                 except Exception:
                     continue  # Skip problematic elements
 
@@ -4744,11 +5183,11 @@ class TwitterScraper:
         return await self._extract_posts_adaptive(username, max_posts, level=3)
     
     async def _extract_posts_comprehensive(self, username: str, max_posts: int = 50) -> List[Dict[str, Any]]:
-        """Extract posts with maximum detail - Level 4 EVERYTHING MODE with VALIDATION."""
-        self.logger.info(f"🚀 NEW COMPREHENSIVE EXTRACTION: Level 4 with validation for @{username}")
+        """Extract posts with maximum detail - SIMPLIFIED for reliability."""
+        self.logger.info(f"🚀 SIMPLIFIED EXTRACTION: Extracting {max_posts} posts for @{username}")
 
-        # Use new adaptive extraction system
-        return await self._extract_posts_adaptive(username, max_posts, level=4)
+        # Use simple, fast extraction instead of complex adaptive system
+        return await self._extract_posts_simple_fast(username, max_posts)
 
     async def _human_delay(self, min_seconds: float = 1.0, max_seconds: float = 3.0):
         """Enhanced human-like delays with realistic patterns."""
@@ -4975,6 +5414,19 @@ class TwitterScraper:
 
     def _get_performance_metrics(self) -> Dict[str, Any]:
         """Phase 4.2: Get comprehensive performance metrics."""
+        # Safety check - extraction_stats may not exist if scraper wasn't fully initialized
+        if not hasattr(self, 'extraction_stats'):
+            return {
+                "total_requests": 0,
+                "cache_hits": 0,
+                "cache_hit_rate": "0.0%",
+                "total_extraction_time": "0.00s",
+                "avg_extraction_time": "0.000s",
+                "anti_detection_actions": 0,
+                "performance_mode": getattr(self, 'performance_mode', 'standard'),
+                "anti_detection_enabled": getattr(self, 'anti_detection_enabled', True)
+            }
+
         total_requests = self.extraction_stats['requests_made']
         cache_hit_rate = (self.extraction_stats['cache_hits'] / max(total_requests, 1)) * 100
 
@@ -6079,7 +6531,11 @@ class TwitterScraper:
         self.setup_date_filtering(params)
 
         self.logger.info(f"👤 Starting comprehensive user scraping for @{username}")
-        
+        # DEBUG: Log received params
+        self.logger.info(f"🔍 DEBUG RECEIVED PARAMS: scrape_likes={params.get('scrape_likes')}, scrape_mentions={params.get('scrape_mentions')}, scrape_reposts={params.get('scrape_reposts')}")
+        self.logger.info(f"🔍 DEBUG ENGAGEMENT PARAMS: scrape_post_likers={params.get('scrape_post_likers')}, scrape_post_repliers={params.get('scrape_post_repliers')}, scrape_post_reposters={params.get('scrape_post_reposters')}")
+        self.logger.info("⏳ STEP 2/5: Preparing data extraction...")
+
         results = {
             "type": "comprehensive_user",
             "username": f"@{username}",
@@ -6092,15 +6548,37 @@ class TwitterScraper:
             "followers": [],
             "following": []
         }
-        
+
         try:
             # Navigate to user profile
             profile_url = f"https://x.com/{username}"
-            self.logger.info(f"🌐 Navigating to profile: {profile_url}")
-            
-            await self._simulate_human_interaction()
-            await self.page.goto(profile_url, wait_until='domcontentloaded', timeout=60000)
-            await self._human_delay(3, 6)
+            self.logger.info(f"⏳ STEP 2/5: Navigating to profile: {profile_url}")
+
+            try:
+                self.logger.info("⏳ Step 2a: Simulating human interaction...")
+                await self._simulate_human_interaction()
+                self.logger.info("✅ Step 2a: Human interaction simulated")
+
+                self.logger.info(f"⏳ Step 2b: Executing page.goto with timeout wrapper...")
+                # FIXED: Add timeout wrapper to prevent infinite hang
+                goto_result = await self._with_timeout(
+                    self.page.goto(profile_url, wait_until='domcontentloaded', timeout=30000),
+                    timeout_ms=35000,
+                    operation_name=f"Navigate to {profile_url}",
+                    default=None
+                )
+                self.logger.info(f"✅ Step 2b: Navigation completed (result: {goto_result is not None})")
+
+                if goto_result is None:
+                    self.logger.warning("⚠️ Navigation timed out - may affect data quality")
+
+                await self._human_delay(3, 6)
+            except Exception as nav_error:
+                self.logger.error(f"❌ Navigation failed: {nav_error}")
+                # Save partial results before failing
+                if self.output_dir:
+                    self._save_partial_results(results, self.output_dir, "navigation_failed")
+                raise
             
             # 🚀 OPTIMIZED SMART CONTENT LOADING - FAST & EFFICIENT 🚀
             self.logger.info("⚡ SMART LOADING - Intelligent content detection (max 30s)...")
@@ -6145,7 +6623,12 @@ class TwitterScraper:
             while time.time() - start_time < max_wait_time and not content_loaded:
                 try:
                     # Check div count growth (indicates loading)
-                    current_div_count = await self.page.locator('div').count()
+                    current_div_count = await self._with_timeout(
+                        self.page.locator('div').count(),
+                        timeout_ms=3000,
+                        operation_name="Count divs for content detection",
+                        default=0
+                    )
 
                     # If div count increased significantly, content is loading
                     if current_div_count > last_div_count + 10:
@@ -6159,7 +6642,12 @@ class TwitterScraper:
                     if stability_checks >= 2 or current_div_count > 40:
                         # Quick profile content verification
                         try:
-                            page_text = await self.page.locator('body').inner_text()
+                            page_text = await self._with_timeout(
+                                self.page.locator('body').inner_text(),
+                                timeout_ms=5000,
+                                operation_name="Get page text for content verification",
+                                default=""
+                            )
                             profile_indicators = ['Following', 'Followers', 'Joined', username]
                             found_indicators = [ind for ind in profile_indicators if ind.lower() in page_text.lower()]
 
@@ -6181,7 +6669,12 @@ class TwitterScraper:
                 self.logger.info("🔄 Final content verification...")
                 try:
                     # Accept any reasonable amount of content
-                    div_count = await self.page.locator('div').count()
+                    div_count = await self._with_timeout(
+                        self.page.locator('div').count(),
+                        timeout_ms=3000,
+                        operation_name="Final div count check",
+                        default=0
+                    )
                     if div_count > 20:  # Lowered threshold for faster loading
                         self.logger.info(f"✅ Acceptable content found: {div_count} divs")
                         content_loaded = True
@@ -6190,22 +6683,29 @@ class TwitterScraper:
 
             elapsed_time = time.time() - start_time
             if content_loaded:
-                self.logger.info(f"🎉 CONTENT LOADED SUCCESSFULLY in {elapsed_time:.1f}s!")
+                self.logger.info(f"✅ STEP 2/5: Content loaded in {elapsed_time:.1f}s!")
                 # Brief stabilization wait for rich content
                 await self._human_delay(1, 2)
             else:
                 self.logger.warning(f"⚠️ Content loading timeout after {elapsed_time:.1f}s - proceeding with available content")
             # Extract profile information first
-            self.logger.info("📋 Extracting profile information...")
+            self.logger.info("⏳ STEP 3/5: Extracting profile information...")
+            self.logger.info("⏳ Step 3a: Calling _extract_profile_info()...")
             try:
                 profile_data = await self._extract_profile_info(username)
+                self.logger.info(f"✅ Step 3a: _extract_profile_info() returned")
                 results["profile"] = profile_data
-                self.logger.info(f"✅ Profile extracted: {len(str(profile_data))} chars")
+                self.logger.info(f"✅ STEP 3/5: Profile extracted ({len(str(profile_data))} chars)")
+
+                # Checkpoint: Save profile data
+                if self.output_dir:
+                    self._save_partial_results(results, self.output_dir, "after_profile")
             except Exception as profile_error:
-                self.logger.error(f"❌ Profile extraction failed: {profile_error}")
+                self.logger.error(f"❌ STEP 3/5: Profile extraction failed: {profile_error}")
                 results["profile"] = {}
-            
+
             # 1. Scrape Posts - ROUTE TO EVERYTHING MODE FOR COMPREHENSIVE SCRAPING
+            self.logger.info("⏳ STEP 4/5: Extracting requested data types...")
             if params.get('scrape_posts', True):
                 max_posts = params.get('max_posts', 100)  # This will now use validated parameters
                 scrape_level = params.get('scrape_level', 4)
@@ -6220,10 +6720,28 @@ class TwitterScraper:
                         posts = await self._scrape_user_posts(username, max_posts)
                     results["posts"] = posts if posts else []
                     self.logger.info(f"✅ Posts extracted: {len(posts) if posts else 0} posts")
+
+                    # NEW: Extract post-level engagement data (likers, repliers, reposters)
+                    if posts and any([
+                        params.get('scrape_post_likers', False),
+                        params.get('scrape_post_repliers', False),
+                        params.get('scrape_post_reposters', False)
+                    ]):
+                        self.logger.info(f"🔍 Extracting post-level engagement data...")
+                        await self._enrich_posts_with_engagement(posts, params)
+                        self.logger.info(f"✅ Post engagement data extracted")
+
+                    # Checkpoint: Save after posts extraction
+                    if self.output_dir:
+                        self._save_partial_results(results, self.output_dir, "after_posts")
                 except Exception as posts_error:
                     self.logger.error(f"❌ Posts extraction failed: {posts_error}")
                     results["posts"] = []
-            
+
+                    # Save partial results even on error
+                    if self.output_dir:
+                        self._save_partial_results(results, self.output_dir, "posts_error")
+
             # 2. Scrape Likes
             if params.get('scrape_likes', False):
                 max_likes = params.get('max_likes', 50)  # Using validated parameters
@@ -6254,19 +6772,45 @@ class TwitterScraper:
             
             # 5. Scrape Followers
             if params.get('scrape_followers', False):
-                max_followers = params.get('max_followers', 200)  # Using validated parameters
-                self.logger.info(f"👥 Scraping followers ({max_followers})...")
-                followers = await self._scrape_user_followers(username, max_followers)
-                results["followers"] = followers
-            
+                try:
+                    max_followers = params.get('max_followers', 200)  # Using validated parameters
+                    self.logger.info(f"👥 Scraping followers ({max_followers})...")
+                    followers = await self._scrape_user_followers(username, max_followers)
+                    results["followers"] = followers
+
+                    # Save partial results after followers
+                    if self.output_dir:
+                        self._save_partial_results(results, self.output_dir, "after_followers")
+                except Exception as followers_error:
+                    self.logger.error(f"❌ Followers extraction failed: {followers_error}")
+                    results["followers"] = []
+
+                    # Save partial results even on error
+                    if self.output_dir:
+                        self._save_partial_results(results, self.output_dir, "followers_error")
+
             # 6. Scrape Following
             if params.get('scrape_following', False):
-                max_following = params.get('max_following', 150)  # Using validated parameters
-                self.logger.info(f"➡️ Scraping following ({max_following})...")
-                following = await self._scrape_user_following(username, max_following)
-                results["following"] = following
+                try:
+                    max_following = params.get('max_following', 150)  # Using validated parameters
+                    self.logger.info(f"➡️ Scraping following ({max_following})...")
+                    following = await self._scrape_user_following(username, max_following)
+                    results["following"] = following
+
+                    # Save partial results after following
+                    if self.output_dir:
+                        self._save_partial_results(results, self.output_dir, "after_following")
+                except Exception as following_error:
+                    self.logger.error(f"❌ Following extraction failed: {following_error}")
+                    results["following"] = []
+
+                    # Save partial results even on error
+                    if self.output_dir:
+                        self._save_partial_results(results, self.output_dir, "following_error")
             
-            self.logger.info(f"🏁 Comprehensive user scraping completed for @{username}")
+            self.logger.info(f"✅ STEP 4/5: Data extraction completed")
+            self.logger.info(f"⏳ STEP 5/5: Finalizing results...")
+            self.logger.info(f"✅ STEP 5/5: Comprehensive scraping completed for @{username}")
             return [results]
 
         except Exception as e:
@@ -6655,14 +7199,49 @@ class TwitterScraper:
             current_url = self.page.url
             if username not in current_url:
                 await self.page.goto(profile_url, wait_until='domcontentloaded', timeout=30000)
-                await self._human_delay(2, 4)
+                # HUMAN BEHAVIOR: Simulate natural profile browsing
+                await HumanBehavior.simulate_profile_browsing(self.page)
             
             # 🚀 HYBRID APPROACH: Try CSS selectors first, then enhanced div parsing
             self.logger.info("🐦 Using multi-method tweet extraction...")
-            
-            # Wait for content to be loaded
-            await self._human_delay(3, 5)
-            
+
+            # Wait for actual tweet elements to appear (Twitter is JavaScript-rendered)
+            self.logger.info("⏳ Waiting for tweets to render...")
+            try:
+                # Wait up to 45 seconds for any tweet element to appear
+                # Twitter's React app can take a while to hydrate, especially on first load
+                await self.page.wait_for_selector(
+                    'article[data-testid="tweet"], div[data-testid="cellInnerDiv"], div[role="article"]',
+                    timeout=45000,
+                    state='visible'
+                )
+                self.logger.info("✅ Tweets detected, starting extraction...")
+                await self._human_delay(2, 3)  # Brief additional wait for more tweets to load
+            except Exception as wait_error:
+                self.logger.warning(f"⚠️ No tweets appeared after 45s: {wait_error}")
+
+                # Check if we're being blocked or on login page
+                page_content = await self.page.content()
+                if 'login' in page_content.lower() or 'sign in' in page_content.lower():
+                    self.logger.error("❌ Twitter showing login page - session authentication failed")
+                    raise Exception("Session authentication failed - login required")
+
+                # Check for rate limit or protection
+                if 'rate limit' in page_content.lower() or 'too many requests' in page_content.lower():
+                    self.logger.error("❌ Twitter rate limit detected")
+                    raise Exception("Rate limited by Twitter")
+
+                # Take screenshot for debugging
+                if self.output_dir:
+                    screenshot_path = f"{self.output_dir}/no_tweets_debug.png"
+                    try:
+                        await self.page.screenshot(path=screenshot_path)
+                        self.logger.info(f"📸 Saved debug screenshot: {screenshot_path}")
+                    except:
+                        pass
+
+                # Continue anyway - might be empty profile
+
             # 🚀 ADVANCED VOLUME BREAKING: Multi-strategy approach for high-volume extraction
             scroll_attempts = 0
             
@@ -6720,11 +7299,17 @@ class TwitterScraper:
                 
                 self.logger.info(f"🔍 Testing {len(css_selectors_2025)} CSS selectors for tweet detection...")
                 
-                for selector in css_selectors_2025:
+                for idx, selector in enumerate(css_selectors_2025):
                     try:
-                        self.logger.debug(f"🔍 Testing selector: {selector}")
-                        elements = await self.page.locator(selector).all()
-                        
+                        self.logger.info(f"🔍 Testing selector {idx+1}/{len(css_selectors_2025)}: {selector[:60]}...")
+                        # Add timeout wrapper to prevent hanging
+                        elements = await self._with_timeout(
+                            self.page.locator(selector).all(),
+                            timeout_ms=5000,
+                            operation_name=f"Locate tweets with selector {idx+1}",
+                            default=[]
+                        )
+
                         if elements:
                             self.logger.info(f"✅ Found {len(elements)} elements with selector: {selector}")
                             
@@ -6749,7 +7334,12 @@ class TwitterScraper:
                                     self.logger.error(f"🚨 Traceback: {traceback.format_exc()}")
                                     # Fallback to simple text extraction
                                     try:
-                                        text_content = await element.inner_text()
+                                        text_content = await self._with_timeout(
+                                            element.inner_text(),
+                                            timeout_ms=3000,
+                                            operation_name=f"Get element {i} text",
+                                            default=""
+                                        )
                                         if text_content and len(text_content.strip()) > 10:
                                             lines = text_content.split('\n')
                                             for line in lines:
@@ -6781,8 +7371,13 @@ class TwitterScraper:
                 if not css_tweets_found:
                     self.logger.info("🔄 Falling back to enhanced div parsing with metadata extraction...")
 
-                    # Get all divs that might contain tweets
-                    tweet_divs = await self.page.locator('div[data-testid*="cell"], article, div[role="article"]').all()
+                    # Get all divs that might contain tweets with timeout
+                    tweet_divs = await self._with_timeout(
+                        self.page.locator('div[data-testid*="cell"], article, div[role="article"]').all(),
+                        timeout_ms=5000,
+                        operation_name="Locate tweet divs (fallback)",
+                        default=[]
+                    )
 
                     self.logger.info(f"🔄 DIV FALLBACK: Found {len(tweet_divs)} potential tweet containers")
 
@@ -7001,8 +7596,34 @@ class TwitterScraper:
                             pass
                 
             self.logger.info(f"🐦 Found {len(posts)} tweets using hybrid extraction")
-            return posts[:max_posts]
-            
+
+            # DEDUPLICATION: Remove tweets with duplicate IDs
+            self.logger.info(f"🔍 Deduplication: {len(posts)} posts before dedup")
+
+            seen_tweet_ids = set()
+            unique_posts = []
+
+            for post in posts:
+                tweet_id = post.get('tweet_id') or post.get('id')
+
+                # Generate a unique key - prefer tweet_id if it's a real Twitter ID
+                if tweet_id and not tweet_id.startswith('tweet_'):
+                    unique_key = tweet_id
+                else:
+                    # Fallback: use combination of author and text
+                    unique_key = f"{post.get('author', '')}_{post.get('text', '')[:50]}"
+
+                if unique_key in seen_tweet_ids:
+                    self.logger.debug(f"⏭️ Skipping duplicate: {unique_key}")
+                    continue
+
+                seen_tweet_ids.add(unique_key)
+                unique_posts.append(post)
+
+            self.logger.info(f"✅ Deduplication complete: {len(posts)} -> {len(unique_posts)} unique posts")
+
+            return unique_posts[:max_posts]
+
         except Exception as e:
             self.logger.error(f"❌ Posts scraping failed: {e}")
             return posts
@@ -7578,7 +8199,246 @@ class TwitterScraper:
         except Exception as e:
             self.logger.error(f"❌ Media scraping failed: {e}")
             return media
-    
+
+    async def _enrich_posts_with_engagement(self, posts: List[Dict[str, Any]], params: Dict[str, Any]):
+        """Enrich posts with engagement data (likers, repliers, reposters)."""
+        try:
+            scrape_likers = params.get('scrape_post_likers', False)
+            scrape_repliers = params.get('scrape_post_repliers', False)
+            scrape_reposters = params.get('scrape_post_reposters', False)
+
+            max_likers = params.get('max_likers_per_post', 20)
+            max_repliers = params.get('max_repliers_per_post', 20)
+            max_reposters = params.get('max_reposters_per_post', 20)
+
+            for i, post in enumerate(posts):
+                tweet_url = post.get('url')
+                if not tweet_url:
+                    self.logger.warning(f"⚠️ Post {i+1} has no URL, skipping engagement extraction")
+                    continue
+
+                self.logger.info(f"🔍 [{i+1}/{len(posts)}] Extracting engagement for: {tweet_url[:60]}...")
+
+                try:
+                    # Extract likers
+                    if scrape_likers:
+                        likers = await self._extract_post_likers(tweet_url, max_likers)
+                        post['likers'] = likers
+                        post['likers_count'] = len([l for l in likers if 'error' not in l])
+                        self.logger.info(f"  💖 {post['likers_count']} likers extracted")
+
+                    # Extract repliers
+                    if scrape_repliers:
+                        repliers = await self._extract_post_repliers(tweet_url, max_repliers)
+                        post['repliers'] = repliers
+                        post['repliers_count'] = len([r for r in repliers if 'error' not in r])
+                        self.logger.info(f"  💬 {post['repliers_count']} repliers extracted")
+
+                    # Extract reposters
+                    if scrape_reposters:
+                        reposters = await self._extract_post_reposters(tweet_url, max_reposters)
+                        post['reposters'] = reposters
+                        post['reposters_count'] = len([r for r in reposters if 'error' not in r])
+                        self.logger.info(f"  🔄 {post['reposters_count']} reposters extracted")
+
+                except Exception as e:
+                    self.logger.error(f"❌ Engagement extraction failed for post {i+1}: {e}")
+                    # Continue with next post even if one fails
+
+        except Exception as e:
+            self.logger.error(f"❌ Post engagement enrichment failed: {e}")
+
+    async def _extract_post_likers(self, tweet_url: str, max_likers: int = 20) -> List[Dict[str, Any]]:
+        """Extract users who liked a specific tweet."""
+        likers = []
+        try:
+            # Twitter's likes page format: https://x.com/username/status/tweet_id/likes
+            likes_url = f"{tweet_url}/likes"
+            self.logger.info(f"💖 Extracting likers from: {likes_url}")
+
+            await self.page.goto(likes_url, wait_until='domcontentloaded', timeout=30000)
+            await self._human_delay(3, 5)
+
+            # Check if likes are visible
+            page_content = await self.page.content()
+            if any(restriction in page_content.lower() for restriction in [
+                'not authorized', 'protected', 'suspended', 'blocked'
+            ]):
+                self.logger.warning(f"⚠️ Likes are not accessible for this tweet")
+                return [{'error': 'access_restricted', 'message': 'Likes not publicly accessible'}]
+
+            scroll_attempts = 0
+            max_scrolls = min(max_likers // 10, 5)
+
+            while len(likers) < max_likers and scroll_attempts < max_scrolls:
+                # Extract user data from the page
+                div_texts = await self.page.locator('div').all_inner_texts()
+
+                for div_text in div_texts:
+                    if len(likers) >= max_likers:
+                        break
+
+                    lines = div_text.split('\n')
+                    for i, line in enumerate(lines):
+                        line = line.strip()
+                        # Look for username patterns (@username)
+                        if line.startswith('@') and len(line) > 2 and len(line) < 50:
+                            username = line
+                            # Try to get display name from previous line
+                            display_name = lines[i-1].strip() if i > 0 else ''
+
+                            # Avoid duplicates
+                            if username not in [u.get('username') for u in likers]:
+                                liker_data = {
+                                    'username': username,
+                                    'display_name': display_name if display_name and len(display_name) < 100 else username,
+                                    'profile_url': f"https://x.com/{username[1:]}",  # Remove @ symbol
+                                    'extracted_from': 'likes_page'
+                                }
+                                likers.append(liker_data)
+
+                                if len(likers) >= max_likers:
+                                    break
+
+                # Scroll for more likers
+                if len(likers) < max_likers:
+                    await self.page.mouse.wheel(0, 800)
+                    await self._human_delay(2, 4)
+                    scroll_attempts += 1
+
+            self.logger.info(f"💖 Extracted {len(likers)} likers")
+            return likers[:max_likers]
+
+        except Exception as e:
+            self.logger.error(f"❌ Post likers extraction failed: {e}")
+            return likers
+
+    async def _extract_post_repliers(self, tweet_url: str, max_repliers: int = 20) -> List[Dict[str, Any]]:
+        """Extract users who replied to a specific tweet."""
+        repliers = []
+        try:
+            self.logger.info(f"💬 Extracting repliers from: {tweet_url}")
+
+            await self.page.goto(tweet_url, wait_until='domcontentloaded', timeout=30000)
+            await self._human_delay(3, 5)
+
+            scroll_attempts = 0
+            max_scrolls = min(max_repliers // 10, 5)
+
+            while len(repliers) < max_repliers and scroll_attempts < max_scrolls:
+                # Look for reply tweets - they have different structure
+                div_texts = await self.page.locator('div').all_inner_texts()
+
+                for div_text in div_texts:
+                    if len(repliers) >= max_repliers:
+                        break
+
+                    lines = div_text.split('\n')
+                    for i, line in enumerate(lines):
+                        line = line.strip()
+
+                        # Look for "Replying to @username" pattern
+                        if 'replying to' in line.lower() or line.startswith('@'):
+                            # Next username pattern is likely the replier
+                            for j in range(max(0, i-3), min(len(lines), i+3)):
+                                potential_username = lines[j].strip()
+                                if (potential_username.startswith('@') and
+                                    len(potential_username) > 2 and
+                                    len(potential_username) < 50):
+
+                                    # Avoid duplicates
+                                    if potential_username not in [u.get('username') for u in repliers]:
+                                        replier_data = {
+                                            'username': potential_username,
+                                            'profile_url': f"https://x.com/{potential_username[1:]}",
+                                            'extracted_from': 'tweet_replies'
+                                        }
+                                        repliers.append(replier_data)
+
+                                        if len(repliers) >= max_repliers:
+                                            break
+
+                            if len(repliers) >= max_repliers:
+                                break
+
+                # Scroll for more replies
+                if len(repliers) < max_repliers:
+                    await self.page.mouse.wheel(0, 800)
+                    await self._human_delay(2, 4)
+                    scroll_attempts += 1
+
+            self.logger.info(f"💬 Extracted {len(repliers)} repliers")
+            return repliers[:max_repliers]
+
+        except Exception as e:
+            self.logger.error(f"❌ Post repliers extraction failed: {e}")
+            return repliers
+
+    async def _extract_post_reposters(self, tweet_url: str, max_reposters: int = 20) -> List[Dict[str, Any]]:
+        """Extract users who reposted a specific tweet."""
+        reposters = []
+        try:
+            # Twitter's retweets page format: https://x.com/username/status/tweet_id/retweets
+            retweets_url = f"{tweet_url}/retweets"
+            self.logger.info(f"🔄 Extracting reposters from: {retweets_url}")
+
+            await self.page.goto(retweets_url, wait_until='domcontentloaded', timeout=30000)
+            await self._human_delay(3, 5)
+
+            # Check if retweets are visible
+            page_content = await self.page.content()
+            if any(restriction in page_content.lower() for restriction in [
+                'not authorized', 'protected', 'suspended', 'blocked'
+            ]):
+                self.logger.warning(f"⚠️ Retweets are not accessible for this tweet")
+                return [{'error': 'access_restricted', 'message': 'Retweets not publicly accessible'}]
+
+            scroll_attempts = 0
+            max_scrolls = min(max_reposters // 10, 5)
+
+            while len(reposters) < max_reposters and scroll_attempts < max_scrolls:
+                # Extract user data from the page
+                div_texts = await self.page.locator('div').all_inner_texts()
+
+                for div_text in div_texts:
+                    if len(reposters) >= max_reposters:
+                        break
+
+                    lines = div_text.split('\n')
+                    for i, line in enumerate(lines):
+                        line = line.strip()
+                        # Look for username patterns (@username)
+                        if line.startswith('@') and len(line) > 2 and len(line) < 50:
+                            username = line
+                            # Try to get display name from previous line
+                            display_name = lines[i-1].strip() if i > 0 else ''
+
+                            # Avoid duplicates
+                            if username not in [u.get('username') for u in reposters]:
+                                reposter_data = {
+                                    'username': username,
+                                    'display_name': display_name if display_name and len(display_name) < 100 else username,
+                                    'profile_url': f"https://x.com/{username[1:]}",
+                                    'extracted_from': 'retweets_page'
+                                }
+                                reposters.append(reposter_data)
+
+                                if len(reposters) >= max_reposters:
+                                    break
+
+                # Scroll for more reposters
+                if len(reposters) < max_reposters:
+                    await self.page.mouse.wheel(0, 800)
+                    await self._human_delay(2, 4)
+                    scroll_attempts += 1
+
+            self.logger.info(f"🔄 Extracted {len(reposters)} reposters")
+            return reposters[:max_reposters]
+
+        except Exception as e:
+            self.logger.error(f"❌ Post reposters extraction failed: {e}")
+            return reposters
+
     async def _scrape_user_followers(self, username: str, max_followers: int) -> List[Dict[str, Any]]:
         """Scrape user's followers list."""
         followers = []
@@ -7586,11 +8446,11 @@ class TwitterScraper:
             # Navigate to followers page
             followers_url = f"https://x.com/{username}/followers"
             await self.page.goto(followers_url, wait_until='domcontentloaded', timeout=30000)
-            await self._human_delay(3, 5)
-            
-            # 🚀 Enhanced followers extraction with div parsing approach
+
+            # HUMAN BEHAVIOR: Simulate natural browsing on followers page
             self.logger.info("👥 Using div-based followers extraction...")
-            await self._human_delay(5, 8)  # Wait for followers page to load
+            await HumanBehavior.random_delay(2000, 4000)
+            await HumanBehavior.simulate_profile_browsing(self.page)
             
             scroll_attempts = 0
             max_scrolls = min(max_followers // 5, 15)
@@ -7665,9 +8525,13 @@ class TwitterScraper:
                 # Scroll for more followers
                 if len(followers) < max_followers:
                     self.logger.info(f"📜 Scrolling for more followers... ({len(followers)}/{max_followers})")
-                    await self.page.mouse.wheel(0, 800)
-                    await self._human_delay(2, 4)
+                    # HUMAN BEHAVIOR: Use human-like scrolling
+                    await HumanBehavior.human_scroll(self.page, 'down', 800)
                     scroll_attempts += 1
+
+                    # HUMAN BEHAVIOR: Occasional mouse movements
+                    if scroll_attempts % 3 == 0:
+                        await HumanBehavior.random_mouse_movements(self.page, count=1)
             
             self.logger.info(f"👥 Extracted {len(followers)} followers")
             return followers[:max_followers]
@@ -7683,11 +8547,11 @@ class TwitterScraper:
             # Navigate to following page
             following_url = f"https://x.com/{username}/following"
             await self.page.goto(following_url, wait_until='domcontentloaded', timeout=30000)
-            await self._human_delay(3, 5)
-            
-            # 🚀 Enhanced following extraction with div parsing approach  
+
+            # HUMAN BEHAVIOR: Simulate natural browsing on following page
             self.logger.info("➡️ Using div-based following extraction...")
-            await self._human_delay(5, 8)  # Wait for following page to load
+            await HumanBehavior.random_delay(2000, 4000)
+            await HumanBehavior.simulate_profile_browsing(self.page)
             
             scroll_attempts = 0
             max_scrolls = min(max_following // 5, 15)
@@ -7762,9 +8626,13 @@ class TwitterScraper:
                 # Scroll for more following users
                 if len(following) < max_following:
                     self.logger.info(f"📜 Scrolling for more following... ({len(following)}/{max_following})")
-                    await self.page.mouse.wheel(0, 800)
-                    await self._human_delay(2, 4)
+                    # HUMAN BEHAVIOR: Use human-like scrolling
+                    await HumanBehavior.human_scroll(self.page, 'down', 800)
                     scroll_attempts += 1
+
+                    # HUMAN BEHAVIOR: Occasional mouse movements
+                    if scroll_attempts % 3 == 0:
+                        await HumanBehavior.random_mouse_movements(self.page, count=1)
             
             self.logger.info(f"➡️ Extracted {len(following)} following")
             return following[:max_following]
@@ -7831,10 +8699,12 @@ class TwitterScraper:
     
     async def _extract_profile_info(self, username: str) -> Dict[str, Any]:
         """Extract comprehensive profile information - FIXED for X/Twitter 2024."""
+        self.logger.info(f"🔍 _extract_profile_info: Starting extraction for @{username}")
         profile_data = {}
-        
+
         try:
             # 1. EXTRACT DISPLAY NAME - Updated selectors for X/Twitter 2024
+            self.logger.info("🔍 Step 1: Extracting display name...")
             display_name_found = False
             name_selectors = [
                 f'[data-testid="UserName"] span:not([role="presentation"])',  # Primary display name
@@ -7844,15 +8714,34 @@ class TwitterScraper:
                 f'[aria-labelledby] span[style*="font-weight: 800"]'  # Bold styled names
             ]
             
-            for selector in name_selectors:
+            for idx, selector in enumerate(name_selectors):
                 try:
+                    self.logger.info(f"🔍 Step 1.{idx+1}: Trying selector: {selector[:50]}...")
                     name_elements = self.page.locator(selector)
-                    count = await name_elements.count()
+                    self.logger.info(f"🔍 Step 1.{idx+1}a: Calling count()...")
+                    count = await self._with_timeout(
+                        name_elements.count(),
+                        timeout_ms=3000,
+                        operation_name=f"Count name elements for selector {idx+1}",
+                        default=0
+                    )
+                    self.logger.info(f"🔍 Step 1.{idx+1}b: Found {count} elements")
                     
-                    for i in range(count):
+                    for i in range(min(count, 10)):  # Limit iterations
                         element = name_elements.nth(i)
-                        if await element.is_visible():
-                            name_text = await element.inner_text()
+                        is_visible = await self._with_timeout(
+                            element.is_visible(),
+                            timeout_ms=2000,
+                            operation_name=f"Check visibility {i}",
+                            default=False
+                        )
+                        if is_visible:
+                            name_text = await self._with_timeout(
+                                element.inner_text(),
+                                timeout_ms=2000,
+                                operation_name=f"Get name text {i}",
+                                default=""
+                            )
                             # Validate it's actually a display name (not username, not UI text)
                             if (name_text and 
                                 not name_text.startswith('@') and
@@ -7887,6 +8776,7 @@ class TwitterScraper:
             profile_data['username'] = username
             
             # 3. EXTRACT BIO/DESCRIPTION - Updated selectors for X/Twitter 2024
+            self.logger.info("🔍 Step 3: Extracting bio...")
             bio_selectors = [
                 '[data-testid="UserDescription"] span',  # Primary bio location
                 '[data-testid="UserDescription"]',
@@ -7894,17 +8784,34 @@ class TwitterScraper:
                 'div[data-testid*="bio"] span',
                 'div[data-testid*="description"] span'
             ]
-            
-            for selector in bio_selectors:
+
+            for idx, selector in enumerate(bio_selectors):
                 try:
+                    self.logger.info(f"🔍 Step 3.{idx+1}: Trying bio selector...")
                     bio_elements = self.page.locator(selector)
-                    count = await bio_elements.count()
-                    
+                    count = await self._with_timeout(
+                        bio_elements.count(),
+                        timeout_ms=3000,
+                        operation_name=f"Count bio elements {idx+1}",
+                        default=0
+                    )
+
                     bio_parts = []
-                    for i in range(count):
+                    for i in range(min(count, 20)):  # Limit iterations
                         element = bio_elements.nth(i)
-                        if await element.is_visible():
-                            bio_text = await element.inner_text()
+                        is_visible = await self._with_timeout(
+                            element.is_visible(),
+                            timeout_ms=2000,
+                            operation_name=f"Check bio visibility {i}",
+                            default=False
+                        )
+                        if is_visible:
+                            bio_text = await self._with_timeout(
+                                element.inner_text(),
+                                timeout_ms=2000,
+                                operation_name=f"Get bio text {i}",
+                                default=""
+                            )
                             if bio_text and bio_text.strip():
                                 bio_parts.append(bio_text.strip())
                     
@@ -7919,6 +8826,7 @@ class TwitterScraper:
                     continue
             
             # 4. EXTRACT FOLLOWER/FOLLOWING COUNTS - Enhanced with multiple strategies
+            self.logger.info("🔍 Step 4: Extracting follower/following counts...")
             try:
                 # Strategy 1: Direct href-based selectors
                 href_selectors = [
@@ -7948,25 +8856,55 @@ class TwitterScraper:
                 ]
                 
                 all_selectors = href_selectors + text_selectors + aria_selectors
-                
-                for selector in all_selectors:
+
+                for idx, selector in enumerate(all_selectors):
+                    # Only try first 10 selectors to avoid infinite loops
+                    if idx >= 10:
+                        break
                     try:
+                        self.logger.info(f"🔍 Step 4.{idx+1}: Trying stats selector...")
                         elements = self.page.locator(selector)
-                        count = await elements.count()
-                        
-                        for i in range(count):
+                        count = await self._with_timeout(
+                            elements.count(),
+                            timeout_ms=3000,
+                            operation_name=f"Count stats elements {idx+1}",
+                            default=0
+                        )
+
+                        for i in range(min(count, 5)):  # Limit to 5 elements max
                             element = elements.nth(i)
-                            
+
                             # Try to get text content
-                            text = await element.inner_text()
+                            text = await self._with_timeout(
+                                element.inner_text(),
+                                timeout_ms=2000,
+                                operation_name=f"Get stats text {i}",
+                                default=""
+                            )
                             if not text:
                                 # Try parent element
                                 parent = element.locator('..')
-                                if await parent.count() > 0:
-                                    text = await parent.inner_text()
-                            
+                                parent_count = await self._with_timeout(
+                                    parent.count(),
+                                    timeout_ms=1000,
+                                    operation_name="Count parent",
+                                    default=0
+                                )
+                                if parent_count > 0:
+                                    text = await self._with_timeout(
+                                        parent.inner_text(),
+                                        timeout_ms=2000,
+                                        operation_name="Get parent text",
+                                        default=""
+                                    )
+
                             # Also check aria-label
-                            aria_label = await element.get_attribute('aria-label')
+                            aria_label = await self._with_timeout(
+                                element.get_attribute('aria-label'),
+                                timeout_ms=1000,
+                                operation_name="Get aria-label",
+                                default=""
+                            )
                             if aria_label:
                                 text = f"{text} {aria_label}".strip()
                             
@@ -8007,45 +8945,58 @@ class TwitterScraper:
                         self.logger.debug(f"Stats selector {selector} failed: {e}")
                         continue
                 
-                # Strategy 4: Fallback pattern search in entire page
+                # Strategy 4: Fallback pattern search in profile container (FIXED: Use scoped query with timeout)
                 if 'followers_count' not in profile_data or 'following_count' not in profile_data:
                     try:
-                        page_text = await self.page.inner_text()
-                        import re
-                        
-                        # Look for patterns like "1.2K Following" or "850 Followers"
-                        following_patterns = [
-                            r'(\d+(?:[.,]\d+)*[KMB]?)\s*Following',
-                            r'Following\s*(\d+(?:[.,]\d+)*[KMB]?)',
-                        ]
-                        
-                        follower_patterns = [
-                            r'(\d+(?:[.,]\d+)*[KMB]?)\s*Followers?',
-                            r'Followers?\s*(\d+(?:[.,]\d+)*[KMB]?)',
-                        ]
-                        
-                        if 'following_count' not in profile_data:
-                            for pattern in following_patterns:
-                                matches = re.findall(pattern, page_text, re.IGNORECASE)
-                                if matches:
-                                    profile_data['following_count'] = matches[0]
-                                    self.logger.info(f"✅ Following (pattern): {matches[0]}")
-                                    break
-                        
-                        if 'followers_count' not in profile_data:
-                            for pattern in follower_patterns:
-                                matches = re.findall(pattern, page_text, re.IGNORECASE)
-                                if matches:
-                                    profile_data['followers_count'] = matches[0]
-                                    self.logger.info(f"✅ Followers (pattern): {matches[0]}")
-                                    break
-                    except:
+                        # Use scoped query instead of entire page to avoid hang
+                        self.logger.info("🔍 Strategy 4: Pattern search in profile header...")
+                        profile_container = self.page.locator('[data-testid="UserProfileHeader_Items"], [data-testid="UserDescription"], main').first
+                        page_text = await self._with_timeout(
+                            profile_container.inner_text(),
+                            timeout_ms=5000,
+                            operation_name="Profile text extraction",
+                            default=""
+                        )
+
+                        if page_text:
+                            import re
+
+                            # Look for patterns like "1.2K Following" or "850 Followers"
+                            following_patterns = [
+                                r'(\d+(?:[.,]\d+)*[KMB]?)\s*Following',
+                                r'Following\s*(\d+(?:[.,]\d+)*[KMB]?)',
+                            ]
+
+                            follower_patterns = [
+                                r'(\d+(?:[.,]\d+)*[KMB]?)\s*Followers?',
+                                r'Followers?\s*(\d+(?:[.,]\d+)*[KMB]?)',
+                            ]
+
+                            if 'following_count' not in profile_data:
+                                for pattern in following_patterns:
+                                    matches = re.findall(pattern, page_text, re.IGNORECASE)
+                                    if matches:
+                                        profile_data['following_count'] = matches[0]
+                                        self.logger.info(f"✅ Following (pattern): {matches[0]}")
+                                        break
+
+                            if 'followers_count' not in profile_data:
+                                for pattern in follower_patterns:
+                                    matches = re.findall(pattern, page_text, re.IGNORECASE)
+                                    if matches:
+                                        profile_data['followers_count'] = matches[0]
+                                        self.logger.info(f"✅ Followers (pattern): {matches[0]}")
+                                        break
+                        else:
+                            self.logger.warning("⚠️ Profile text extraction timed out or failed")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Strategy 4 failed: {e}")
                         pass
                         
             except Exception as e:
                 self.logger.debug(f"⚠️ Stats extraction failed: {e}")
             
-            # 5. EXTRACT POST COUNT - Look for posts/tweets count
+            # 5. EXTRACT POST COUNT - Look for posts/tweets count (FIXED: Add timeout)
             try:
                 # Look for navigation tabs that show post count
                 nav_selectors = [
@@ -8053,15 +9004,25 @@ class TwitterScraper:
                     '[role="tablist"] a span',       # Tab navigation
                     'nav[role="navigation"] a span'   # Navigation links
                 ]
-                
+
                 for selector in nav_selectors:
                     try:
                         nav_elements = self.page.locator(selector)
-                        count = await nav_elements.count()
-                        
-                        for i in range(count):
+                        count = await self._with_timeout(
+                            nav_elements.count(),
+                            timeout_ms=3000,
+                            operation_name=f"Count elements for {selector}",
+                            default=0
+                        )
+
+                        for i in range(min(count, 10)):  # Limit iterations
                             element = nav_elements.nth(i)
-                            text = await element.inner_text()
+                            text = await self._with_timeout(
+                                element.inner_text(),
+                                timeout_ms=2000,
+                                operation_name=f"Get text for element {i}",
+                                default=""
+                            )
                             # Look for post count patterns like "1.2K Posts" or "850 Tweets"
                             if text and ('post' in text.lower() or 'tweet' in text.lower()):
                                 import re
@@ -8070,32 +9031,45 @@ class TwitterScraper:
                                     profile_data['posts_count'] = numbers[0]
                                     self.logger.info(f"✅ Posts count: {numbers[0]}")
                                     break
-                    except:
+                    except Exception as e:
+                        self.logger.debug(f"Selector {selector} failed: {e}")
                         continue
-                        
+
             except Exception as e:
                 self.logger.debug(f"⚠️ Post count extraction failed: {e}")
             
-            # 6. EXTRACT JOIN DATE
+            # 6. EXTRACT JOIN DATE (FIXED: Add timeout)
             try:
                 join_selectors = [
                     'span:has-text("Joined")',
                     '[data-testid="UserProfileHeader_Items"] span',
                     'div[dir="ltr"] span:has-text("Joined")'
                 ]
-                
+
                 for selector in join_selectors:
                     try:
                         join_element = self.page.locator(selector).first
-                        if await join_element.count() > 0:
-                            join_text = await join_element.inner_text()
-                            if 'joined' in join_text.lower():
+                        element_count = await self._with_timeout(
+                            join_element.count(),
+                            timeout_ms=2000,
+                            operation_name="Check join element count",
+                            default=0
+                        )
+                        if element_count > 0:
+                            join_text = await self._with_timeout(
+                                join_element.inner_text(),
+                                timeout_ms=2000,
+                                operation_name="Get join date text",
+                                default=""
+                            )
+                            if join_text and 'joined' in join_text.lower():
                                 profile_data['joined'] = join_text
                                 self.logger.info(f"✅ Join date: {join_text}")
                                 break
-                    except:
+                    except Exception as e:
+                        self.logger.debug(f"Join selector {selector} failed: {e}")
                         continue
-                        
+
             except Exception as e:
                 self.logger.debug(f"⚠️ Join date extraction failed: {e}")
             
@@ -8113,15 +9087,18 @@ class TwitterScraper:
     async def load_session(self, session_file: str = "/sessions/twitter_session.json"):
         """Load saved session cookies to bypass authentication."""
         self.logger.info(f"🍪 Loading Twitter session from {session_file}")
-        
+
         try:
             # Check if session file exists
+            self.logger.info("⏳ Step 1a/5: Checking session file existence...")
             if not os.path.exists(session_file):
                 raise ValueError(f"Session file not found: {session_file}")
-            
+
             # Load session data
+            self.logger.info("⏳ Step 1b/5: Reading session data from file...")
             with open(session_file, 'r') as f:
                 session_data = json.load(f)
+            self.logger.info(f"✅ Step 1b/5: Loaded session data ({len(session_data)} keys)")
             
             cookies = session_data.get("cookies", {})
             if not cookies.get("auth_token"):
@@ -8143,35 +9120,47 @@ class TwitterScraper:
                 await self._attempt_session_refresh(session_file, session_data)
             
             self.logger.info(f"📅 Session captured: {session_data.get('captured_at', 'unknown')}")
-            
-            # Create browser context (similar to authenticate but simpler)
-            import random
-            mobile_viewports = [
-                {'width': 375, 'height': 812},  # iPhone X
-                {'width': 414, 'height': 896},  # iPhone 11 Pro Max
-                {'width': 390, 'height': 844},  # iPhone 12
-            ]
-            viewport = random.choice(mobile_viewports)
-            
-            mobile_user_agents = [
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
-                'Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
-            ]
-            user_agent = random.choice(mobile_user_agents)
-            
-            self.context = await self.browser.new_context(
-                viewport=viewport,
-                user_agent=user_agent,
-                locale='en-US',
-                timezone_id='America/New_York',
-                device_scale_factor=2.0,
-                has_touch=True,
-                is_mobile=True
-            )
-            
+
+            # Use context from workers if provided, otherwise create one
+            if self.context is None:
+                self.logger.info("⏳ Step 1c/5: Creating browser context with mobile user agent...")
+                import random
+                mobile_viewports = [
+                    {'width': 375, 'height': 812},  # iPhone X
+                    {'width': 414, 'height': 896},  # iPhone 11 Pro Max
+                    {'width': 390, 'height': 844},  # iPhone 12
+                ]
+                viewport = random.choice(mobile_viewports)
+
+                mobile_user_agents = [
+                    'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1',
+                    'Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+                ]
+                user_agent = random.choice(mobile_user_agents)
+
+                self.context = await self.browser.new_context(
+                    viewport=viewport,
+                    user_agent=user_agent,
+                    locale='en-US',
+                    timezone_id='America/New_York',
+                    device_scale_factor=2.0,
+                    has_touch=True,
+                    is_mobile=True
+                )
+            else:
+                self.logger.info("✅ Step 1c/5: Using stealth context from workers (already created)")
+
             self.page = await self.context.new_page()
-            
+
+            # ENHANCED STEALTH: Apply extra stealth measures to page
+            from ..stealth_config import EnhancedStealthConfig
+            await EnhancedStealthConfig.apply_extra_stealth_to_page(self.page)
+            self.logger.info("🔒 Enhanced stealth applied to page")
+
+            self.logger.info("✅ Step 1c/5: Browser context created successfully")
+
             # Add cookies to context - FIXED: Add to both domains correctly
+            self.logger.info("⏳ Step 1d/5: Adding session cookies to browser context...")
             cookie_list = []
             for name, value in cookies.items():
                 # Add for x.com domain
@@ -8191,11 +9180,11 @@ class TwitterScraper:
                 })
             
             await self.context.add_cookies(cookie_list)
-            self.logger.info(f"🍪 Added {len(cookie_list)} cookies to browser context")
-            
+            self.logger.info(f"✅ Step 1d/5: Added {len(cookie_list)} cookies to browser context")
+
             # ENHANCED: Validate session by checking a Twitter page with increased timeout
             try:
-                self.logger.info("🔍 Validating session authentication...")
+                self.logger.info("⏳ Step 1e/5: Validating session authentication...")
                 await self.page.goto("https://x.com/home", wait_until='domcontentloaded', timeout=60000)  # Increased to 60 seconds
                 await self.page.wait_for_timeout(5000)  # Wait for content to load
                 
@@ -8222,15 +9211,15 @@ class TwitterScraper:
                 
                 if authenticated:
                     self.authenticated = True
-                    self.logger.info("🎉 Session validation successful - fully authenticated!")
+                    self.logger.info("✅ Step 1e/5: Session validation successful - fully authenticated!")
                 else:
-                    self.logger.warning("⚠️ Session loaded but authentication unclear")
+                    self.logger.warning("⚠️ Step 1e/5: Session loaded but authentication unclear")
                     self.authenticated = True  # Proceed anyway, may work for public content
-                    
+
             except Exception as auth_e:
-                self.logger.warning(f"⚠️ Session validation failed: {auth_e} - proceeding anyway")
+                self.logger.warning(f"⚠️ Step 1e/5: Session validation failed: {auth_e} - proceeding anyway")
                 self.authenticated = True  # Proceed anyway
-                
+
         except Exception as e:
             self.logger.error(f"❌ Failed to load session: {e}")
             raise Exception(f"Session loading failed: {e}")

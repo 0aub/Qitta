@@ -1,0 +1,20 @@
+{
+  "cookies": {
+    "auth_token": "YOUR_AUTH_TOKEN_HERE",
+    "ct0": "YOUR_CT0_TOKEN_HERE",
+    "kdt": "YOUR_KDT_TOKEN_HERE",
+    "twid": "YOUR_TWID_HERE",
+    "guest_id": "YOUR_GUEST_ID_HERE",
+    "guest_id_marketing": "YOUR_GUEST_ID_MARKETING_HERE",
+    "guest_id_ads": "YOUR_GUEST_ID_ADS_HERE",
+    "personalization_id": "YOUR_PERSONALIZATION_ID_HERE",
+    "night_mode": "2",
+    "dnt": "1",
+    "lang": "en"
+  },
+  "captured_at": "2025-01-01T00:00:00.000000",
+  "captured_at_timestamp": 1704067200.0,
+  "expires_estimate": 1706745600.0,
+  "username": "@YourTwitterHandle",
+  "email": "your_email@example.com"
+}

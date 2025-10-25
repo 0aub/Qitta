@@ -61,23 +61,26 @@ class BrowserContextManager:
         """Get a dedicated browser context for a job with guaranteed cleanup."""
         context = None
         try:
-            # Phase 4.3: Enhanced context creation with stealth integration
-            if self.stealth_manager:
-                # Remove default user agent as stealth manager will handle it
-                context_options.pop('user_agent', None)
-            else:
-                # Fallback user agent if no stealth manager
-                context_options.setdefault('user_agent',
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                )
+            # ENHANCED STEALTH: Always apply stealth configuration
+            from .stealth_config import EnhancedStealthConfig
 
-            context = await self.browser.new_context(**context_options)
+            # Get stealth context options (randomized)
+            stealth_options = EnhancedStealthConfig.get_stealth_context_options()
+
+            # Merge with any provided context_options (stealth takes precedence)
+            merged_options = {**context_options, **stealth_options}
+
+            self.logger.info(f"🔒 Creating STEALTH context for job {job_id}")
+            self.logger.info(f"   UA: {stealth_options['user_agent'][:60]}...")
+            self.logger.info(f"   Viewport: {stealth_options['viewport']['width']}x{stealth_options['viewport']['height']}")
+
+            context = await self.browser.new_context(**merged_options)
             self._active_contexts[job_id] = context
 
-            # Phase 4.3: Apply stealth measures to the context
-            if self.stealth_manager:
-                await self.stealth_manager.apply_stealth_to_context(context)
-                self.logger.debug(f"Applied {self.stealth_manager.stealth_level.value} stealth to context for job {job_id}")
+            # ENHANCED STEALTH: Apply playwright-stealth measures
+            self.logger.info(f"🔒 Applying playwright-stealth to context...")
+            await EnhancedStealthConfig.apply_stealth_to_context(context)
+            self.logger.info(f"   ✅ Stealth measures applied")
 
             self.logger.debug(f"Created browser context for job {job_id}")
             yield context
@@ -89,9 +92,6 @@ class BrowserContextManager:
             # Guaranteed cleanup
             if context:
                 try:
-                    # Phase 4.3: Clean up stealth traces before closing context
-                    if self.stealth_manager:
-                        await self.stealth_manager.cleanup_traces(context)
                     await context.close()
                     self.logger.debug(f"Closed browser context for job {job_id}")
                 except Exception as e:
@@ -257,10 +257,13 @@ class Worker:
 
         # Create job output directory
         job_output_dir = os.path.join(self.data_root, job.task_name, job_id)
+        self.logger.info(f"⏳ WORKER: Creating output directory: {job_output_dir}")
         os.makedirs(job_output_dir, exist_ok=True)
 
         # Setup job logger
+        self.logger.info(f"⏳ WORKER: Setting up job logger...")
         job_logger = self._setup_job_logger(job_id, job_output_dir)
+        job_logger.info(f"✅ WORKER: Job logger initialized for job {job_id}")
 
         # Create error context
         error_context = ErrorContext(
@@ -273,17 +276,22 @@ class Worker:
 
         try:
             # Get task function
+            job_logger.info("⏳ WORKER: Looking up task function...")
             if job.task_name not in self.task_registry:
                 raise WorkerError(f"Unknown task '{job.task_name}'")
 
             task_fn = self.task_registry[job.task_name]
+            job_logger.info(f"✅ WORKER: Task function found: {task_fn.__name__ if hasattr(task_fn, '__name__') else 'unknown'}")
 
             # Phase 2.5: Execute task through circuit breaker (including browser context creation)
             circuit_breaker_name = self._get_circuit_breaker_name(job.task_name)
+            job_logger.info(f"⏳ WORKER: Setting up circuit breaker: {circuit_breaker_name}")
 
             async def execute_task():
                 # Phase 4.2b: Include browser context creation in circuit breaker scope
+                job_logger.info("⏳ WORKER: Creating browser context...")
                 async with self.context_manager.get_context(job_id) as context:
+                    job_logger.info("✅ WORKER: Browser context created successfully")
                     # Update error context with browser state
                     error_context.browser_state = {
                         "browser_connected": self.browser.is_connected(),
@@ -291,127 +299,139 @@ class Worker:
                     }
 
                     # Check if task function expects context parameter
+                    job_logger.info("⏳ WORKER: Invoking task function...")
                     import inspect
                     sig = inspect.signature(task_fn)
                     if 'context' in sig.parameters:
                         # New context-aware task function
-                        return await task_fn(
+                        job_logger.info("⏳ WORKER: Calling task with context parameter...")
+                        result = await task_fn(
                             browser=self.browser,
                             context=context,
                             params=job.params,
                             job_output_dir=job_output_dir,
                             logger=job_logger,
                         )
+                        job_logger.info("✅ WORKER: Task function completed")
+                        return result
                     else:
                         # Legacy task function - pass browser
-                        return await task_fn(
+                        job_logger.info("⏳ WORKER: Calling task without context parameter...")
+                        result = await task_fn(
                             browser=self.browser,
                             params=job.params,
                             job_output_dir=job_output_dir,
                             logger=job_logger,
                         )
+                        job_logger.info("✅ WORKER: Task function completed")
+                        return result
 
-                try:
-                    # Phase 2.6: Execute with fallback support
-                    if self.fallback_manager:
-                        # Prepare fallback data
-                        fallback_data = {
-                            "task_name": job.task_name,
-                            "params": job.params,
-                            "worker_id": self.worker_id,
-                            "job_id": job_id
-                        }
+            # Phase 2.6: Execute with fallback support
+            job_logger.info("⏳ WORKER: Executing task...")
+            try:
+                if self.fallback_manager:
+                    job_logger.info("⏳ WORKER: Using fallback manager...")
+                    # Prepare fallback data
+                    fallback_data = {
+                        "task_name": job.task_name,
+                        "params": job.params,
+                        "worker_id": self.worker_id,
+                        "job_id": job_id
+                    }
 
-                        # Execute with fallback mechanisms
-                        fallback_execution = await self.fallback_manager.execute_with_fallback(
-                            service_name=circuit_breaker_name,
-                            primary_func=execute_task,
-                            fallback_data=fallback_data
-                        )
+                    # Execute with fallback mechanisms
+                    fallback_execution = await self.fallback_manager.execute_with_fallback(
+                        service_name=circuit_breaker_name,
+                        primary_func=execute_task,
+                        fallback_data=fallback_data
+                    )
 
-                        if not fallback_execution.success:
-                            # Fallback also failed - raise error
-                            raise EnhancedError(
-                                f"Task execution failed: {fallback_execution.error}",
-                                category=ErrorCategory.EXTERNAL_SERVICE,
-                                severity=ErrorSeverity.HIGH,
-                                recovery_strategy=RecoveryStrategy.EXPONENTIAL_BACKOFF
-                            )
-
-                        # Use fallback result
-                        result = fallback_execution.data
-
-                        # Log degradation information
-                        if fallback_execution.is_degraded:
-                            self.logger.warning(
-                                f"Job {job_id} completed with degraded service "
-                                f"(strategy: {fallback_execution.strategy_used}, "
-                                f"response_time: {fallback_execution.response_time_ms:.1f}ms)"
-                            )
-
-                        # Update cache if successful
-                        if fallback_execution.success and result:
-                            self.fallback_manager.update_cache(circuit_breaker_name, result)
-
-                    elif self.circuit_breaker_manager:
-                        # Only circuit breaker available
-                        result = await self.circuit_breaker_manager.call_with_breaker(
-                            circuit_breaker_name,
-                            execute_task
-                        )
-                    else:
-                        # Direct execution fallback
-                        result = await execute_task()
-
-                except CircuitBreakerError as e:
-                    # Circuit breaker is open - try fallback if available
-                    if self.fallback_manager:
-                        self.logger.warning(f"Circuit breaker {e.circuit_name} is {e.state} - attempting fallback for job {job_id}")
-
-                        fallback_data = {
-                            "task_name": job.task_name,
-                            "params": job.params,
-                            "worker_id": self.worker_id,
-                            "job_id": job_id,
-                            "circuit_breaker_state": e.state
-                        }
-
-                        fallback_execution = await self.fallback_manager._execute_fallback(
-                            circuit_breaker_name,
-                            fallback_data,
-                            0,  # start_time
-                            f"Circuit breaker {e.circuit_name} is {e.state}"
-                        )
-
-                        if fallback_execution.success:
-                            result = fallback_execution.data
-                            self.logger.info(f"Job {job_id} completed using fallback strategy: {fallback_execution.strategy_used}")
-                        else:
-                            # Both circuit breaker and fallback failed
-                            self.logger.error(f"Job {job_id} failed - circuit breaker open and fallback unsuccessful")
-                            raise EnhancedError(
-                                f"Service temporarily unavailable: {e.circuit_name} circuit breaker is {e.state} and fallback failed",
-                                category=ErrorCategory.EXTERNAL_SERVICE,
-                                severity=ErrorSeverity.HIGH,
-                                recovery_strategy=RecoveryStrategy.EXPONENTIAL_BACKOFF
-                            )
-                    else:
-                        # No fallback available
-                        self.logger.error(f"Circuit breaker {e.circuit_name} is {e.state} - rejecting job {job_id}")
+                    if not fallback_execution.success:
+                        # Fallback also failed - raise error
                         raise EnhancedError(
-                            f"Service temporarily unavailable: {e.circuit_name} circuit breaker is {e.state}",
+                            f"Task execution failed: {fallback_execution.error}",
                             category=ErrorCategory.EXTERNAL_SERVICE,
                             severity=ErrorSeverity.HIGH,
                             recovery_strategy=RecoveryStrategy.EXPONENTIAL_BACKOFF
                         )
 
-                # Mark as completed
-                await self.job_store.mark_job_completed(job_id, result)
-                self.logger.info(f"Job {job_id} completed successfully")
+                    # Use fallback result
+                    result = fallback_execution.data
 
-                # Reset failure count on success
-                self._consecutive_failures = 0
-                self._last_success = datetime.datetime.utcnow()
+                    # Log degradation information
+                    if fallback_execution.is_degraded:
+                        self.logger.warning(
+                            f"Job {job_id} completed with degraded service "
+                            f"(strategy: {fallback_execution.strategy_used}, "
+                            f"response_time: {fallback_execution.response_time_ms:.1f}ms)"
+                        )
+
+                    # Update cache if successful
+                    if fallback_execution.success and result:
+                        self.fallback_manager.update_cache(circuit_breaker_name, result)
+
+                elif self.circuit_breaker_manager:
+                    # Only circuit breaker available
+                    job_logger.info("⏳ WORKER: Using circuit breaker...")
+                    result = await self.circuit_breaker_manager.call_with_breaker(
+                        circuit_breaker_name,
+                        execute_task
+                    )
+                else:
+                    # Direct execution fallback
+                    job_logger.info("⏳ WORKER: Direct execution (no circuit breaker)...")
+                    result = await execute_task()
+
+            except CircuitBreakerError as e:
+                # Circuit breaker is open - try fallback if available
+                if self.fallback_manager:
+                    self.logger.warning(f"Circuit breaker {e.circuit_name} is {e.state} - attempting fallback for job {job_id}")
+
+                    fallback_data = {
+                        "task_name": job.task_name,
+                        "params": job.params,
+                        "worker_id": self.worker_id,
+                        "job_id": job_id,
+                        "circuit_breaker_state": e.state
+                    }
+
+                    fallback_execution = await self.fallback_manager._execute_fallback(
+                        circuit_breaker_name,
+                        fallback_data,
+                        0,  # start_time
+                        f"Circuit breaker {e.circuit_name} is {e.state}"
+                    )
+
+                    if fallback_execution.success:
+                        result = fallback_execution.data
+                        self.logger.info(f"Job {job_id} completed using fallback strategy: {fallback_execution.strategy_used}")
+                    else:
+                        # Both circuit breaker and fallback failed
+                        self.logger.error(f"Job {job_id} failed - circuit breaker open and fallback unsuccessful")
+                        raise EnhancedError(
+                            f"Service temporarily unavailable: {e.circuit_name} circuit breaker is {e.state} and fallback failed",
+                            category=ErrorCategory.EXTERNAL_SERVICE,
+                            severity=ErrorSeverity.HIGH,
+                            recovery_strategy=RecoveryStrategy.EXPONENTIAL_BACKOFF
+                        )
+                else:
+                    # No fallback available
+                    self.logger.error(f"Circuit breaker {e.circuit_name} is {e.state} - rejecting job {job_id}")
+                    raise EnhancedError(
+                        f"Service temporarily unavailable: {e.circuit_name} circuit breaker is {e.state}",
+                        category=ErrorCategory.EXTERNAL_SERVICE,
+                        severity=ErrorSeverity.HIGH,
+                        recovery_strategy=RecoveryStrategy.EXPONENTIAL_BACKOFF
+                    )
+
+            # Mark as completed
+            job_logger.info("⏳ WORKER: Marking job as completed...")
+            await self.job_store.mark_job_completed(job_id, result)
+            self.logger.info(f"Job {job_id} completed successfully")
+
+            # Reset failure count on success
+            self._consecutive_failures = 0
+            self._last_success = datetime.datetime.utcnow()
 
         except Exception as e:
             # Enhanced error handling
@@ -451,23 +471,30 @@ class Worker:
 
     def _setup_job_logger(self, job_id: str, job_output_dir: str) -> logging.Logger:
         """Setup a dedicated logger for the job."""
+        self.logger.info(f"⏳ Creating job logger step 1/5: Getting log path...")
         job_log_path = os.path.join(job_output_dir, "job.log")
+        self.logger.info(f"⏳ Creating job logger step 2/5: Getting logger instance...")
         job_logger = logging.getLogger(f"browser.job.{job_id}")
 
         # Remove existing handlers to avoid duplicates
+        self.logger.info(f"⏳ Creating job logger step 3/5: Removing old handlers...")
         for handler in job_logger.handlers[:]:
             job_logger.removeHandler(handler)
 
         # File handler
+        self.logger.info(f"⏳ Creating job logger step 4/5: Creating file handler at {job_log_path}...")
         fh = logging.FileHandler(job_log_path)
         fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
         job_logger.addHandler(fh)
 
-        # Console handler
-        for handler in self.logger.handlers:
-            job_logger.addHandler(handler)
+        # Console handler - create new stream handler instead of reusing
+        self.logger.info(f"⏳ Creating job logger step 5/5: Creating console handler...")
+        ch = logging.StreamHandler()
+        ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+        job_logger.addHandler(ch)
 
         job_logger.setLevel(logging.INFO)
+        self.logger.info(f"✅ Job logger created successfully")
         return job_logger
 
     async def _heartbeat_loop(self) -> None:
@@ -596,7 +623,7 @@ class WorkerPool:
                 failure_threshold=3,      # Open after 3 failures
                 recovery_timeout=30.0,    # Try half-open after 30 seconds
                 success_threshold=2,      # Close after 2 successes
-                timeout=15.0             # 15 second request timeout
+                timeout=90.0             # 90 second timeout for Twitter navigation (content loading can be slow)
             )
         )
 

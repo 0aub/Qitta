@@ -269,7 +269,30 @@ async def submit_job(task_name: str, body: SubmitRequest, request: Request):
     params: Dict[str, Any] = body.dict()
 
     # Remove reliability-specific fields from params
-    timeout_seconds = params.pop("timeout_seconds", 300)
+    # Intelligent timeout based on scrape_level and features
+    scrape_level = params.get("scrape_level", 1)
+    has_social_graph = params.get("scrape_followers") or params.get("scrape_following")
+
+    # Default timeouts by level (with human behavior delays considered)
+    if not params.get("timeout_seconds"):
+        if scrape_level >= 4:
+            default_timeout = 900  # 15 minutes for Level 4 (comprehensive)
+        elif scrape_level >= 3:
+            if has_social_graph:
+                default_timeout = 720  # 12 minutes for Level 3 with social graph
+            else:
+                default_timeout = 600  # 10 minutes for Level 3
+        elif scrape_level >= 2:
+            if has_social_graph:
+                default_timeout = 600  # 10 minutes for Level 2 with social graph
+            else:
+                default_timeout = 420  # 7 minutes for Level 2
+        else:
+            default_timeout = 300  # 5 minutes for Level 1
+    else:
+        default_timeout = 300
+
+    timeout_seconds = params.pop("timeout_seconds", default_timeout)
     priority = params.pop("priority", 0)
     max_retries = params.pop("max_retries", 3)
     params.pop("proxy", None)

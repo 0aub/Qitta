@@ -9,6 +9,12 @@ backend/wireguard/wg0.json
 **/wg*.conf
 **/wg*.json
 
+# Twitter session cookies (contains auth tokens)
+backend/browser/sessions/twitter_session.json
+backend/browser/sessions/twitter_session_backup_*.json
+**/twitter_session.json
+**/twitter_session_backup_*.json
+
 # Python
 __pycache__/
 *.py[cod]
