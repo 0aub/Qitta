@@ -2248,7 +2248,7 @@ class TwitterScraper:
         try:
             # MOBILE-FIRST STRATEGY: Force mobile interface throughout
             import random
-            
+
             # Mobile viewports only - convince Twitter we're mobile
             mobile_viewports = [
                 {'width': 375, 'height': 812},  # iPhone X
@@ -2319,6 +2319,19 @@ class TwitterScraper:
             from ..stealth_config import EnhancedStealthConfig
             await EnhancedStealthConfig.apply_extra_stealth_to_page(self.page)
             self.logger.info("🔒 Enhanced stealth applied to page")
+
+            # GO DIRECTLY TO LOGIN PAGE (moved here after page creation)
+            self.logger.info("🔐 Navigating directly to Twitter login page...")
+            try:
+                await self.page.goto("https://x.com/i/flow/login", wait_until='domcontentloaded', timeout=30000)
+                await self.page.wait_for_timeout(5000)  # Wait for page to fully load
+                self.logger.info("✅ Login page loaded successfully")
+                # Skip the multi-strategy access below since we went directly to login
+                use_multi_strategy = False
+            except Exception as e:
+                self.logger.warning(f"⚠️ Direct login navigation failed: {e}")
+                self.logger.info("🔄 Falling back to multi-strategy access...")
+                use_multi_strategy = True
 
             # CRITICAL: Block redirects away from mobile.twitter.com
             await self.page.route("**/*", self._mobile_route_handler)
@@ -2430,103 +2443,107 @@ class TwitterScraper:
                 });
             """)
             
-            # MULTI-STRATEGY ACCESS: Try different Twitter endpoints progressively
-            self.logger.info("🌐 ENHANCED ACCESS: Trying multiple Twitter entry points...")
-            
-            # Progressive X.com access strategies
-            access_strategies = [
-                {
-                    'name': 'X.com Direct Home',
-                    'url': 'https://x.com/home',
-                    'wait_until': 'domcontentloaded', 
-                    'timeout': 45000
-                },
-                {
-                    'name': 'X.com Explore',
-                    'url': 'https://x.com/explore',
-                    'wait_until': 'networkidle',
-                    'timeout': 60000
-                },
-                {
-                    'name': 'X.com Settings',
-                    'url': 'https://x.com/settings',
-                    'wait_until': 'domcontentloaded',
-                    'timeout': 30000
-                },
-                {
-                    'name': 'Legacy Twitter Home',
-                    'url': 'https://twitter.com/home',
-                    'wait_until': 'domcontentloaded',
-                    'timeout': 45000
-                },
-                {
-                    'name': 'Mobile Twitter Fallback',
-                    'url': 'https://mobile.twitter.com/home',
-                    'wait_until': 'domcontentloaded',
-                    'timeout': 45000
-                }
-            ]
-            
-            access_successful = False
-            successful_url = None
-            
-            for strategy in access_strategies:
-                try:
-                    self.logger.info(f"🚀 Trying: {strategy['name']} -> {strategy['url']}")
-                    
-                    # Human-like delay before each attempt
-                    await self._human_delay(2, 4)
-                    
-                    # Attempt navigation with enhanced error handling
-                    await self.page.goto(
-                        strategy['url'], 
-                        wait_until=strategy['wait_until'], 
-                        timeout=strategy['timeout']
-                    )
-                    
-                    # Wait for page to fully load
-                    await self._human_delay(3, 6)
-                    
-                    # Check if we successfully loaded Twitter
-                    current_url = self.page.url
-                    page_title = await self.page.title()
-                    
-                    self.logger.info(f"📍 Result: {current_url} | Title: {page_title[:50]}...")
-                    
-                    # Success indicators
-                    if any(indicator in current_url.lower() for indicator in ['twitter.com', 'x.com', 'mobile.twitter']):
-                        if not any(block in current_url.lower() for block in ['login', 'session', 'error', 'suspended']):
-                            self.logger.info(f"✅ SUCCESS: {strategy['name']} worked!")
-                            access_successful = True
-                            successful_url = current_url
-                            break
-                    
-                    self.logger.warning(f"⚠️ {strategy['name']} did not provide expected result")
-                    
-                except Exception as e:
-                    self.logger.warning(f"❌ {strategy['name']} failed: {str(e)[:100]}...")
-                    continue
-            
-            if not access_successful:
-                self.logger.error("💥 All Twitter access strategies failed!")
-                raise Exception("Unable to access Twitter with any strategy - all endpoints blocked")
-            
-            # SUCCESS: We have access to Twitter!
-            self.logger.info(f"🎉 Twitter access established: {successful_url}")
-            await self._human_delay(2, 4)
-            self.logger.info(f"📍 Current URL: {self.page.url}")
-            self.logger.info(f"📑 Page title: {await self.page.title()}")
-            
+            # MULTI-STRATEGY ACCESS - only used if direct login fails
+            # (use_multi_strategy variable is set above based on direct login success)
+
+            if use_multi_strategy:
+                # MULTI-STRATEGY ACCESS: Try different Twitter endpoints progressively
+                self.logger.info("🌐 ENHANCED ACCESS: Trying multiple Twitter entry points...")
+
+                # Progressive X.com access strategies
+                access_strategies = [
+                    {
+                        'name': 'X.com Direct Home',
+                        'url': 'https://x.com/home',
+                        'wait_until': 'domcontentloaded', 
+                        'timeout': 45000
+                    },
+                    {
+                        'name': 'X.com Explore',
+                        'url': 'https://x.com/explore',
+                        'wait_until': 'networkidle',
+                        'timeout': 60000
+                    },
+                    {
+                        'name': 'X.com Settings',
+                        'url': 'https://x.com/settings',
+                        'wait_until': 'domcontentloaded',
+                        'timeout': 30000
+                    },
+                    {
+                        'name': 'Legacy Twitter Home',
+                        'url': 'https://twitter.com/home',
+                        'wait_until': 'domcontentloaded',
+                        'timeout': 45000
+                    },
+                    {
+                        'name': 'Mobile Twitter Fallback',
+                        'url': 'https://mobile.twitter.com/home',
+                        'wait_until': 'domcontentloaded',
+                        'timeout': 45000
+                    }
+                ]
+                
+                access_successful = False
+                successful_url = None
+                
+                for strategy in access_strategies:
+                    try:
+                        self.logger.info(f"🚀 Trying: {strategy['name']} -> {strategy['url']}")
+                        
+                        # Human-like delay before each attempt
+                        await self._human_delay(2, 4)
+                        
+                        # Attempt navigation with enhanced error handling
+                        await self.page.goto(
+                            strategy['url'], 
+                            wait_until=strategy['wait_until'], 
+                            timeout=strategy['timeout']
+                        )
+                        
+                        # Wait for page to fully load
+                        await self._human_delay(3, 6)
+                        
+                        # Check if we successfully loaded Twitter
+                        current_url = self.page.url
+                        page_title = await self.page.title()
+                        
+                        self.logger.info(f"📍 Result: {current_url} | Title: {page_title[:50]}...")
+                        
+                        # Success indicators
+                        if any(indicator in current_url.lower() for indicator in ['twitter.com', 'x.com', 'mobile.twitter']):
+                            if not any(block in current_url.lower() for block in ['login', 'session', 'error', 'suspended']):
+                                self.logger.info(f"✅ SUCCESS: {strategy['name']} worked!")
+                                access_successful = True
+                                successful_url = current_url
+                                break
+                        
+                        self.logger.warning(f"⚠️ {strategy['name']} did not provide expected result")
+                        
+                    except Exception as e:
+                        self.logger.warning(f"❌ {strategy['name']} failed: {str(e)[:100]}...")
+                        continue
+                
+                if not access_successful:
+                    self.logger.error("💥 All Twitter access strategies failed!")
+                    raise Exception("Unable to access Twitter with any strategy - all endpoints blocked")
+                
+                # SUCCESS: We have access to Twitter!
+                self.logger.info(f"🎉 Twitter access established: {successful_url}")
+                await self._human_delay(2, 4)
+                self.logger.info(f"📍 Current URL: {self.page.url}")
+                self.logger.info(f"📑 Page title: {await self.page.title()}")
+                
             # Check if we're being redirected or blocked
             if 'x.com' in self.page.url:
                 self.logger.info("🔄 Redirected to x.com - updating login URL")
                 self.LOGIN_URL = "https://x.com/i/flow/login"
             
-            # Wait longer for JavaScript to render the page
-            self.logger.info("⏳ Waiting for page to fully load with JavaScript...")
-            await self.page.wait_for_timeout(10000)
-            
-            # Try to wait for any input element to appear
+            # Wait for JavaScript to render the login form
+            self.logger.info("⏳ Waiting for login form to fully load...")
+            await self.page.wait_for_timeout(5000)
+
+            # Try to wait for any input element to appear (login form fields)
             try:
                 await self.page.wait_for_selector('input', timeout=60000)  # Increased to 60 seconds
                 self.logger.info("✅ Input element detected")
@@ -2551,6 +2568,8 @@ class TwitterScraper:
             
             # Step 1: Mobile-specific username/email selectors
             self.logger.info("📱 Entering email/username (MOBILE MODE)...")
+            self.logger.info(f"🔑 Credentials loaded: email={bool(self.email)}, username={bool(self.username)}, password={bool(self.password)}")
+            self.logger.info(f"📧 Email value: {self.email[:10]}... (first 10 chars)")
             mobile_username_selectors = [
                 # Mobile Twitter specific selectors  
                 'input[name="username_or_email"]',
@@ -2656,9 +2675,18 @@ class TwitterScraper:
             
             if not username_entered:
                 raise Exception("Could not enter username/email")
-                
-            await self.page.wait_for_timeout(3000)
-            
+
+            # Wait for page navigation to password screen after clicking Next
+            self.logger.info("⏳ Waiting for page navigation to password screen...")
+            try:
+                # Wait for URL to change (indicates navigation to password page)
+                await self.page.wait_for_url("**/login**", timeout=10000)
+                self.logger.info(f"✅ Navigated to: {self.page.url}")
+            except:
+                # Fallback: just wait if URL didn't change
+                self.logger.warning("⚠️ URL didn't change, waiting 5s...")
+                await self.page.wait_for_timeout(5000)
+
             # Step 2: Handle potential username verification
             try:
                 # Sometimes Twitter asks for username verification
@@ -2667,16 +2695,32 @@ class TwitterScraper:
                     self.logger.info("📝 Username verification required...")
                     await username_verification.fill(self.username)
                     await self.page.wait_for_timeout(1000)
-                    
+
                     next_button = self.page.locator('div[role="button"]:has-text("Next")')
                     if await next_button.is_visible():
                         await next_button.click()
-                        await self.page.wait_for_timeout(3000)
+                        await self.page.wait_for_timeout(5000)
             except:
                 pass  # Username verification not required
-            
+
             # Step 3: Mobile password entry
             self.logger.info("📱 Entering password (MOBILE MODE)...")
+
+            # Debug: Check current page state
+            current_url = self.page.url
+            page_title = await self.page.title()
+            self.logger.info(f"📍 Current URL after wait: {current_url}")
+            self.logger.info(f"📑 Page title after wait: {page_title}")
+
+            # Debug: Take screenshot to see what page we're on
+            try:
+                await self.page.screenshot(path="/tmp/twitter_password_page.png")
+                self.logger.info("📸 Password page screenshot saved to /tmp/twitter_password_page.png")
+            except:
+                pass
+
+            # Debug: Check what password fields exist
+            self.logger.info("🔍 Checking available password fields...")
             mobile_password_selectors = [
                 # Mobile Twitter specific
                 'input[name="session[password]"]',
@@ -2685,15 +2729,31 @@ class TwitterScraper:
                 '#password',
                 'input[placeholder*="Password"]',
                 'input[placeholder*="password"]',
-                
+
                 # Generic mobile password fields
                 'input[type="password"]',
                 'input[autocomplete="current-password"]',
-                
+
                 # Desktop fallbacks
                 'input[data-testid="ocfPasswordTextInput"]'
             ]
-            
+
+            # Debug: Log all password field availability
+            for i, selector in enumerate(mobile_password_selectors):
+                try:
+                    elements = self.page.locator(selector)
+                    count = await elements.count()
+                    self.logger.info(f"  [{i}] {selector}: {count} elements found")
+
+                    if count > 0:
+                        for j in range(min(count, 2)):
+                            element = elements.nth(j)
+                            visible = await element.is_visible()
+                            enabled = await element.is_enabled()
+                            self.logger.info(f"      Element {j}: visible={visible}, enabled={enabled}")
+                except Exception as e:
+                    self.logger.debug(f"  [{i}] {selector}: Error - {e}")
+
             password_entered = False
             for selector in mobile_password_selectors:
                 try:
@@ -2741,6 +2801,7 @@ class TwitterScraper:
                                     await login_button.first.hover()
                                     await self._human_delay(0.5, 1.0)
                                     await login_button.first.click()
+                                    self.logger.info(f"✅ Password entered and login button clicked")
                                     password_entered = True
                                     break
                             except Exception as e:
