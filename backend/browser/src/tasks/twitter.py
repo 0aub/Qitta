@@ -437,8 +437,29 @@ class TwitterTask:
             # Initialize scraper with assigned session and context from workers
             scraper = TwitterScraper(browser, logger, output_dir=job_output_dir, context=context)
             
-            # Load the assigned session
-            if clean_params.get("use_session") or os.path.exists(session_file):
+            # Load the assigned session - validate it first before using
+            session_valid = False
+            if os.path.exists(session_file):
+                try:
+                    # Check if session file has valid auth_token
+                    with open(session_file, 'r') as f:
+                        session_data = json.load(f)
+                    cookies = session_data.get("cookies", {})
+                    has_auth_token = bool(cookies.get("auth_token"))
+
+                    # Check if session is expired
+                    expires_estimate = session_data.get("expires_estimate", 0)
+                    is_expired = datetime.now().timestamp() > expires_estimate
+
+                    if has_auth_token and not is_expired:
+                        session_valid = True
+                        logger.info(f"✅ Session validation: Valid session found")
+                    else:
+                        logger.warning(f"⚠️ Session validation: Invalid session (auth_token={has_auth_token}, expired={is_expired})")
+                except Exception as e:
+                    logger.warning(f"⚠️ Session validation failed: {e}")
+
+            if session_valid and clean_params.get("use_session", True):
                 logger.info(f"🍪 Using session for authentication: {session_file}")
                 logger.info("⏳ STEP 1/5: Loading session cookies...")
                 await scraper.load_session(session_file)
