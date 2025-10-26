@@ -107,9 +107,8 @@ class ContainerBrowserRuntime:
             '--no-first-run',
             '--no-default-browser-check',
             '--use-gl=disabled',
-            '--enable-automation',
-            '--allow-running-insecure-content',
-            '--aggressive'
+            '--disable-blink-features=AutomationControlled',  # CRITICAL: Hide automation
+            '--allow-running-insecure-content'
         ]
 
         try:
