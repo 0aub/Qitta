@@ -9,6 +9,7 @@ import re
 import tempfile
 import urllib.parse
 from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime, timedelta
 import httpx
 
 # ───────── content sniffing & MIME helpers (from utils_content) ─────────
@@ -330,13 +331,195 @@ def save_json_atomic(file_path: pathlib.Path, data: Any, create_dirs: bool = Tru
     try:
         if create_dirs:
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
         temp_path = file_path.with_suffix(file_path.suffix + ".part")
-        
+
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        
+
         temp_path.replace(file_path)
         return True
     except Exception:
         return False
+
+
+# ========================================================================
+# DATE AND TIME UTILITIES
+# ========================================================================
+# Functions for date parsing, filtering, and timeline management
+# Used across scrapers for temporal data extraction
+
+def parse_date_range(date_range: str) -> Tuple[datetime, datetime]:
+    """Parse predefined date ranges into start/end datetime objects."""
+    now = datetime.now()
+
+    if date_range == "last_day" or date_range == "yesterday":
+        start = now - timedelta(days=1)
+        end = now
+    elif date_range == "last_3_days":
+        start = now - timedelta(days=3)
+        end = now
+    elif date_range == "last_week":
+        start = now - timedelta(days=7)
+        end = now
+    elif date_range == "last_2_weeks":
+        start = now - timedelta(days=14)
+        end = now
+    elif date_range == "last_month":
+        start = now - timedelta(days=30)
+        end = now
+    elif date_range == "last_3_months":
+        start = now - timedelta(days=90)
+        end = now
+    elif date_range == "last_6_months":
+        start = now - timedelta(days=180)
+        end = now
+    elif date_range == "last_year":
+        start = now - timedelta(days=365)
+        end = now
+    elif date_range == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+    else:
+        # Default to last week if unknown range
+        start = now - timedelta(days=7)
+        end = now
+
+    return start, end
+
+
+def parse_custom_date(date_str: str) -> Optional[datetime]:
+    """Parse custom date string into datetime object."""
+    if not date_str:
+        return None
+
+    try:
+        # Try different formats
+        formats = [
+            "%Y-%m-%d",           # 2024-01-01
+            "%Y-%m-%dT%H:%M:%S",  # 2024-01-01T10:30:00
+            "%Y-%m-%d %H:%M:%S",  # 2024-01-01 10:30:00
+            "%m/%d/%Y",           # 01/01/2024
+            "%d/%m/%Y",           # 01/01/2024 (European)
+            "%Y/%m/%d",           # 2024/01/01 (ISO-like)
+        ]
+
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+
+        # If no format matches, try ISO format
+        return datetime.fromisoformat(date_str.replace('Z', '+00:00').replace('+00:00', ''))
+
+    except Exception as e:
+        raise ValueError(f"Unable to parse date '{date_str}': {e}")
+
+
+def get_date_filter_bounds(params: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Get date filtering bounds from parameters."""
+    if not params.get("enable_date_filtering"):
+        return None, None
+
+    # Handle predefined ranges
+    date_range = params.get("date_range", "")
+    if date_range:
+        return parse_date_range(date_range)
+
+    # Handle custom date range
+    start_date = params.get("start_date", "")
+    end_date = params.get("end_date", "")
+
+    start_dt = parse_custom_date(start_date) if start_date else None
+    end_dt = parse_custom_date(end_date) if end_date else datetime.now()
+
+    return start_dt, end_dt
+
+
+def is_within_date_range(timestamp: str, start_dt: Optional[datetime], end_dt: Optional[datetime]) -> bool:
+    """Check if timestamp is within the specified date range."""
+    if not timestamp or not start_dt or not end_dt:
+        return True
+
+    try:
+        # Parse timestamp (usually ISO format)
+        if 'T' in timestamp:
+            item_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00').replace('+00:00', ''))
+        else:
+            # Handle relative timestamps like "2h", "1d ago"
+            return parse_relative_timestamp(timestamp, start_dt, end_dt)
+
+        # Remove timezone info for comparison - ensure all datetimes are timezone-naive
+        item_dt = item_dt.replace(tzinfo=None) if item_dt.tzinfo else item_dt
+        start_dt = start_dt.replace(tzinfo=None) if start_dt.tzinfo else start_dt
+        end_dt = end_dt.replace(tzinfo=None) if end_dt.tzinfo else end_dt
+
+        return start_dt <= item_dt <= end_dt
+
+    except Exception:
+        # If parsing fails, assume it's within range to avoid losing data
+        return True
+
+
+def parse_relative_timestamp(timestamp: str, start_dt: datetime, end_dt: datetime) -> bool:
+    """Parse relative timestamps like '2h', '3d ago', 'yesterday'."""
+    try:
+        timestamp = timestamp.lower().strip()
+        now = datetime.now()
+
+        if 'ago' in timestamp:
+            timestamp = timestamp.replace('ago', '').strip()
+
+        if timestamp == 'now' or timestamp == 'just now':
+            item_dt = now
+        elif 's' in timestamp:  # seconds
+            seconds = int(timestamp.replace('s', ''))
+            item_dt = now - timedelta(seconds=seconds)
+        elif 'm' in timestamp:  # minutes
+            minutes = int(timestamp.replace('m', ''))
+            item_dt = now - timedelta(minutes=minutes)
+        elif 'h' in timestamp:  # hours
+            hours = int(timestamp.replace('h', ''))
+            item_dt = now - timedelta(hours=hours)
+        elif 'd' in timestamp:  # days
+            days = int(timestamp.replace('d', ''))
+            item_dt = now - timedelta(days=days)
+        elif 'w' in timestamp:  # weeks
+            weeks = int(timestamp.replace('w', ''))
+            item_dt = now - timedelta(weeks=weeks)
+        else:
+            return True  # Can't parse, assume valid
+
+        return start_dt <= item_dt <= end_dt
+
+    except Exception:
+        return True
+
+
+def format_date(dt: datetime, format_str: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Format datetime object to string."""
+    return dt.strftime(format_str)
+
+
+def calculate_date_range_days(start_dt: datetime, end_dt: datetime) -> int:
+    """Calculate number of days between two dates."""
+    return (end_dt - start_dt).days
+
+
+def get_expected_data_reduction(date_range: str) -> str:
+    """Estimate expected data reduction for a given date range."""
+    if date_range in ["last_day", "today"]:
+        return "90-95%"
+    elif date_range in ["last_3_days", "last_week"]:
+        return "80-90%"
+    elif date_range == "last_2_weeks":
+        return "70-80%"
+    elif date_range == "last_month":
+        return "50-70%"
+    elif date_range == "last_3_months":
+        return "30-50%"
+    elif date_range == "last_6_months":
+        return "20-30%"
+    else:
+        return "varies"

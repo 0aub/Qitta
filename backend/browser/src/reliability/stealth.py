@@ -132,9 +132,9 @@ class StealthManager:
         # Rotate user agent if needed
         await self._rotate_user_agent_if_needed(context)
 
-        # Set realistic viewport
-        viewport = self._get_realistic_viewport()
-        await context.set_viewport_size(viewport["width"], viewport["height"])
+        # NOTE: Viewport must be set when creating context in Playwright, not after
+        # viewport = self._get_realistic_viewport()
+        # await context.set_viewport_size(viewport["width"], viewport["height"])
 
         # Basic headers
         await context.set_extra_http_headers({
@@ -273,10 +273,12 @@ class StealthManager:
                 all_agents = self.user_agent_pool.desktop_chrome
 
             self.current_user_agent = random.choice(all_agents)
-            await context.set_user_agent(self.current_user_agent)
+            # NOTE: Cannot change user agent on existing context in Playwright
+            # User agent must be set when creating the context
+            # await context.set_user_agent(self.current_user_agent)
             self.last_user_agent_change = now
 
-            self.logger.info(f"Rotated user agent: {self.current_user_agent[:50]}...")
+            self.logger.info(f"Selected user agent (for next context): {self.current_user_agent[:50]}...")
 
     def _get_realistic_viewport(self) -> Dict[str, int]:
         """Get realistic viewport dimensions."""

@@ -112,14 +112,22 @@ class ContainerBrowserRuntime:
         ]
 
         try:
+            # CRITICAL: Use headed mode to bypass Twitter bot detection
+            # WSL/Docker supports headed mode via X11 forwarding if DISPLAY is set
+            import os
+            # Check BROWSER_HEADLESS first (docker-compose), fallback to HEADLESS
+            headless_env = os.getenv('BROWSER_HEADLESS', os.getenv('HEADLESS', 'false'))
+            use_headless = headless_env.lower() == 'true'
+
             self.browser = await self._playwright.chromium.launch(
-                headless=True,  # Force headless in containers
+                headless=use_headless,  # Allow non-headless via env var
                 args=minimal_args,
-                timeout=60000,  # Reduced timeout
+                timeout=60000,
                 slow_mo=0,
                 devtools=False
             )
-            self._logger.info("✅ Container browser launched successfully")
+            mode = "headless" if use_headless else "headed"
+            self._logger.info(f"✅ Container browser launched successfully ({mode} mode)")
 
         except Exception as e:
             self._logger.error(f"❌ Container browser launch failed: {e}")

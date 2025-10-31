@@ -278,14 +278,16 @@ class ErrorHandler:
         """Log error with appropriate level."""
         log_message = f"[{error.category.value}] {error.message}"
 
+        # Don't use extra parameter - it causes "Attempt to overwrite 'message' in LogRecord" error
+        # Just log the formatted message instead
         if error.severity == ErrorSeverity.CRITICAL:
-            self.logger.critical(log_message, extra=error.to_dict())
+            self.logger.critical(log_message)
         elif error.severity == ErrorSeverity.HIGH:
-            self.logger.error(log_message, extra=error.to_dict())
+            self.logger.error(log_message)
         elif error.severity == ErrorSeverity.MEDIUM:
-            self.logger.warning(log_message, extra=error.to_dict())
+            self.logger.warning(log_message)
         else:
-            self.logger.info(log_message, extra=error.to_dict())
+            self.logger.info(log_message)
 
     def _update_error_stats(self, error: EnhancedError) -> None:
         """Update error statistics for pattern detection."""

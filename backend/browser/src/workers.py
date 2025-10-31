@@ -329,7 +329,11 @@ class Worker:
             # Phase 2.6: Execute with fallback support
             job_logger.info("⏳ WORKER: Executing task...")
             try:
-                if self.fallback_manager:
+                # HOTFIX: Disable fallback manager for Twitter to avoid caching/state issues
+                # Fallback manager has bugs with sequential jobs and aggressive caching
+                use_fallback = self.fallback_manager and circuit_breaker_name != "twitter_navigation"
+
+                if use_fallback:
                     job_logger.info("⏳ WORKER: Using fallback manager...")
                     # Prepare fallback data
                     fallback_data = {
@@ -579,10 +583,12 @@ class WorkerPool:
         task_registry: Dict[str, TaskFunc],
         data_root: str,
         logger: logging.Logger,
-        max_workers: int = 2
+        max_workers: int = 2,
+        browser_runtime = None  # Optional reference to BrowserRuntime for restart capability
     ):
         self.job_store = job_store
         self.browser = browser
+        self.browser_runtime = browser_runtime  # Store reference for browser restart
         self.task_registry = task_registry
         self.data_root = data_root
         self.logger = logger
@@ -623,7 +629,7 @@ class WorkerPool:
                 failure_threshold=3,      # Open after 3 failures
                 recovery_timeout=30.0,    # Try half-open after 30 seconds
                 success_threshold=2,      # Close after 2 successes
-                timeout=90.0             # 90 second timeout for Twitter navigation (content loading can be slow)
+                timeout=300.0            # 5 minute timeout for Twitter extraction (Levels 2-3 need more time for followers/following)
             )
         )
 
@@ -653,17 +659,18 @@ class WorkerPool:
 
     def _setup_fallback_strategies(self) -> None:
         """Configure fallback strategies for services."""
-        # Twitter fallback strategy - use cached responses
+        # Twitter fallback strategy - fail fast without caching
+        # Caching causes all jobs to return same result since cache key is service_name only
         twitter_fallback = FallbackConfig(
-            strategy=FallbackStrategy.CACHED_RESPONSE,
+            strategy=FallbackStrategy.FAIL_FAST,
             timeout_seconds=5.0,
-            cache_ttl_seconds=300.0,  # 5 minutes
+            cache_ttl_seconds=0,  # No caching to avoid wrong results
             mock_response_template={
-                "status": "degraded",
-                "message": "Twitter service is temporarily unavailable, using cached data",
+                "status": "failed",
+                "message": "Twitter service temporarily unavailable",
                 "data": [],
-                "cached": True,
-                "degraded": True
+                "cached": False,
+                "degraded": False
             }
         )
         self.fallback_manager.register_fallback("twitter_navigation", twitter_fallback)
@@ -834,7 +841,51 @@ class WorkerPool:
                 self.logger.error(f"Error in enhanced health monitor: {e}")
 
     async def _check_worker_health(self):
-        """Traditional worker health checks."""
+        """Traditional worker health checks with browser connection validation."""
+        # CRITICAL: Check if browser is still connected
+        if not self.browser.is_connected():
+            self.logger.error("🚨 CRITICAL: Browser disconnected! Attempting automatic browser restart...")
+
+            # Try to restart browser if we have access to browser_runtime
+            if self.browser_runtime:
+                try:
+                    # Stop all workers first
+                    self.logger.info("Stopping all workers for browser restart...")
+                    for worker in list(self._workers.values()):
+                        try:
+                            await worker.stop()
+                        except Exception as e:
+                            self.logger.warning(f"Error stopping worker during browser restart: {e}")
+                    self._workers.clear()
+
+                    # Restart browser
+                    self.logger.info("🔄 Restarting browser runtime...")
+                    await self.browser_runtime.stop()
+                    await self.browser_runtime.start()
+                    self.browser = self.browser_runtime.browser
+
+                    # Restart workers with new browser
+                    self.logger.info("🔄 Restarting workers with new browser...")
+                    for i in range(self.max_workers):
+                        await self._start_worker(f"worker-{i}")
+
+                    self.logger.info("✅ Browser and workers restarted successfully!")
+                    return
+
+                except Exception as e:
+                    self.logger.error(f"❌ Failed to restart browser: {e}")
+                    # Fallback: stop everything
+                    for worker in self._workers.values():
+                        worker._shutdown_event.set()
+                    return
+            else:
+                # No browser_runtime reference - cannot restart
+                self.logger.error("⚠️ Browser restart required but no browser_runtime reference available")
+                self.logger.error("⚠️ Stopping all workers - service restart required")
+                for worker in self._workers.values():
+                    worker._shutdown_event.set()
+                return
+
         # Check if we have the minimum number of workers
         if len(self._workers) < max(1, self.max_workers // 2):
             self.logger.warning(f"Worker count critically low: {len(self._workers)}")

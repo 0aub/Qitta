@@ -56,8 +56,8 @@ async def github(*, browser: Browser, params: Dict[str, Any], job_output_dir: st
     return await GithubTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
 
 @_registry.register("twitter")
-async def twitter(*, browser: Browser, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
-    return await TwitterTask.run(browser=browser, params=params, job_output_dir=job_output_dir, logger=logger)
+async def twitter(*, browser: Browser, context=None, params: Dict[str, Any], job_output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+    return await TwitterTask.run(browser=browser, context=context, params=params, job_output_dir=job_output_dir, logger=logger)
 
 # Exports for main.py
 task_registry = _registry.tasks

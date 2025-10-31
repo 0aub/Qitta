@@ -27,7 +27,7 @@ from typing import Any, Dict
 import os
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel
 from typing import List, Optional
@@ -514,6 +514,189 @@ async def delete_session(filename: str):
     except Exception as e:
         service_logger.error(f"Could not delete session: {e}")
         raise HTTPException(status_code=500, detail=f"Could not delete session: {str(e)}")
+
+
+# ----------------------------------------------------------------------------
+# Session Management Endpoints (Session-Only Mode)
+# ----------------------------------------------------------------------------
+
+class SessionUpdateRequest(BaseModel):
+    """Request to update a session with fresh cookies."""
+    session_name: str
+    cookies: Dict[str, str]
+
+class SessionValidateRequest(BaseModel):
+    """Request to validate a session."""
+    session_file: str
+
+@app.post("/sessions/validate")
+async def validate_session(body: SessionValidateRequest):
+    """Validate if a session is still valid and get expiry info."""
+    try:
+        import json
+        from datetime import datetime
+        import os
+
+        session_path = f"/sessions/{body.session_file}"
+
+        if not os.path.exists(session_path):
+            return {
+                "valid": False,
+                "error": "Session file not found",
+                "session_file": body.session_file
+            }
+
+        # Load session
+        with open(session_path, 'r') as f:
+            session_data = json.load(f)
+
+        cookies = session_data.get("cookies", {})
+        has_auth_token = bool(cookies.get("auth_token"))
+        has_ct0 = bool(cookies.get("ct0"))
+        has_twid = bool(cookies.get("twid"))
+
+        # Check expiration
+        expires_estimate = session_data.get("expires_estimate", 0)
+        current_time = datetime.now().timestamp()
+        is_expired = current_time > expires_estimate
+        time_remaining = max(0, expires_estimate - current_time)
+
+        # CloudFlare token check
+        has_cf_token = bool(cookies.get("__cf_bm"))
+
+        valid = has_auth_token and has_ct0 and has_twid and not is_expired
+
+        return {
+            "valid": valid,
+            "session_file": body.session_file,
+            "has_auth_token": has_auth_token,
+            "has_ct0": has_ct0,
+            "has_twid": has_twid,
+            "has_cloudflare_token": has_cf_token,
+            "is_expired": is_expired,
+            "time_remaining_seconds": int(time_remaining),
+            "time_remaining_hours": round(time_remaining / 3600, 2),
+            "captured_at": session_data.get("captured_at"),
+            "expires_estimate": expires_estimate
+        }
+
+    except Exception as e:
+        service_logger.error(f"Session validation failed: {e}")
+        return {
+            "valid": False,
+            "error": str(e),
+            "session_file": body.session_file
+        }
+
+@app.post("/sessions/update")
+async def update_session(body: SessionUpdateRequest):
+    """Update a session file with fresh cookies."""
+    try:
+        import json
+        from datetime import datetime
+
+        session_path = f"/sessions/{body.session_name}"
+
+        # Calculate expiry (Twitter sessions typically last 30 days)
+        current_time = datetime.now()
+        expires_estimate = (current_time.timestamp() + (30 * 24 * 3600))
+
+        session_data = {
+            "cookies": body.cookies,
+            "captured_at": current_time.isoformat(),
+            "expires_estimate": expires_estimate,
+            "updated_via_api": True
+        }
+
+        # Write session file
+        with open(session_path, 'w') as f:
+            json.dump(session_data, f, indent=2)
+
+        service_logger.info(f"✅ Session updated: {body.session_name}")
+
+        return {
+            "success": True,
+            "session_name": body.session_name,
+            "session_path": session_path,
+            "captured_at": session_data["captured_at"],
+            "expires_estimate": expires_estimate,
+            "cookies_updated": list(body.cookies.keys())
+        }
+
+    except Exception as e:
+        service_logger.error(f"Session update failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not update session: {str(e)}")
+
+@app.get("/sessions/status")
+async def get_sessions_status():
+    """Get status of all session files."""
+    try:
+        import json
+        from datetime import datetime
+        import os
+        import glob
+
+        session_files = glob.glob("/sessions/*.json")
+        sessions_status = []
+
+        for session_path in session_files:
+            try:
+                with open(session_path, 'r') as f:
+                    session_data = json.load(f)
+
+                cookies = session_data.get("cookies", {})
+                expires_estimate = session_data.get("expires_estimate", 0)
+                current_time = datetime.now().timestamp()
+                is_expired = current_time > expires_estimate
+                time_remaining = max(0, expires_estimate - current_time)
+
+                valid = (
+                    bool(cookies.get("auth_token")) and
+                    bool(cookies.get("ct0")) and
+                    bool(cookies.get("twid")) and
+                    not is_expired
+                )
+
+                sessions_status.append({
+                    "filename": os.path.basename(session_path),
+                    "valid": valid,
+                    "is_expired": is_expired,
+                    "time_remaining_hours": round(time_remaining / 3600, 2),
+                    "captured_at": session_data.get("captured_at"),
+                    "has_cloudflare_token": bool(cookies.get("__cf_bm"))
+                })
+            except Exception as e:
+                sessions_status.append({
+                    "filename": os.path.basename(session_path),
+                    "valid": False,
+                    "error": str(e)
+                })
+
+        valid_count = sum(1 for s in sessions_status if s.get("valid"))
+
+        return {
+            "total_sessions": len(sessions_status),
+            "valid_sessions": valid_count,
+            "invalid_sessions": len(sessions_status) - valid_count,
+            "sessions": sessions_status
+        }
+
+    except Exception as e:
+        service_logger.error(f"Could not get sessions status: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not get sessions status: {str(e)}")
+
+@app.get("/sessions/harvester", response_class=HTMLResponse)
+async def get_session_harvester():
+    """Serve the session harvester HTML page."""
+    try:
+        import os
+        html_path = os.path.join(os.path.dirname(__file__), "session_harvester_bookmarklet.html")
+        with open(html_path, 'r') as f:
+            html_content = f.read()
+        return HTMLResponse(content=html_content)
+    except Exception as e:
+        service_logger.error(f"Could not load session harvester: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not load session harvester: {str(e)}")
 
 
 # ----------------------------------------------------------------------------
@@ -1068,17 +1251,19 @@ async def on_startup() -> None:
             lambda: browser_runtime.browser.is_connected()
         )
 
-        # Reliable worker pool
+        # Reliable worker pool with automatic browser restart capability
         worker_pool = WorkerPool(
             job_store=job_store,
             browser=browser_runtime.browser,
             task_registry=task_registry,
             data_root=config.system.data_root,
             logger=service_logger,
-            max_workers=config.scaling.max_workers
+            max_workers=config.scaling.max_workers,
+            browser_runtime=browser_runtime  # Pass runtime for automatic browser restart
         )
         await worker_pool.start()
         service_logger.info(f"✅ Reliable worker pool started with {config.scaling.max_workers} workers")
+        service_logger.info("🔄 Automatic browser restart enabled")
 
         # Initialize batch manager for large-scale extractions
         batch_manager = BatchManager(

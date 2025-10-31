@@ -106,6 +106,7 @@ class SubmitRequest(BaseModel):
     timeout_seconds: int = 300  # 5 minutes default
     priority: int = 0  # Higher numbers = higher priority
     max_retries: int = 3
+    scrape_mode: str = "full"  # INCREMENTAL SCRAPING: "full" or "incremental"
 
     class Config:
         extra = "allow"

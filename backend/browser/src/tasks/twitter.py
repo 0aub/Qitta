@@ -61,6 +61,7 @@ import logging
 import asyncio
 import os
 import time
+import random
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Union
 import hashlib
@@ -78,6 +79,13 @@ from ..utils import (
     get_expected_data_reduction
 )
 from ..human_behavior import HumanBehavior
+from ..checkpoint_manager import CheckpointManager
+
+
+# Custom exception for session refresh requirement
+class SessionRefreshRequired(Exception):
+    """Raised when session is about to expire and needs refresh to continue extraction."""
+    pass
 
 
 # DEPRECATED: Kept for backward compatibility - use shared.metrics.calculate_extraction_success_rate
@@ -436,7 +444,11 @@ class TwitterTask:
             
             # Initialize scraper with assigned session and context from workers
             scraper = TwitterScraper(browser, logger, output_dir=job_output_dir, context=context)
-            
+
+            # INCREMENTAL SCRAPING: Store scrape_mode for use in extraction methods
+            scraper.current_scrape_mode = clean_params.get('scrape_mode', 'full')
+            logger.info(f"🎯 Scrape mode: {scraper.current_scrape_mode}")
+
             # Load the assigned session - validate it first before using
             session_valid = False
             if os.path.exists(session_file):
@@ -459,16 +471,30 @@ class TwitterTask:
                 except Exception as e:
                     logger.warning(f"⚠️ Session validation failed: {e}")
 
-            if session_valid and clean_params.get("use_session", True):
+            # SESSION-ONLY MODE: Only use sessions, never credential-based auth
+            # This avoids bot detection from automated login
+            if session_valid:
                 logger.info(f"🍪 Using session for authentication: {session_file}")
                 logger.info("⏳ STEP 1/5: Loading session cookies...")
                 await scraper.load_session(session_file)
                 logger.info("✅ STEP 1/5: Session loaded successfully")
             else:
-                logger.info("🔐 Using credential-based authentication...")
-                logger.info("⏳ STEP 1/5: Starting authentication...")
-                await scraper.authenticate()
-                logger.info("✅ STEP 1/5: Authentication completed")
+                # Session is invalid or expired - reject the job
+                error_msg = f"""
+❌ SESSION-ONLY MODE: Session is invalid or expired
+
+To fix this, provide fresh cookies:
+
+1. Open http://localhost:8004/sessions/harvester in your browser
+2. Follow the instructions to harvest cookies from x.com
+3. Upload the cookies using the web interface
+4. Retry this job
+
+Session file: {session_file}
+Alternative: Use the API endpoint POST /sessions/update with fresh cookies
+"""
+                logger.error(error_msg)
+                raise Exception("Session invalid or expired. Session-only mode requires valid cookies. Use /sessions/harvester to update.")
             
             # Add the corrected parameters to clean_params (FIXED ROUTING)
             # Only set target_username for user scraping, not search operations
@@ -698,7 +724,7 @@ class TwitterTask:
                         'scrape_following': clean_params.get('scrape_following', False),
                         'max_following': min(clean_params.get('max_following', 10), 10),  # Max 10 for level 2
                         'scrape_reposts': False,
-                        'max_posts': min(clean_params.get('max_posts', 10), 15),  # Limit posts for level 2
+                        'max_posts': clean_params.get('max_posts', 10),  # FIXED: Respect user's max_posts for large-scale extraction
                         # Post-level engagement (optional, user-controlled)
                         'scrape_post_likers': clean_params.get('scrape_post_likers', False),
                         'max_likers_per_post': clean_params.get('max_likers_per_post', 20),
@@ -746,20 +772,10 @@ class TwitterTask:
                 logger.info(f"🎯 Scraped: {', '.join(scrape_options) if scrape_options else 'Posts only'}")
                 
             else:
-                # Legacy mode - basic extraction by level
-                logger.info(f"🔄 LEGACY MODE: Level {scrape_level}")
-                if scrape_level >= 4:
-                    results = await scraper.scrape_level_4(clean_params)
-                    extraction_method = "level_4_comprehensive"
-                elif scrape_level >= 3:
-                    results = await scraper.scrape_level_3(clean_params)
-                    extraction_method = "level_3_with_media"
-                elif scrape_level >= 2:
-                    results = await scraper.scrape_level_2(clean_params)
-                    extraction_method = "level_2_full_profile"
-                else:
-                    results = await scraper.scrape_level_1(clean_params)
-                    extraction_method = "level_1_basic"
+                # Use comprehensive scraper for all levels (legacy methods deprecated)
+                logger.info(f"🚀 COMPREHENSIVE MODE: Level {scrape_level}")
+                results = await scraper.scrape_user_comprehensive(clean_params)
+                extraction_method = "comprehensive_user_scraping"
             
             # Calculate metrics - FIXED to reflect actual data quality with error handling
             try:
@@ -791,6 +807,22 @@ class TwitterTask:
             
             # Prepare result structure with safe data handling
             safe_results = results if isinstance(results, (list, tuple)) else []
+
+            # Fix: For comprehensive scraping, extract the actual data dict
+            # Comprehensive scraper returns [user_data_dict] where user_data_dict has keys like 'posts', 'followers', etc.
+            if len(safe_results) == 1 and isinstance(safe_results[0], dict):
+                # Check if it's the comprehensive scraper format (has posts/followers/etc keys)
+                first_item = safe_results[0]
+                if any(key in first_item for key in ['posts', 'followers', 'following', 'likes', 'mentions', 'reposts']):
+                    # Comprehensive scraping format - extract the dict directly
+                    result_data = first_item
+                else:
+                    # Legacy format - wrap in items
+                    result_data = {"items": safe_results}
+            else:
+                # Legacy mode returns list of items directly
+                result_data = {"items": safe_results}
+
             result = {
                 "status": "success",
                 "search_metadata": {
@@ -801,7 +833,7 @@ class TwitterTask:
                     "success_rate": success_rate,
                     "search_completed_at": datetime.now().isoformat()
                 },
-                "data": safe_results,
+                "data": result_data,
                 # PHASE 4.2: Performance and Anti-Detection Metrics
                 "performance_metrics": scraper._get_performance_metrics() if 'scraper' in locals() else {}
             }
@@ -831,7 +863,18 @@ class TwitterTask:
                     logger.info(f"💾 Phase 4.1: Exported data to: {exported_files}")
                 except Exception as e:
                     logger.error(f"❌ Failed to save output: {e}")
-            
+
+            # INCREMENTAL SCRAPING: Save checkpoint for future scrapes
+            if result_data and result_data.get('posts') and len(result_data['posts']) > 0:
+                try:
+                    username = clean_params.get('username') or clean_params.get('target_username')
+                    if username:
+                        scraper.checkpoint_manager.save_checkpoint(username, result_data['posts'])
+                        logger.info(f"✅ Checkpoint saved for @{username} ({len(result_data['posts'])} posts)")
+                except Exception as checkpoint_error:
+                    logger.warning(f"⚠️ Checkpoint save failed: {checkpoint_error}")
+                    # Don't fail the job if checkpoint save fails
+
             return result
             
         except Exception as e:
@@ -898,7 +941,7 @@ class TwitterTask:
             
             # User account scraping parameters - FIXED PARAMETER MAPPING
             "scrape_posts": params.get("scrape_posts", params.get("enable_posts", True)),
-            "max_posts": min(params.get("max_posts", params.get("posts_count", 100)), 500),
+            "max_posts": params.get("max_posts", params.get("posts_count", 100)),  # FIXED: Allow large-scale extraction (no cap)
             "scrape_likes": params.get("scrape_likes", params.get("enable_likes", False)),
             "max_likes": min(params.get("max_likes", params.get("likes_count", 50)), 200),
             "scrape_mentions": params.get("scrape_mentions", params.get("enable_mentions", False)),
@@ -933,6 +976,9 @@ class TwitterTask:
             "include_retweets": params.get("include_retweets", True),
             "use_session": params.get("use_session", False),
             "session_file": params.get("session_file", "/sessions/twitter_session.json"),
+
+            # INCREMENTAL SCRAPING: scrape_mode parameter
+            "scrape_mode": params.get("scrape_mode", "full"),  # "full" or "incremental"
         }
 
 
@@ -2016,6 +2062,7 @@ class TwitterScraper:
         self.logger = logger
         self.output_dir = output_dir
         self.context = context  # Use context from workers if provided
+        self.context_is_shared = context is not None  # Track if context is shared from workers
         self.page = None
         self.date_filter_start = None
         self.date_filter_end = None
@@ -2027,6 +2074,51 @@ class TwitterScraper:
         self.email = os.getenv('X_EMAIL', '')
         self.username = os.getenv('X_USERNAME', '')
         self.password = os.getenv('X_PASS', '')
+
+        # ENHANCED: Authentication resilience features
+        self.auth_attempts = 0
+        self.max_auth_attempts = 3
+        self.session_health_score = 100
+        self.last_auth_check = None
+        self.auth_failures = []
+        self.rate_limit_detected = False
+        self.blocked_detected = False
+
+        # ENHANCED: Backup authentication methods
+        self.backup_credentials = {}
+        self.current_credential_set = 0
+
+        # ENHANCED: Session persistence and recovery
+        self.session_file = "/sessions/twitter_session.json"
+        self.session_backup_file = "/sessions/twitter_session_backup.json"
+
+        # AUTO-REFRESH: Session monitoring for long-running jobs
+        self.session_start_time = None
+        self.session_refresh_threshold = 1200  # 20 minutes (before 30-min expiration)
+        self.last_session_check = None
+        self.auto_refresh_enabled = True
+        self.session_refresh_count = 0
+
+        # PHASE 4.2: Performance and Anti-Detection Optimizations
+        self.performance_mode = True
+        self.anti_detection_enabled = True
+        self.request_cache = {}
+        self.timing_variance = 0.5  # Human-like timing variation
+        self.extraction_stats = {
+            'requests_made': 0,
+            'cache_hits': 0,
+            'extraction_time': 0,
+            'anti_detection_actions': 0
+        }
+
+        # RANDOMIZATION: Human-like extraction patterns
+        self.actions_performed = 0  # Track actions for break timing
+        self.last_break_time = None
+        self.randomize_extraction = True  # Enable randomized patterns
+
+        # INCREMENTAL SCRAPING: Checkpoint manager for tracking last scraped posts
+        self.checkpoint_manager = CheckpointManager()
+        self.logger.info("📦 Checkpoint manager initialized for incremental scraping")
 
     async def _with_timeout(self, operation, timeout_ms=10000, operation_name="operation", default=None):
         """Wrapper to add timeout to async operations with graceful fallback."""
@@ -2141,40 +2233,6 @@ class TwitterScraper:
             self.logger.error(f"❌ Simple extraction failed: {e}")
             self.logger.info(f"⚠️ Returning {len(posts)} partial results")
             return posts
-
-        # ENHANCED: Authentication resilience features
-        self.auth_attempts = 0
-        self.max_auth_attempts = 3
-        self.session_health_score = 100
-        self.last_auth_check = None
-        self.auth_failures = []
-        self.rate_limit_detected = False
-        self.blocked_detected = False
-
-        # ENHANCED: Backup authentication methods
-        self.backup_credentials = self._load_backup_credentials()
-        self.current_credential_set = 0
-
-        # ENHANCED: Session persistence and recovery
-        self.session_file = f"/sessions/twitter_session_{hash(self.username)}.json"
-        self.session_backup_file = f"/sessions/twitter_session_backup_{hash(self.username)}.json"
-
-        # PHASE 4.2: Performance and Anti-Detection Optimizations
-        self.performance_mode = True
-        self.anti_detection_enabled = True
-        self.request_cache = {}
-        self.timing_variance = 0.5  # Human-like timing variation
-        self.extraction_stats = {
-            'requests_made': 0,
-            'cache_hits': 0,
-            'extraction_time': 0,
-            'anti_detection_actions': 0
-        }
-
-        # Only require credentials if not using session
-        # (session loading will bypass credential authentication)
-        if not all([self.email, self.username, self.password]):
-            self.logger.warning("⚠️ Twitter credentials not found - session mode required")
     
     def setup_date_filtering(self, params: Dict[str, Any]):
         """Initialize date filtering based on parameters."""
@@ -4549,9 +4607,22 @@ class TwitterScraper:
             last_progress_log = 0
 
             while scroll_attempt < max_scrolls:
+                # AUTO-REFRESH: Monitor session and refresh if needed (every ~60 seconds)
+                if scroll_attempt % 20 == 0:  # Check every 20 scrolls
+                    await self._monitor_and_refresh_session()
+
                 # Memory management every 50 scrolls
                 if extraction_state['memory_cleanup_counter'] % 50 == 0:
                     await self._cleanup_browser_memory()
+
+                # OPTIMIZED HUMAN BEHAVIOR: Less frequent breaks for large-scale extraction
+                self.actions_performed += 1
+                # Take breaks every 50 actions (doubled from 25) with shorter duration
+                if HumanBehavior.should_take_break(self.actions_performed, threshold=50):
+                    self.logger.info(f"😴 Taking human-like break after {self.actions_performed} actions...")
+                    await HumanBehavior.take_human_break(self.page, duration_seconds=random.uniform(3, 6))  # Reduced from 8-15s
+                    self.actions_performed = 0  # Reset counter
+                    self.last_break_time = time.time()
 
                 # Perform scroll with performance tracking
                 scroll_start = time.time()
@@ -4713,23 +4784,39 @@ class TwitterScraper:
             tweet_elements = self.page.locator('article[data-testid="tweet"]')
             count = await tweet_elements.count()
 
+            # RANDOMIZATION: Don't always extract in sequential order - humans jump around
+            max_to_check = min(count, 20)
+            if self.randomize_extraction and max_to_check > 5:
+                # Create randomized index list (visit tweets in random order)
+                indices = list(range(max_to_check))
+                random.shuffle(indices)
+                self.logger.debug(f"🔀 Randomized extraction order: checking {len(indices)} tweets")
+            else:
+                indices = list(range(max_to_check))
+
             # Only check visible tweets to avoid processing entire DOM
-            for i in range(min(count, 20)):  # Limit to recent tweets in viewport
+            for i in indices:
                 try:
                     element = tweet_elements.nth(i)
                     if await element.is_visible():
-                        # HUMAN BEHAVIOR: Simulate reading the tweet before extracting
-                        if i % 3 == 0:  # Every 3rd tweet, add reading delay
-                            await HumanBehavior.random_delay(300, 800)
+                        # OPTIMIZED HUMAN BEHAVIOR: Reduced delays for large-scale extraction
+                        # Only add delays occasionally (10% chance) instead of every 3rd tweet
+                        if random.random() < 0.1:
+                            await HumanBehavior.random_delay(100, 300)  # Reduced from 300-800ms
 
                         tweet_data = await self._extract_tweet_from_element(element, i, username, include_engagement=True)
                         if tweet_data and tweet_data.get('text'):
                             tweets.append(tweet_data)
 
-                            # HUMAN BEHAVIOR: Simulate reading time based on text length
+                            # OPTIMIZED: Only add reading delay for very long tweets (5% chance)
                             text_length = len(tweet_data.get('text', ''))
-                            if text_length > 100:  # Longer tweets get more reading time
-                                await HumanBehavior.reading_delay(text_length, wpm=250)
+                            if text_length > 200 and random.random() < 0.05:
+                                await HumanBehavior.reading_delay(text_length, wpm=400)  # Faster reading
+
+                        # OPTIMIZED: Reduced mouse movement frequency
+                        if random.random() < 0.05:  # 5% chance (down from 15%)
+                            await HumanBehavior.random_mouse_movements(self.page, count=1)
+
                 except Exception:
                     continue  # Skip problematic elements
 
@@ -6612,6 +6699,17 @@ class TwitterScraper:
         # Initialize date filtering
         self.setup_date_filtering(params)
 
+        # INCREMENTAL SCRAPING: Load checkpoint if in incremental mode
+        self.checkpoint_post_id = None
+        scrape_mode = getattr(self, 'current_scrape_mode', 'full')
+        if scrape_mode == 'incremental':
+            checkpoint = self.checkpoint_manager.load_checkpoint(username)
+            if checkpoint:
+                self.checkpoint_post_id = checkpoint.get('last_scraped_post_id')
+                self.logger.info(f"🔄 INCREMENTAL MODE: Will stop at post ID {self.checkpoint_post_id}")
+            else:
+                self.logger.info(f"🔄 INCREMENTAL MODE: No checkpoint found - will scrape all posts")
+
         self.logger.info(f"👤 Starting comprehensive user scraping for @{username}")
         # DEBUG: Log received params
         self.logger.info(f"🔍 DEBUG RECEIVED PARAMS: scrape_likes={params.get('scrape_likes')}, scrape_mentions={params.get('scrape_mentions')}, scrape_reposts={params.get('scrape_reposts')}")
@@ -6800,6 +6898,22 @@ class TwitterScraper:
                     else:
                         # For lower levels: Use standard extraction
                         posts = await self._scrape_user_posts(username, max_posts)
+
+                    # INCREMENTAL SCRAPING: Filter posts based on checkpoint
+                    if posts and self.checkpoint_post_id:
+                        original_count = len(posts)
+                        # Keep only posts that come BEFORE (are newer than) the checkpoint post
+                        filtered_posts = []
+                        for post in posts:
+                            post_id = post.get('id') or post.get('post_id')
+                            if post_id == self.checkpoint_post_id:
+                                # Hit the checkpoint - stop here
+                                self.logger.info(f"🔄 INCREMENTAL MODE: Reached checkpoint post {post_id} - stopping")
+                                break
+                            filtered_posts.append(post)
+                        posts = filtered_posts
+                        self.logger.info(f"🔄 INCREMENTAL MODE: Filtered {original_count} → {len(posts)} posts (stopped at checkpoint)")
+
                     results["posts"] = posts if posts else []
                     self.logger.info(f"✅ Posts extracted: {len(posts) if posts else 0} posts")
 
@@ -7247,10 +7361,13 @@ class TwitterScraper:
                         self.logger.debug(f"🧹 Closed page: {page.url}")
                     except Exception as page_error:
                         self.logger.warning(f"⚠️ Failed to close page: {page_error}")
-                
-                # Close the browser context
-                await self.context.close()
-                self.logger.info("🧹 Browser context closed successfully")
+
+                # CRITICAL FIX: Only close context if WE created it, not if it was shared from workers
+                if not self.context_is_shared:
+                    await self.context.close()
+                    self.logger.info("🧹 Browser context closed successfully")
+                else:
+                    self.logger.info("🧹 Browser context kept open (shared from workers)")
                 
             # Clear internal references
             self.context = None
@@ -9203,6 +9320,11 @@ class TwitterScraper:
             
             self.logger.info(f"📅 Session captured: {session_data.get('captured_at', 'unknown')}")
 
+            # AUTO-REFRESH: Track session start time for monitoring
+            self.session_start_time = time.time()
+            self.last_session_check = self.session_start_time
+            self.logger.info(f"⏱️ Session monitoring started (will auto-refresh after {self.session_refresh_threshold}s)")
+
             # Use context from workers if provided, otherwise create one
             if self.context is None:
                 self.logger.info("⏳ Step 1c/5: Creating browser context with mobile user agent...")
@@ -9362,6 +9484,86 @@ class TwitterScraper:
             self.logger.error(f"❌ Session refresh failed: {refresh_error}")
             return False
     
+    async def _monitor_and_refresh_session(self) -> bool:
+        """Monitor session age and proactively refresh if needed during long extractions."""
+        if not self.auto_refresh_enabled or not self.session_start_time:
+            return True
+
+        try:
+            current_time = time.time()
+            session_age = current_time - self.session_start_time
+
+            # Check every 60 seconds (don't check too frequently)
+            if self.last_session_check and (current_time - self.last_session_check) < 60:
+                return True
+
+            self.last_session_check = current_time
+
+            # If session is approaching expiration (20 minutes), refresh it
+            if session_age >= self.session_refresh_threshold:
+                self.logger.warning(f"⏰ Session age: {session_age/60:.1f} minutes - Auto-refresh triggered!")
+
+                # Get fresh cookies from current browsing context
+                try:
+                    fresh_cookies = await self.context.cookies()
+                    if fresh_cookies:
+                        updated_cookies = {}
+                        for cookie in fresh_cookies:
+                            updated_cookies[cookie['name']] = cookie['value']
+
+                        # If we got fresh auth_token, save it
+                        if updated_cookies.get('auth_token'):
+                            session_file = "/sessions/twitter_session.json"
+                            with open(session_file, 'r') as f:
+                                old_session = json.load(f)
+
+                            # Update session with fresh cookies
+                            refreshed_session = {
+                                "cookies": updated_cookies,
+                                "captured_at": datetime.now().isoformat(),
+                                "captured_at_timestamp": datetime.now().timestamp(),
+                                "expires_estimate": datetime.now().timestamp() + (25 * 24 * 60 * 60),
+                                "refresh_count": old_session.get("refresh_count", 0) + 1,
+                                "last_refresh": datetime.now().isoformat(),
+                                "username": old_session.get("username", ""),
+                                "email": old_session.get("email", "")
+                            }
+
+                            # Backup old session
+                            backup_file = f"/sessions/twitter_session_auto_backup_{int(time.time())}.json"
+                            with open(backup_file, 'w') as f:
+                                json.dump(old_session, f, indent=2)
+
+                            # Save refreshed session
+                            with open(session_file, 'w') as f:
+                                json.dump(refreshed_session, f, indent=2)
+
+                            # Reset timer
+                            self.session_start_time = current_time
+                            self.session_refresh_count += 1
+
+                            self.logger.info(f"✅ AUTO-REFRESH #{self.session_refresh_count}: Session refreshed successfully!")
+                            self.logger.info(f"🔄 Fresh cookies saved, timer reset, continuing extraction...")
+                            return True
+
+                except Exception as refresh_error:
+                    self.logger.error(f"❌ Auto-refresh failed: {refresh_error}")
+                    self.logger.warning("⚠️ Continuing with existing session...")
+                    # Reset timer anyway to avoid constant refresh attempts
+                    self.session_start_time = current_time
+                    return False
+
+            # Session is still fresh
+            remaining_time = self.session_refresh_threshold - session_age
+            if session_age > 600:  # Log status after 10 minutes
+                self.logger.info(f"⏱️ Session health check: {session_age/60:.1f}min elapsed, {remaining_time/60:.1f}min until refresh")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Session monitoring error: {e}")
+            return True  # Don't block extraction on monitoring errors
+
     async def _check_session_health(self) -> dict:
         """Check the current health status of the session."""
         health_status = {
@@ -9414,50 +9616,101 @@ class TwitterScraper:
         return health_status
     
     async def _extract_high_volume_posts(self, username: str, max_posts: int) -> List[Dict[str, Any]]:
-        """Advanced high-volume tweet extraction using multiple strategies."""
+        """Advanced high-volume tweet extraction using multiple strategies with session refresh checkpoints."""
         all_posts = []
-        
+        checkpoint_file = f"/tmp/checkpoint_{username}_{max_posts}.json"
+
+        # CHECKPOINT SYSTEM: Load progress if resuming from previous session
+        checkpoint_data = await self._load_checkpoint(checkpoint_file)
+        if checkpoint_data:
+            all_posts = checkpoint_data.get('posts', [])
+            completed_strategies = checkpoint_data.get('completed_strategies', [])
+            session_count = checkpoint_data.get('session_count', 1)
+            self.logger.info(f"📦 RESUMING FROM CHECKPOINT: {len(all_posts)} posts already extracted")
+            self.logger.info(f"📊 Completed strategies: {completed_strategies}")
+            self.logger.info(f"🔄 Session #{session_count + 1}")
+        else:
+            completed_strategies = []
+            session_count = 1
+            self.logger.info(f"🆕 STARTING FRESH EXTRACTION")
+
         try:
             self.logger.info(f"🚀 HIGH-VOLUME EXTRACTION: Targeting {max_posts} posts for @{username}")
-            self.logger.info(f"🎯 HIGH-VOLUME METHOD CALLED: This confirms the strategy is activating!")
-            
+            self.logger.info(f"🎯 SESSION-AWARE MODE: Will checkpoint every 20 minutes for session refresh")
+
             # Strategy 1: Multiple time-based approaches
             extraction_strategies = [
                 self._extract_recent_posts,      # Latest posts
-                self._extract_popular_posts,     # Popular/top posts  
+                self._extract_popular_posts,     # Popular/top posts
                 self._extract_media_posts,       # Posts with media
-                self._extract_replies_posts      # Posts with replies
+                # self._extract_replies_posts    # DISABLED: Strategy 4 has bugs causing crashes
             ]
-            
+
             posts_per_strategy = max_posts // len(extraction_strategies)
-            remaining_posts = max_posts
-            
+            remaining_posts = max_posts - len(all_posts)
+
+            extraction_start_time = time.time()
+
             for strategy_index, strategy in enumerate(extraction_strategies):
+                strategy_name = strategy.__name__.replace('_extract_', '').replace('_posts', '')
+
+                # Skip already completed strategies
+                if strategy_name in completed_strategies:
+                    self.logger.info(f"⏭️ Skipping {strategy_name} (already completed in previous session)")
+                    continue
+
                 if remaining_posts <= 0:
                     break
-                    
+
+                # SESSION EXPIRATION CHECK: Pause if approaching 25-minute mark
+                elapsed_time = time.time() - extraction_start_time
+                if elapsed_time > 1500:  # 25 minutes
+                    self.logger.warning(f"⏰ SESSION EXPIRING SOON: Saving checkpoint at {len(all_posts)} posts")
+                    await self._save_checkpoint(checkpoint_file, {
+                        'posts': all_posts,
+                        'completed_strategies': completed_strategies,
+                        'session_count': session_count,
+                        'target': max_posts,
+                        'remaining': remaining_posts,
+                        'timestamp': time.time()
+                    })
+                    raise SessionRefreshRequired(
+                        f"Session refresh needed. Progress saved: {len(all_posts)}/{max_posts} posts. "
+                        f"Provide fresh cookies and resume job."
+                    )
+
                 target_count = min(posts_per_strategy, remaining_posts)
-                strategy_name = strategy.__name__.replace('_extract_', '').replace('_posts', '')
-                
+
                 self.logger.info(f"📋 Strategy {strategy_index + 1}/{len(extraction_strategies)}: {strategy_name} (target: {target_count})")
-                
+
                 try:
                     strategy_posts = await strategy(username, target_count)
-                    
+
                     # Deduplicate posts
                     new_posts = []
                     existing_texts = {post.get('text', '') for post in all_posts}
-                    
+
                     for post in strategy_posts:
                         if post.get('text', '') not in existing_texts:
                             new_posts.append(post)
                             existing_texts.add(post.get('text', ''))
-                    
+
                     all_posts.extend(new_posts)
                     remaining_posts -= len(new_posts)
-                    
+                    completed_strategies.append(strategy_name)
+
                     self.logger.info(f"✅ Strategy {strategy_name}: {len(new_posts)} unique posts added (total: {len(all_posts)})")
-                    
+
+                    # Save checkpoint after each strategy
+                    await self._save_checkpoint(checkpoint_file, {
+                        'posts': all_posts,
+                        'completed_strategies': completed_strategies,
+                        'session_count': session_count,
+                        'target': max_posts,
+                        'remaining': remaining_posts,
+                        'timestamp': time.time()
+                    })
+
                     # Brief pause between strategies
                     await self._human_delay(2, 4)
                     
@@ -9484,7 +9737,7 @@ class TwitterScraper:
             
             # Enhanced scrolling with longer persistence
             scroll_attempts = 0
-            max_scrolls = min(50, target_count // 2)  # Up to 50 scroll attempts
+            max_scrolls = min(200, target_count // 2)  # Up to 200 scroll attempts for large extractions
             consecutive_empty = 0
             
             while len(posts) < target_count and scroll_attempts < max_scrolls and consecutive_empty < 5:
@@ -9545,7 +9798,7 @@ class TwitterScraper:
             await self._human_delay(3, 5)
             
             # Extract using similar method but with search results
-            for scroll in range(min(20, target_count // 3)):
+            for scroll in range(min(100, target_count // 3)):  # Increased from 20 to 100 for large extractions
                 div_texts = await self.page.locator('div').all_inner_texts()
                 
                 for div_text in div_texts:
@@ -9591,7 +9844,7 @@ class TwitterScraper:
             await self._human_delay(3, 5)
             
             # Extract media posts
-            for scroll in range(min(15, target_count // 4)):
+            for scroll in range(min(75, target_count // 4)):  # Increased from 15 to 75 for large extractions
                 div_texts = await self.page.locator('div').all_inner_texts()
                 
                 for div_text in div_texts:

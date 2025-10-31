@@ -520,3 +520,185 @@ class ObservabilityManager:
             "logger_name": self.logger.name,
             "timestamp": datetime.utcnow().isoformat()
         }
+
+
+# ========================================================================
+# DATA EXTRACTION QUALITY METRICS
+# ========================================================================
+# Functions for calculating extraction success rates and data quality
+# Used across scrapers (Twitter, Airbnb, Booking, etc.)
+
+from typing import Union
+
+def calculate_extraction_success_rate(
+    results: Union[List[Dict[str, Any]], bool, None],
+    params: Dict[str, Any],
+    method: str
+) -> float:
+    """
+    Calculate realistic success rate based on actual data quality.
+
+    Args:
+        results: Extraction results (list of items or boolean)
+        params: Extraction parameters
+        method: Extraction method used
+
+    Returns:
+        Success rate as float between 0.0 and 1.0
+    """
+    # CRITICAL FIX: Type validation first to prevent "object of type 'bool' has no len()" error
+    if not isinstance(results, (list, tuple)):
+        return 0.0
+
+    if not results:
+        return 0.0
+
+    # For comprehensive scraping (e.g., user profile with posts)
+    if method == "comprehensive_user_scraping" and len(results) == 1:
+        result = results[0]
+
+        # Count successful data extractions
+        success_points = 0
+        total_points = 0
+
+        # Profile data (20 points possible)
+        profile = result.get('profile', {})
+        if profile.get('display_name'):
+            success_points += 5
+        if profile.get('username'):
+            success_points += 3
+        if profile.get('bio'):
+            success_points += 4
+        if profile.get('followers_count'):
+            success_points += 4
+        if profile.get('following_count'):
+            success_points += 2
+        if profile.get('posts_count'):
+            success_points += 2
+        total_points += 20
+
+        # Posts data (40 points possible) - ENHANCED FOR VALIDATION
+        posts = result.get('posts', [])
+        if posts:
+            requested_posts = params.get('max_posts', 10)
+            posts_extracted = len(posts)
+            posts_with_dates = len([p for p in posts if p.get('date') or p.get('timestamp')])
+            posts_with_engagement = len([p for p in posts if p.get('likes') or p.get('retweets')])
+
+            # Count validation-verified posts for data integrity
+            validated_posts = len([p for p in posts if p.get('validation_method') or p.get('validation_confidence')])
+            high_confidence_posts = len([p for p in posts if p.get('validation_confidence') in ['high', 'verified']])
+
+            # Check for authorship accuracy
+            correct_author_posts = len([p for p in posts if p.get('author') == params.get('username', '')])
+            posts_with_text = len([p for p in posts if p.get('text') and len(p.get('text', '')) > 10])
+
+            # Posts quantity (10 points) - EVERYTHING MODE ADJUSTMENT
+            if posts_extracted >= 50:  # EVERYTHING mode likely achieved
+                quantity_score = 10  # Maximum points for high extraction
+            elif posts_extracted >= requested_posts:
+                quantity_score = 10  # Full points if met or exceeded request
+            else:
+                quantity_score = min(10, (posts_extracted / max(requested_posts, 1)) * 10)
+            success_points += quantity_score
+
+            # Posts quality (30 points) - ENHANCED WITH VALIDATION METRICS
+            if posts_extracted > 0:
+                success_points += (posts_with_text / posts_extracted) * 10  # Text quality
+                success_points += (posts_with_dates / posts_extracted) * 5   # Date presence
+                success_points += (posts_with_engagement / posts_extracted) * 3  # Engagement metrics
+
+                # VALIDATION QUALITY METRICS (12 points)
+                if validated_posts > 0:
+                    success_points += (validated_posts / posts_extracted) * 7  # Validation coverage
+                    success_points += (high_confidence_posts / posts_extracted) * 5  # High confidence
+
+                # AUTHORSHIP ACCURACY (Critical for data integrity)
+                authorship_accuracy = correct_author_posts / posts_extracted
+                if authorship_accuracy >= 0.9:  # 90%+ accuracy
+                    success_points += 10  # Bonus for high accuracy
+                elif authorship_accuracy >= 0.7:  # 70%+ accuracy
+                    success_points += 7
+                elif authorship_accuracy >= 0.5:  # 50%+ accuracy
+                    success_points += 4
+                else:
+                    # Heavy penalty for poor authorship accuracy
+                    success_points = max(0, success_points - 15)
+
+        total_points += 40
+
+        # Other data types (40 points possible)
+        for data_type, weight in [('likes', 10), ('mentions', 8), ('reposts', 9), ('media', 8), ('followers', 7), ('following', 7)]:
+            if params.get(f'scrape_{data_type}', False):
+                data_list = result.get(data_type, [])
+                requested = params.get(f'max_{data_type}', 10)
+                if data_list and len(data_list) > 0:
+                    success_points += min(weight, (len(data_list) / max(requested, 1)) * weight)
+            total_points += weight
+
+        return (success_points / total_points) if total_points > 0 else 0.0
+
+    # For simple list-based extraction methods
+    else:
+        max_requested = params.get('max_posts', params.get('max_results', 10))
+        return len(results) / max(max_requested, 1) if max_requested > 0 else 0.0
+
+
+def calculate_data_completeness(data: Dict[str, Any], required_fields: List[str]) -> float:
+    """
+    Calculate completeness score based on required fields.
+
+    Args:
+        data: Data dictionary to check
+        required_fields: List of required field names
+
+    Returns:
+        Completeness score as float between 0.0 and 1.0
+    """
+    if not required_fields:
+        return 1.0
+
+    present_fields = sum(1 for field in required_fields if data.get(field))
+    return present_fields / len(required_fields)
+
+
+def calculate_batch_success_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Calculate comprehensive success metrics for batch operations.
+
+    Args:
+        results: List of batch job results
+
+    Returns:
+        Dictionary with success metrics
+    """
+    total_jobs = len(results)
+    if total_jobs == 0:
+        return {
+            'total_jobs': 0,
+            'successful_jobs': 0,
+            'failed_jobs': 0,
+            'success_rate': 0.0,
+            'average_extraction_count': 0,
+            'total_items_extracted': 0
+        }
+
+    successful_jobs = sum(1 for r in results if r.get('status') == 'success')
+    failed_jobs = total_jobs - successful_jobs
+
+    # Count total items extracted
+    total_items = 0
+    for r in results:
+        if isinstance(r.get('data'), list):
+            total_items += len(r['data'])
+        elif r.get('posts'):
+            total_items += len(r['posts'])
+
+    return {
+        'total_jobs': total_jobs,
+        'successful_jobs': successful_jobs,
+        'failed_jobs': failed_jobs,
+        'success_rate': successful_jobs / total_jobs,
+        'average_extraction_count': total_items / max(total_jobs, 1),
+        'total_items_extracted': total_items
+    }
