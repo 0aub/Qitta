@@ -103,7 +103,11 @@ class BookingTask:
             # Save output if requested
             if job_output_dir and hotels:
                 BookingTask._save_output(result, job_output_dir, logger)
-            
+
+                # Apply RAG enhancements (post-processing)
+                logger.info("📊 Applying RAG optimizations...")
+                result = BookingRAGEnhancer.enhance_for_rag(result, job_output_dir, logger)
+
             return result
             
         except Exception as e:
@@ -1664,16 +1668,492 @@ class BookingScraper:
         """Fix and normalize image URL."""
         if not url:
             return ""
-        
+
         # Remove size parameters for higher quality
         url = re.sub(r'\?k=[^&]+', '', url)
         url = re.sub(r'&k=[^&]+', '', url)
-        
+
         # Ensure HTTPS
         if url.startswith('//'):
             url = 'https:' + url
         elif url.startswith('http:'):
             url = url.replace('http:', 'https:')
-            
+
         return url
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# RAG ENHANCEMENT METHODS (Post-Processing)
+# ═══════════════════════════════════════════════════════════════════════
+
+class BookingRAGEnhancer:
+    """
+    RAG optimization post-processor for Booking.com hotel data.
+
+    Transforms already-scraped hotel data into RAG-ready structured output:
+    - Per-hotel metadata files
+    - Review analysis (topics, sentiment indicators)
+    - Quality scoring
+    - Hotel categorization
+    - Area analysis
+    - Comparative metadata
+
+    NO NEW SCRAPING - Pure data transformation!
+    """
+
+    @staticmethod
+    def enhance_for_rag(result: Dict[str, Any], output_dir: str, logger: logging.Logger) -> Dict[str, Any]:
+        """
+        Main entry point: Transform scraped hotel data into RAG-ready format.
+
+        Takes existing hotels_data.json and creates structured output.
+        """
+        try:
+            hotels = result.get("hotels", [])
+            if not hotels:
+                logger.warning("No hotels to enhance for RAG")
+                return result
+
+            logger.info(f"🎯 RAG Enhancement: Processing {len(hotels)} hotels...")
+
+            # Create output directories
+            import os
+            hotels_dir = os.path.join(output_dir, "hotels")
+            metadata_dir = os.path.join(output_dir, "metadata")
+            os.makedirs(hotels_dir, exist_ok=True)
+            os.makedirs(metadata_dir, exist_ok=True)
+
+            # Process each hotel
+            enhanced_hotels = []
+            for idx, hotel in enumerate(hotels):
+                logger.info(f"  Processing hotel {idx+1}/{len(hotels)}: {hotel.get('name', 'Unknown')}")
+
+                # Enhance hotel with RAG data
+                enhanced_hotel = BookingRAGEnhancer._enhance_hotel(hotel, logger)
+                enhanced_hotels.append(enhanced_hotel)
+
+                # Save per-hotel files
+                hotel_id = enhanced_hotel.get("hotel_id", f"hotel_{idx}")
+                BookingRAGEnhancer._save_hotel_files(enhanced_hotel, hotels_dir, hotel_id, logger)
+                BookingRAGEnhancer._save_hotel_metadata(enhanced_hotel, metadata_dir, hotel_id, logger)
+
+            # Create analysis files
+            area_analysis = BookingRAGEnhancer._analyze_areas(enhanced_hotels)
+            comparison = BookingRAGEnhancer._create_comparison_matrix(enhanced_hotels)
+            review_summary = BookingRAGEnhancer._summarize_reviews(enhanced_hotels)
+
+            # Save analysis files
+            try:
+                with open(os.path.join(output_dir, "area_analysis.json"), 'w', encoding='utf-8') as f:
+                    json.dump(area_analysis, f, indent=2, ensure_ascii=False)
+
+                with open(os.path.join(output_dir, "hotel_comparison.json"), 'w', encoding='utf-8') as f:
+                    json.dump(comparison, f, indent=2, ensure_ascii=False)
+
+                with open(os.path.join(output_dir, "review_topics_summary.json"), 'w', encoding='utf-8') as f:
+                    json.dump(review_summary, f, indent=2, ensure_ascii=False)
+
+                # Update search summary
+                search_summary = {
+                    **result.get("search_metadata", {}),
+                    "rag_enhancements": {
+                        "total_hotels_processed": len(enhanced_hotels),
+                        "hotels_with_reviews": len([h for h in enhanced_hotels if h.get('reviews')]),
+                        "hotels_with_quality_scores": len([h for h in enhanced_hotels if h.get('quality_metrics')]),
+                        "popular_areas": [area[0] for area in area_analysis.get("popular_areas", [])[:5]],
+                        "price_range": comparison.get("price_range", {}),
+                        "enhanced_at": datetime.now().isoformat()
+                    }
+                }
+
+                with open(os.path.join(output_dir, "search_summary.json"), 'w', encoding='utf-8') as f:
+                    json.dump(search_summary, f, indent=2, ensure_ascii=False)
+
+            except Exception as e:
+                logger.warning(f"Failed to save analysis files: {e}")
+
+            logger.info(f"✅ RAG Enhancement complete: {len(enhanced_hotels)} hotels processed")
+            logger.info(f"📂 Output: {output_dir}")
+            logger.info(f"   - hotels/: Per-hotel directories")
+            logger.info(f"   - metadata/: Quick-access metadata files")
+            logger.info(f"   - area_analysis.json: Neighborhood insights")
+            logger.info(f"   - hotel_comparison.json: Comparative data")
+            logger.info(f"   - review_topics_summary.json: Review analysis")
+
+            # Update result with enhanced data
+            result["hotels"] = enhanced_hotels
+            return result
+
+        except Exception as e:
+            logger.error(f"RAG enhancement failed: {e}", exc_info=True)
+            return result
+
+    @staticmethod
+    def _enhance_hotel(hotel: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
+        """Enhance a single hotel with RAG metadata."""
+        enhanced = hotel.copy()
+
+        # Analyze reviews if present
+        if hotel.get('reviews'):
+            enhanced['review_analysis'] = BookingRAGEnhancer._analyze_reviews(hotel['reviews'])
+
+        # Calculate quality scores
+        enhanced['quality_metrics'] = BookingRAGEnhancer._calculate_quality_score(hotel)
+
+        # Categorize hotel
+        enhanced['categories'] = BookingRAGEnhancer._categorize_hotel(hotel)
+
+        return enhanced
+
+    @staticmethod
+    def _analyze_reviews(reviews: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Analyze reviews for topics and sentiment indicators."""
+        if not reviews:
+            return {"total_reviews": 0}
+
+        topic_counts = {
+            "cleanliness": 0,
+            "service": 0,
+            "location": 0,
+            "room_quality": 0,
+            "value": 0,
+            "amenities": 0
+        }
+
+        sentiment_counts = {
+            "positive": 0,
+            "negative": 0,
+            "mixed": 0
+        }
+
+        for review in reviews:
+            review_text = review.get('review_text', '').lower()
+
+            # Topic detection (simple keyword-based)
+            if any(word in review_text for word in ['clean', 'tidy', 'dirty', 'spotless']):
+                topic_counts['cleanliness'] += 1
+            if any(word in review_text for word in ['staff', 'service', 'helpful', 'friendly', 'rude']):
+                topic_counts['service'] += 1
+            if any(word in review_text for word in ['location', 'walkable', 'near', 'convenient', 'central']):
+                topic_counts['location'] += 1
+            if any(word in review_text for word in ['room', 'bed', 'bathroom', 'shower', 'spacious', 'cramped']):
+                topic_counts['room_quality'] += 1
+            if any(word in review_text for word in ['value', 'price', 'worth', 'expensive', 'cheap']):
+                topic_counts['value'] += 1
+            if any(word in review_text for word in ['pool', 'gym', 'wifi', 'breakfast', 'parking']):
+                topic_counts['amenities'] += 1
+
+            # Sentiment indicators (simple)
+            positive_words = ['great', 'excellent', 'amazing', 'wonderful', 'perfect', 'loved', 'best', 'fantastic']
+            negative_words = ['bad', 'poor', 'terrible', 'awful', 'horrible', 'worst', 'disappointed', 'never']
+
+            pos_count = sum(1 for word in positive_words if word in review_text)
+            neg_count = sum(1 for word in negative_words if word in review_text)
+
+            if pos_count > neg_count + 1:
+                sentiment_counts['positive'] += 1
+            elif neg_count > pos_count + 1:
+                sentiment_counts['negative'] += 1
+            else:
+                sentiment_counts['mixed'] += 1
+
+        return {
+            "total_reviews": len(reviews),
+            "topic_distribution": topic_counts,
+            "sentiment_distribution": sentiment_counts,
+            "most_mentioned_topics": sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        }
+
+    @staticmethod
+    def _calculate_quality_score(hotel: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate comprehensive quality metrics."""
+        score = 0.0
+
+        # Rating score (40%)
+        rating = hotel.get('rating', 0)
+        if rating > 0:
+            score += (rating / 10) * 0.4
+
+        # Review count score (20%)
+        review_count = hotel.get('review_count', 0)
+        if review_count > 1000:
+            score += 0.2
+        elif review_count > 100:
+            score += 0.15
+        elif review_count > 10:
+            score += 0.1
+
+        # Amenity completeness (20%)
+        amenity_count = len(hotel.get('amenities', []))
+        if amenity_count > 10:
+            score += 0.2
+        elif amenity_count > 5:
+            score += 0.15
+        elif amenity_count > 0:
+            score += 0.1
+
+        # Has description (10%)
+        if hotel.get('description') and len(hotel.get('description', '')) > 50:
+            score += 0.1
+
+        # Has location data (10%)
+        if hotel.get('latitude') and hotel.get('longitude'):
+            score += 0.1
+
+        # Data completeness percentage
+        fields_expected = ['name', 'address', 'price_per_night', 'rating', 'amenities', 'description', 'latitude']
+        fields_present = sum(1 for field in fields_expected if hotel.get(field))
+        completeness = fields_present / len(fields_expected)
+
+        return {
+            "overall_quality_score": round(score, 2),
+            "data_completeness": round(completeness, 2),
+            "quality_rating": "excellent" if score >= 0.8 else "good" if score >= 0.6 else "fair" if score >= 0.4 else "poor",
+            "has_sufficient_data": completeness >= 0.7
+        }
+
+    @staticmethod
+    def _categorize_hotel(hotel: Dict[str, Any]) -> Dict[str, Any]:
+        """Categorize hotel for RAG organization."""
+        categories = []
+
+        # Price-based categories
+        price = hotel.get('price_per_night', 0)
+        if price > 500:
+            categories.append('luxury')
+        elif price > 200:
+            categories.append('upscale')
+        elif price > 100:
+            categories.append('mid-range')
+        elif price > 0:
+            categories.append('budget')
+
+        # Amenity-based categories
+        amenities_lower = [a.lower() for a in hotel.get('amenities', [])]
+        if any('pool' in a or 'swimming' in a for a in amenities_lower):
+            categories.append('leisure')
+        if any('gym' in a or 'fitness' in a for a in amenities_lower):
+            categories.append('fitness')
+        if any('business' in a or 'meeting' in a for a in amenities_lower):
+            categories.append('business')
+        if any('family' in a or 'kids' in a or 'children' in a for a in amenities_lower):
+            categories.append('family-friendly')
+        if any('spa' in a or 'wellness' in a for a in amenities_lower):
+            categories.append('wellness')
+
+        # Rating-based
+        rating = hotel.get('rating', 0)
+        if rating >= 9.0:
+            categories.append('highly-rated')
+        elif rating >= 8.0:
+            categories.append('well-rated')
+
+        return {
+            "categories": categories,
+            "primary_category": categories[0] if categories else "uncategorized",
+            "category_count": len(categories)
+        }
+
+    @staticmethod
+    def _analyze_areas(hotels: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Analyze neighborhoods/areas from hotel data."""
+        area_counts = {}
+        area_avg_prices = {}
+        area_avg_ratings = {}
+
+        for hotel in hotels:
+            address = hotel.get('address', '')
+            if not address:
+                continue
+
+            # Simple area extraction (can be enhanced with better parsing)
+            # Look for common area patterns in addresses
+            areas_found = []
+
+            # Common area keywords
+            area_keywords = [
+                'Dubai Marina', 'Downtown', 'JBR', 'Business Bay', 'DIFC',
+                'Burj Khalifa', 'Dubai Mall', 'Palm Jumeirah', 'Deira',
+                'Bur Dubai', 'Jumeirah', 'City Walk', 'Al Barsha'
+            ]
+
+            for area in area_keywords:
+                if area in address:
+                    areas_found.append(area)
+
+            # Use first found area or generic extraction
+            area = areas_found[0] if areas_found else "Unknown"
+
+            # Count hotels per area
+            area_counts[area] = area_counts.get(area, 0) + 1
+
+            # Track prices per area
+            price = hotel.get('price_per_night', 0)
+            if price > 0:
+                if area not in area_avg_prices:
+                    area_avg_prices[area] = []
+                area_avg_prices[area].append(price)
+
+            # Track ratings per area
+            rating = hotel.get('rating', 0)
+            if rating > 0:
+                if area not in area_avg_ratings:
+                    area_avg_ratings[area] = []
+                area_avg_ratings[area].append(rating)
+
+        # Calculate averages
+        area_stats = {}
+        for area in area_counts.keys():
+            area_stats[area] = {
+                "hotel_count": area_counts[area],
+                "avg_price": round(sum(area_avg_prices.get(area, [0])) / len(area_avg_prices.get(area, [1])), 2) if area in area_avg_prices else 0,
+                "avg_rating": round(sum(area_avg_ratings.get(area, [0])) / len(area_avg_ratings.get(area, [1])), 2) if area in area_avg_ratings else 0
+            }
+
+        return {
+            "popular_areas": sorted(area_counts.items(), key=lambda x: x[1], reverse=True)[:10],
+            "total_areas": len(area_counts),
+            "area_statistics": area_stats
+        }
+
+    @staticmethod
+    def _create_comparison_matrix(hotels: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create hotel comparison data for RAG."""
+        if not hotels:
+            return {}
+
+        prices = [h.get('price_per_night', 0) for h in hotels if h.get('price_per_night', 0) > 0]
+        ratings = [h.get('rating', 0) for h in hotels if h.get('rating', 0) > 0]
+        review_counts = [h.get('review_count', 0) for h in hotels if h.get('review_count', 0) > 0]
+
+        return {
+            "price_range": {
+                "min": min(prices) if prices else 0,
+                "max": max(prices) if prices else 0,
+                "average": round(sum(prices) / len(prices), 2) if prices else 0,
+                "median": round(sorted(prices)[len(prices)//2], 2) if prices else 0
+            },
+            "rating_range": {
+                "min": min(ratings) if ratings else 0,
+                "max": max(ratings) if ratings else 0,
+                "average": round(sum(ratings) / len(ratings), 2) if ratings else 0
+            },
+            "review_stats": {
+                "min": min(review_counts) if review_counts else 0,
+                "max": max(review_counts) if review_counts else 0,
+                "average": round(sum(review_counts) / len(review_counts), 2) if review_counts else 0
+            },
+            "total_hotels": len(hotels),
+            "hotels_with_prices": len(prices),
+            "hotels_with_ratings": len(ratings),
+            "hotels_with_reviews": len([h for h in hotels if h.get('reviews')])
+        }
+
+    @staticmethod
+    def _summarize_reviews(hotels: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Summarize review topics across all hotels."""
+        all_topics = {
+            "cleanliness": 0,
+            "service": 0,
+            "location": 0,
+            "room_quality": 0,
+            "value": 0,
+            "amenities": 0
+        }
+
+        total_reviews = 0
+        total_sentiments = {"positive": 0, "negative": 0, "mixed": 0}
+
+        for hotel in hotels:
+            review_analysis = hotel.get('review_analysis', {})
+            if review_analysis:
+                # Aggregate topics
+                topics = review_analysis.get('topic_distribution', {})
+                for topic, count in topics.items():
+                    if topic in all_topics:
+                        all_topics[topic] += count
+
+                # Aggregate sentiments
+                sentiments = review_analysis.get('sentiment_distribution', {})
+                for sent, count in sentiments.items():
+                    if sent in total_sentiments:
+                        total_sentiments[sent] += count
+
+                total_reviews += review_analysis.get('total_reviews', 0)
+
+        return {
+            "total_reviews_analyzed": total_reviews,
+            "top_topics": sorted(all_topics.items(), key=lambda x: x[1], reverse=True),
+            "sentiment_summary": total_sentiments,
+            "hotels_with_reviews": len([h for h in hotels if h.get('reviews')])
+        }
+
+    @staticmethod
+    def _save_hotel_files(hotel: Dict[str, Any], hotels_dir: str, hotel_id: str, logger: logging.Logger):
+        """Save per-hotel files."""
+        try:
+            import os
+            hotel_dir = os.path.join(hotels_dir, hotel_id)
+            os.makedirs(hotel_dir, exist_ok=True)
+
+            # Save hotel info
+            hotel_info = {
+                "hotel_id": hotel.get("hotel_id"),
+                "name": hotel.get("name"),
+                "address": hotel.get("address"),
+                "rating": hotel.get("rating"),
+                "price_per_night": hotel.get("price_per_night"),
+                "review_count": hotel.get("review_count"),
+                "booking_url": hotel.get("booking_url"),
+                "description": hotel.get("description"),
+                "amenities": hotel.get("amenities", []),
+                "images": hotel.get("images", []),
+                "location": {
+                    "latitude": hotel.get("latitude"),
+                    "longitude": hotel.get("longitude"),
+                    "google_maps_url": hotel.get("google_maps_url")
+                }
+            }
+
+            with open(os.path.join(hotel_dir, "info.json"), 'w', encoding='utf-8') as f:
+                json.dump(hotel_info, f, indent=2, ensure_ascii=False)
+
+            # Save reviews if present
+            if hotel.get('reviews'):
+                with open(os.path.join(hotel_dir, "reviews_analyzed.json"), 'w', encoding='utf-8') as f:
+                    json.dump({
+                        "reviews": hotel.get("reviews"),
+                        "analysis": hotel.get("review_analysis", {})
+                    }, f, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            logger.debug(f"Failed to save hotel files for {hotel_id}: {e}")
+
+    @staticmethod
+    def _save_hotel_metadata(hotel: Dict[str, Any], metadata_dir: str, hotel_id: str, logger: logging.Logger):
+        """Save quick-access metadata file."""
+        try:
+            import os
+            metadata = {
+                "hotel_id": hotel.get("hotel_id"),
+                "name": hotel.get("name"),
+                "categories": hotel.get("categories", {}),
+                "quality_metrics": hotel.get("quality_metrics", {}),
+                "price_per_night": hotel.get("price_per_night"),
+                "rating": hotel.get("rating"),
+                "review_summary": {
+                    "count": hotel.get("review_count", 0),
+                    "has_reviews": len(hotel.get("reviews", [])) > 0,
+                    "top_topics": hotel.get("review_analysis", {}).get("most_mentioned_topics", [])
+                },
+                "location_summary": {
+                    "has_coordinates": bool(hotel.get("latitude") and hotel.get("longitude")),
+                    "address": hotel.get("address")
+                }
+            }
+
+            with open(os.path.join(metadata_dir, f"{hotel_id}_meta.json"), 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            logger.debug(f"Failed to save metadata for {hotel_id}: {e}")
